@@ -1,233 +1,314 @@
-# DevMemoir Implementation Plan
+# DevMemoir implementation plan
 
-**Status:** Proposed  
-**Architecture dependency:** [DEV_MEMOIR_ARCHITECTURE.md](./DEV_MEMOIR_ARCHITECTURE.md)
+**Status:** Reconciled — GO WITH CONDITIONS
+**Architecture:** [DEV_MEMOIR_ARCHITECTURE.md](./DEV_MEMOIR_ARCHITECTURE.md)
+**Formal review input:** [ADVERSARIAL_REVIEW_GROK.md](./ADVERSARIAL_REVIEW_GROK.md)
 
 ## Delivery rules
 
-- Each milestone must leave `main` deployable and the database migration-forward.
-- Correctness and privacy tests are acceptance criteria, not follow-up work.
-- Every background stage is idempotent before it is made concurrent.
-- Live GitHub tests use a dedicated test App/account/repository; fixtures are redacted.
-- Do not add source cloning, patches, AI calls, organization support, or billing during v0.1.
+1. Build the selected Option B: TypeScript modular monolith with separately deployable Next.js web, Fastify API, and worker processes.
+2. Treat DevMemoir as a view of **connected repositories**, never a complete GitHub archive or automatic proof of personal accomplishment.
+3. Only API and worker write GitHub-derived tables. Web owns rendering and the host-only application session, and reads through the API boundary.
+4. Use GitHub numeric IDs for identity, tenant IDs on every private/source row, forced PostgreSQL RLS for application roles, and exact account/installation binding.
+5. A webhook delivery GUID is event identity, not success. Only `processed` and `ignored` are terminal no-op states.
+6. A `push` webhook is a sync signal. Never persist its `commits` array; source facts come from an authoritative GitHub ref-head traversal.
+7. Keep v0.1 metadata-minimal: titles/messages and lifecycle metadata are allowed; bodies, files/paths/counts, patches, blobs, raw Git emails, comments, and workflow artifacts are off.
+8. Use synthetic/sandbox private data until Gate A (M1–M6) passes. Do not rely on a free/scale-to-zero database for real private history.
+9. Every milestone ends with automated evidence and a short decision log. Deferred experiments cannot silently expand the data or endpoint envelope.
 
-## Milestone 1 — One-repository end-to-end vertical slice
+## Milestone 1 — Secure vertical slice
 
-**Objective:** Prove the whole architecture with the smallest meaningful memoir.
+### Objective
 
-**Scope**
+Prove one allowlisted owner can authenticate, bind one selected GitHub App installation, import the newest 100 currently reachable default-branch commits, receive a push signal, recover from failure, and view a truthful private timeline.
 
-- pnpm monorepo with `web`, `api`, `worker`, `domain`, `db`, `github`, and `jobs` boundaries.
-- Local PostgreSQL and first migrations for tenant/user/identity/installation/repository/commit/event/delivery/job/cursor.
-- Owner allowlist and GitHub App user authorization.
-- Installation/setup callback for one selected private or public test repository.
-- Import repository metadata and newest 100 default-branch commits.
-- Signed `push` webhook receipt, durable GUID dedupe, asynchronous processing.
-- Basic chronological activity page with repository, factual event, date, and GitHub link.
+### Dependencies
 
-**Dependencies:** GitHub test App, callback/webhook URL, local tunnel or deployed API, PostgreSQL.
+GitHub sandbox owner/account and App registration, fixed callback/setup URLs, Railway/Neon projects, provider secret stores, and approved initial database roles/migration.
 
-**Acceptance criteria**
+### Scope
 
-- Owner can sign in and connect exactly one repository.
-- Import survives a worker termination after page persistence and finishes without duplicates.
-- A new push appears within two minutes.
-- Replaying the same delivery creates no second source row, job, or event.
-- Private repository name/message never appears in application logs.
-- A non-allowlisted GitHub user is denied before tenant creation.
+- Create the pnpm workspace and shared packages for config, contracts, database, GitHub client, domain, observability, and jobs.
+- Deploy Next.js web, Fastify API, and a separate always-on worker. Local development may co-host API/worker, but production may not.
+- Configure paid always-on Neon in the target region:
+  - pooled URL and small single-digit pools for web/API;
+  - direct URL and small single-digit pools for worker, pg-boss, and migrations;
+  - no `LISTEN` through the pooler and no production scale-to-zero.
+- Create the GitHub App with install-time user authorization disabled, OAuth callback distinct from setup URL, expiring user tokens enabled if exposed later, private visibility, minimum read permissions, and subscribed events including `ping` and `github_app_authorization`.
+- Implement login with PKCE S256, hashed single-use state, encrypted server-side verifier, allowlisted return paths, short-lived auth transaction, one-time API-to-web handoff, and `__Host-devmemoir_session` (`Secure`, `HttpOnly`, `SameSite=Lax`, path `/`).
+- Verify the installation account ID/type against the signed-in GitHub user before binding. A setup callback without usable state may only be claimed from an authenticated session and must re-fetch/verify the installation.
+- Add owner allowlist enforcement before tenant creation.
+- Add the first PostgreSQL schema with UUIDv7 keys, v0.1 `UNIQUE(github_account_id)` and `UNIQUE(user_id)` identity constraints, tenant IDs, forced RLS for non-owner application roles, and role separation for web/API/worker/migrations/queue.
+- Implement a central GitHub endpoint permit-list. Deny contents, blobs, trees for content acquisition, archives, and cloning; strip compare `files[].patch` before any value crosses the client boundary.
+- Import repository metadata and the newest 100 commits reachable from the current default-branch head. Store no raw Git emails or file details.
+- Display the exact copy: **“Newest 100 commits currently reachable from the default branch of this connected repository.”**
+- Implement default timeline rules: connected owner plus explicit project milestones; authored/committed same SHA/person renders once; merged PR is not duplicated as closed; merger does not inherit authorship; bots hidden by default; nullable/ghost actors remain project/unknown context.
+- Implement webhook receipt with a 2 MB pre-parse cap, raw-byte HMAC verification, current/previous secret rotation overlap, tolerant Zod schemas that strip unknown fields, `ping`/`github_app_authorization`, and signed unknown events/actions acknowledged as `ignored`.
+- Persist a delivery state machine: `received → processing → processed|ignored|failed|dead_letter`, with first/last receipt time, receipt count, lease/attempt/error metadata, encrypted payload, and expiry.
+- On `push`, store only delivery/install/repository IDs plus `ref`, `before`, `after`, and `forced`; enqueue an authoritative ref-head sync and ignore the payload commit list.
+- Add pg-boss behind `JobPort`, direct-connection polling/leases, logical job keys, atomic source-page/cursor transactions, and graceful worker drain.
+- Ship an allowlist-only structured logger and exception scrubber. Keep Sentry/OTel/session replay/third-party analytics disabled.
 
-**Important tests:** signature vectors; invalid signature; Unicode raw body; concurrent duplicate delivery; migration from empty DB; page transaction/cursor; worker lease recovery; one live private-repo E2E.
+### Acceptance criteria
 
-**Risks:** callback identity confusion, framework body parsing changes raw bytes, token leakage, pg-boss lifecycle behavior.
+- Login/session state is single-use; a non-allowlisted GitHub user and an installation-account mismatch are both rejected before any tenant/source row is created.
+- One selected repository renders exactly the API-derived newest 100 reachable commits and the exact completeness statement.
+- A push whose embedded commits disagree with GitHub API results produces only API-derived source facts/events.
+- Same-GUID redelivery from `received`, worker-killed `processing`, `failed`, and retried `dead_letter` resumes or ensures one logical job; only `processed`/`ignored` are no-ops.
+- Killing the worker before and after transaction commit yields one source fact/event, a correct cursor, and a terminal delivery after recovery.
+- Concurrent first receipt of one GUID creates one logical job while retaining receipt metadata.
+- Endpoint denial, compare-patch stripping, 2 MB rejection, tolerant unknown fields/actions, `ping`, and `github_app_authorization` are covered.
+- Direct SQL and service tests prove Tenant A cannot read/write Tenant B; web cannot write GitHub-derived tables.
+- A private canary repository name, commit message, body, path, payload, token, and secret appear in no logs, metrics, serialized errors, or CI artifacts.
 
-## Milestone 2 — Complete repository inventory and lifecycle
+### Important tests
 
-**Objective:** Make repository authorization a durable, changing relationship.
+Unit-test HMAC/validators/permit-list/logger; integration-test delivery states, transaction/lease recovery, roles/RLS, and cursors; end-to-end-test PKCE → install bind → import → push → timeline with a live sandbox App.
 
-**Scope**
+### Risks and exit
 
-- Installation inventory pagination and `installation`/`installation_repositories` processing.
-- Repository selection/access rows and states: active, revoked, suspended, deleted.
-- Repository metadata, visibility, archive/delete flags, rename/name history.
-- Owner-only connection/status UI.
+The largest M1 risks are auth topology, delivery state semantics, and pooled/direct configuration. Exit only with deployed sandbox evidence and restart/redelivery tests; M1 completion does **not** permit reliance on real private history.
 
-**Dependencies:** Milestone 1 App and core schema.
+## Milestone 2 — Installation and repository inventory
 
-**Acceptance criteria**
+### Objective
 
-- Adding/removing a repository at GitHub updates access without changing historical repository identity.
-- Rename updates display and link while preserving timeline rows.
-- App suspension/uninstall stops new token creation and queued API calls.
-- A 403/404 triggers inventory verification rather than immediate data deletion.
+Make installation lifecycle and selected-repository access authoritative and restartable.
 
-**Important tests:** installation pagination; rename; transfer fixture; permission change; suspend/unsuspend/uninstall; private access removal/re-add.
+### Dependencies
 
-**Risks:** confusing installation owner with signed-in user; GitHub webhook action drift; renamed URL redirects.
+M1 session/install binding, GitHub client permit-list, tenant schema, and durable job framework.
 
-## Milestone 3 — Resumable historical backfill
+### Scope
 
-**Objective:** Import the defined v0.1 historical truth for every selected repository.
+- Handle installation created/deleted/suspend/unsuspend and repositories added/removed.
+- Always paginate `/installation/repositories`; never treat the repository list embedded in `installation.created` as complete.
+- Re-fetch installation account, permissions, selection mode, and repository visibility with an installation token minted just in time.
+- Preserve repository identity across rename/transfer; maintain name history and access tombstones.
+- Cancel/gate jobs and token minting immediately on loss of access.
 
-**Scope**
+### Acceptance criteria
 
-- Staged coordinator and checkpoints for metadata, branches, tags, default-branch commits, PRs, issues, releases.
-- GitHub `Link` pagination, `per_page=100`, API version pinning, request budgets.
-- Atomic page upsert/cursor transactions and progress model.
-- Source tables and indexes for all MVP entities.
-- Backfill progress/failure UI.
+- Truncated webhook fixture plus multi-page inventory yields the full selected set.
+- Remove/re-add and rename/transfer preserve internal identity and resume safely.
+- A mismatched, org-owned, suspended, or uninstalled installation cannot be claimed by the M1 owner flow.
+- No installation token or App JWT is persisted, enqueued, logged, or sent to web.
 
-**Dependencies:** Milestone 2 repository inventory; job adapter proven.
+### Important tests
 
-**Acceptance criteria**
+Truncated-event/multi-page inventory, account mismatch, rename/transfer, remove/re-add, suspend/uninstall, and token-leak canary tests.
 
-- Backfill can be stopped in every stage and resume from the last committed checkpoint.
-- Re-running any complete stage changes no row counts except observation timestamps.
-- PR-shaped results from issue endpoints do not create issue duplicates.
-- Rate-limit exhaustion pauses and resumes without operator database edits.
-- The completeness boundary (“default branch plus current references”) is visible to the owner.
+### Risks
 
-**Important tests:** multi-page/final-empty-page; malformed item isolation; restart each stage; primary/secondary rate limit; deleted branch; same SHA on multiple branches; source update regression.
+GitHub lifecycle ordering and ambiguous 403/404 can revoke or bind the wrong access; authoritative account/inventory re-fetch and tombstones are mandatory.
 
-**Risks:** API request explosion, Git timestamp quirks, large repository duration, misleading progress totals.
+## Milestone 3 — Restartable historical backfill
 
-## Milestone 4 — Full live event normalization
+### Objective
 
-**Objective:** Keep supported facts current with low latency.
+Backfill the supported connected-repository facts with explicit completeness and bounded API cost.
 
-**Scope**
+### Dependencies
 
-- `repository`, `create`, `delete`, `pull_request`, `issues`, and `release` webhooks.
-- Canonical lifecycle verbs and source-to-event projectors.
-- Source timestamp stale-update rules and ambiguous-entity re-fetch jobs.
-- Dead-letter status and owner-only sanitized inspection/retry.
+M2 authoritative repository inventory/access, direct worker queue, source schema, endpoint budgets, and completeness contract.
 
-**Dependencies:** Milestone 3 source tables and event vocabulary.
+### Scope
 
-**Acceptance criteria**
+- Traverse commits from authoritative ref heads with page/high-water checkpoints; default branch first.
+- Use a 24-hour time overlap only as a supplemental stale-update guard, never as the primary discovery algorithm.
+- Import branches/tags and metadata-only PRs, issues, and releases. Bodies, commit files/paths/counts, patches, and raw emails remain unrequested/unpopulated.
+- Apply source timestamps and idempotent upserts; checkpoint only after the full page transaction commits.
+- Track observed, reachable-at-sync, known-unknown, and out-of-scope states for UI copy.
+- Limit installation concurrency to 1–2 GitHub requests and honor primary/secondary limits.
 
-- Every subscribed event/action is handled, explicitly ignored, or dead-lettered; none disappears silently.
-- Older delivery cannot reopen/overwrite a newer closed entity.
-- PR merge produces one primary merge contribution in default analytics.
-- Unknown action produces an alertable ignored/unsupported record.
+### Acceptance criteria
 
-**Important tests:** action fixture matrix; out-of-order transitions; delayed push; force push; replay; repository archive/unarchive; release draft/publish/edit/delete.
+- Repeated or interrupted backfill is monotonic and produces no duplicate source/event rows.
+- Forced/diverged refs update reachability without deleting preserved commits.
+- Pagination handles empty/final pages and a restart at every stage boundary.
+- The UI never labels the connected/default-branch slice as full GitHub history.
 
-**Risks:** GitHub adds actions/fields; projector semantics double-count activity; source webhook payload lacks full detail.
+### Important tests
 
-## Milestone 5 — Reconciliation and webhook gap recovery
+Multi-page/empty pagination, kill at every checkpoint, force-push/divergence, stale update, rate-limit pause, and restart with overlap fixtures.
 
-**Objective:** Demonstrate that missed live events self-heal.
+### Risks
 
-**Scope**
+Ref traversal can be expensive and still incomplete; cap concurrency, preserve known-unknown states, and never let a time window masquerade as authoritative discovery.
 
-- Six-hour recent reconciliation, daily inventory, weekly rolling deep checks.
-- Cursor overlap windows and ETags.
-- GitHub App failed-delivery audit/redelivery within the three-day window.
-- Reconciliation run status and data-freshness indicator.
+## Milestone 4 — Canonical development-event projection
 
-**Dependencies:** Milestones 3–4 idempotent API and webhook paths.
+### Objective
 
-**Acceptance criteria**
+Project factual source lifecycles into a stable, queryable timeline without over-attribution.
 
-- Intentionally omitted PR, issue, release, and commit webhooks are repaired.
-- Reconciliation is safe during simultaneous webhook processing.
-- One repository failure does not prevent others from completing.
-- Owner sees last successful sync and a degraded state after threshold breach.
+### Dependencies
 
-**Important tests:** missed webhook; concurrent reconcile/webhook; ETag 304; overlap boundary; delivery audit pagination/redelivery; partial GitHub outage.
+M3 normalized source facts, stable GitHub-account links, source/event uniqueness, and approved completeness/attribution vocabulary.
 
-**Risks:** redelivery API credential/permission assumptions, excess periodic calls, cursor advancement bugs.
+### Scope
 
-## Milestone 6 — Privacy, lifecycle, and operational hardening
+- Implement the controlled event vocabulary and deterministic source/event unique keys.
+- Populate actor kind, contribution role, context kind, confidence, visibility snapshot, and completeness state.
+- Keep project context separate from connected-owner activity; nullable/ghost actors remain unknown.
+- Apply collapse rules at projection/query boundaries, preserving source lifecycle facts.
+- Provide source links and private-repository markings; no public sharing/indexing.
 
-**Objective:** Make owner private-repository use defensible and recoverable.
+### Acceptance criteria
 
-**Scope**
+- Golden fixtures cover merged-versus-closed, authored-versus-committed, merger attribution, bots, collaborators, releases, ghost actors, and stale/out-of-order events.
+- Reprojection from normalized source facts is deterministic and versioned.
+- No productivity score or inferred accomplishment is introduced.
 
-- Secrets inventory/rotation instructions and endpoint allowlist.
-- Structured log allowlist and automated redaction tests.
-- Raw payload expiry job (30 days) and restricted dead-letter retention.
-- Disconnect, immediate delete, grace-retain, and account deletion workflows.
-- Database backup configuration and first restore drill.
-- Security headers, session protection, CSRF/state/PKCE, rate limits on public endpoints.
+### Important tests
 
-**Dependencies:** Complete data inventory from earlier milestones.
+Golden owner/collaborator/bot/ghost and lifecycle-collapse fixtures, deterministic full reprojection, stale/out-of-order races, and private source-link access.
 
-**Acceptance criteria**
+### Risks
 
-- Automated scan of logs/telemetry finds no fixture private content or credentials.
-- Expired payloads are removed while normalized events remain usable.
-- Account deletion purges live tenant data and invalidates all sessions/jobs.
-- A documented backup is restored into a clean database and passes integrity counts.
-- Source/blob/archive GitHub endpoints cannot be invoked through the adapter.
+Semantic over-attribution can undermine the product even when ingestion is correct; preserve source facts, version projection rules, and keep project context queryable.
 
-**Important tests:** IDOR/tenant checks; CSRF/state replay; token encryption/key version; log injection; payload expiry; disconnect races; restore smoke test.
+## Milestone 5 — Reconciliation and operational repair
 
-**Risks:** provider backup deletion semantics, accidental cascade gaps, overly broad observability capture.
+### Objective
 
-## Milestone 7 — Data quality and owner MVP release
+Repair missed deliveries and source drift without user-token dependency.
 
-**Objective:** Prove the product answers the core question across the owner's repositories.
+### Dependencies
 
-**Scope**
+M3 restartable sync, M4 projection, GitHub App delivery APIs, scheduler/worker health, and opaque operational metrics.
 
-- Cross-repository timeline with repository/type/date filters.
-- Attribution roles/confidence and project-context distinction.
-- Completeness/freshness indicators and data-quality audit script.
-- Operational dashboards/alerts and runbook.
-- Two-week deployed soak test and cost/rate-limit measurement.
+### Scope
 
-**Dependencies:** Milestones 1–6.
+- Reconcile active repositories every six hours and all authorized repositories daily.
+- Audit failed GitHub deliveries every six hours with an App JWT, request redelivery where appropriate, and correlate results to the existing GUID row.
+- Re-inventory installations/repositories daily and repair cursors/source facts idempotently.
+- Expose owner-only health, last-success, backlog, and retry controls without private content.
+- Add quota lanes, backoff/jitter, worker heartbeat/lease alerts, and queue-rebuild procedure based on source/cursor truth.
+- Defer weekly deep reconcile until measured Gate A repair yield justifies its API budget.
 
-**Acceptance criteria**
+### Acceptance criteria
 
-- Owner reviews a representative month and can trace every displayed item to GitHub.
-- Sample audit reports precision/recall estimates and unmatched commit categories.
-- No queue item exceeds freshness SLO during the soak test without an alert.
-- Monthly projected cost and GitHub request budget are recorded.
-- All v0.1 E2E tests pass against public and private test repositories.
+- Suppressed supported webhook is repaired by reconcile.
+- Failed-delivery audit works with App JWT only and same-GUID redelivery resumes a failed state.
+- Queue tables can be rebuilt without losing source progress.
+- Active/all reconciliation age and rate-limit pauses are observable with opaque metrics.
 
-**Important tests:** timezone boundaries; pagination/filter consistency; deleted/renamed repository display; attribution ambiguity; accessibility smoke; deployment during event burst.
+### Important tests
 
-**Risks:** technically correct but semantically unhelpful timeline; timezone double counting; owner history exposes attribution gaps.
+Suppressed webhook repair, App-JWT-only failed-delivery audit, same-GUID recovery, queue wipe/rebuild, rate-limit exhaustion, and stale inventory/access repair.
 
-## Milestone 8 — v0.2 readiness experiments
+### Risks
 
-**Objective:** Resolve evidence-dependent choices without expanding v0.1 scope.
+Audit/reconcile loops can amplify API load or use the wrong credential; installation lanes, explicit schedules, and endpoint/credential contract tests bound the blast radius.
 
-**Scope**
+## Milestone 6 — Privacy, lifecycle, and recovery gate
 
-- Compare default versus active-branch backfill.
-- Measure per-commit file-stat value/cost.
-- Prototype rule classifications on a fixed evaluation set.
-- Measure pg-boss contention at 100k queued jobs.
-- Draft RLS policy and validate tenant isolation for future beta.
+### Objective
 
-**Dependencies:** Real v0.1 data and observability.
+Complete Gate A controls before relying on real private-owner history.
 
-**Acceptance criteria:** each experiment produces a short decision record with data, recommendation, rollback, and resulting backlog change.
+### Dependencies
 
-**Important tests:** defined in each experiment; production writes remain disabled for experimental classifiers.
+M1–M5 stable source/recovery flows, paid always-on Neon backup/PITR, isolated restore target, provider secret rotation support, and deletion policy.
 
-**Risks:** experiments become hidden product features; evaluation set overfits the owner's style.
+### Scope
+
+- Expire successful raw webhook payloads at 7 days and dead-letter payloads at a 30-day hard cap; processing never extends expiry.
+- Implement disconnect, repository removal, uninstall, account deletion, session revocation, and accurate backup-retention status.
+- Rehearse webhook-secret and GitHub App private-key rotation with an overlap window and explicit old-key revocation.
+- Verify paid Neon backup/PITR policy and restore into an isolated environment.
+- Audit forced RLS, application/migration/queue roles, outbound endpoints, observability sinks, and provider secrets.
+- Produce Gate A evidence covering M1–M6 acceptance criteria.
+
+### Acceptance criteria
+
+- Expiry jobs remove encrypted payloads on schedule without deleting normalized facts.
+- Delete/disconnect stops reads/jobs/tokens immediately and removes live rows as promised.
+- Restore recovers schema, tenants, cursors, and normalized counts; test output leaks no content.
+- Rotation maintains service through overlap and proves old material unusable afterward.
+- Security/privacy checklist and tenant-isolation matrix have no open Gate A blocker.
+
+### Important tests
+
+Clock-driven 7/30-day expiry, uninstall/disconnect/delete under running jobs, session revocation, old/new secret overlap then revocation, isolated restore, and direct-SQL role matrix.
+
+### Risks
+
+Deletion and restore are destructive/high-trust operations; isolate targets, preserve audit evidence without content, and never promise provider-backup erasure before retention expires.
+
+## Milestone 7 — Soak, quality, and dashboard
+
+### Objective
+
+Validate the Gate A architecture under representative owner use and make completeness visible.
+
+### Dependencies
+
+Gate A evidence, approved owner/sandbox data set, cost/latency dashboards, quality sampling procedure, and stable completeness copy.
+
+### Scope
+
+- Run a two-week sandbox/approved-owner soak; measure Railway–Neon latency/cost, pools, queues, quotas, reconciliation repair yield, and payload purge lag.
+- Add cross-repository calendar/timeline filters, project activity counts, completeness indicators, and owner/project/bot controls.
+- Tune small pools, worker concurrency, and alerts from evidence; do not expand retained data.
+
+### Acceptance criteria
+
+- Quality sampling matches source facts and collapse/attribution rules.
+- Copy remains precise under deleted refs, force pushes, access loss, and unlinked actors.
+- Operational objectives hold without cold/sleep loss or pool exhaustion.
+
+### Important tests
+
+Two-week SLO/cost soak, sampled source-to-event comparison, completeness-copy scenarios, private sharing/indexing denial, and pool/queue stress under representative backfill.
+
+### Risks
+
+One-owner samples can hide scale and semantic bias; record confidence/sample limits and do not widen data collection to improve dashboard polish.
+
+## Milestone 8 — Explicit post-Gate-A experiments
+
+### Objective
+
+Evaluate optional scope without weakening the Gate A privacy/correctness contract.
+
+### Dependencies
+
+Gate B quality evidence, a written hypothesis and owner approval for each experiment, endpoint/storage budgets, and a rollback/retention plan.
+
+### Scope
+
+Run independent, reversible experiments for all-active-branch history, weekly deep reconcile, per-commit file stats, bodies, reviews/deployments, co-author trailers, and pg-boss load. Each proposal records benefit, API cost, storage/retention, privacy/UI control, migration/rollback, endpoint changes, and updated completeness semantics. No experiment may store patches, blobs, raw Git emails, or source content.
+
+### Acceptance criteria
+
+Each experiment produces a recorded adopt/reject decision; rejected data is purged on schedule, and adopted scope has an ADR/migration/tests/copy/control before release.
+
+### Important tests
+
+Run the experiment-specific endpoint, tenant, retention/purge, migration/rollback, completeness, and log-canary suites in an isolated tenant before any owner rollout.
+
+### Risks
+
+Optional signals can silently become surveillance or permanent private content; experiments remain opt-in, isolated, reversible, and never change default attribution into productivity scoring.
 
 ## Release gates
 
-### Gate A — Private owner use
+### Gate A — Private-owner data readiness
 
-- Milestones 1–6 complete.
-- Paid restorable PostgreSQL configured.
-- Restore drill passed.
-- No high-severity security finding open.
-- Webhook replay and worker restart tests green.
+Requires M1–M6: all blocker tests pass; paid always-on Neon and isolated restore verified; no private canary leakage; forced RLS/direct-SQL isolation green; endpoint permit-list green; failed same-GUID redelivery and worker kills green; expiry/deletion/rotation green; exact completeness copy shipped.
 
-### Gate B — v0.1 declared successful
+### Gate B — Owner MVP quality
 
-- Milestone 7 soak complete.
-- Daily reconciliation and raw-payload expiry healthy.
-- Core question is useful in owner review, with known completeness caveats shown.
+Requires M7 soak and data-quality review: operational objectives sustained, repair loops observed, attribution/collapse sample approved, cost understood, and no open high-severity privacy/reliability issue.
 
-### Gate C — Multi-user beta work may start
+### Gate C — Multi-user beta
 
-- RLS/tenant negative tests, KMS-backed key handling, deletion/export policy, abuse controls, privacy/terms review, and incident runbook approved.
+Requires revalidation of RLS and installation ownership, quotas/abuse controls, per-user lifecycle, incident/support runbooks, formal privacy/terms/DPA review, stronger sign-only App-key custody, and a new adversarial review of the implementation—not only these documents.
 
+## Decision log after reconciliation
+
+- Retained: Option B, Next.js + Fastify + worker, PostgreSQL/Drizzle, pg-boss behind `JobPort`, Railway + Neon, read-only GitHub App permission posture, tenant-scoped copies, no blobs/patches.
+- Corrected: GUID state machine, authoritative push sync, auth/session/install binding, connected-repository product language, v0.1 identity uniqueness, pooled/direct database topology, first-schema RLS, M1 observability, event attribution/collapse, 7/30-day payload retention, and Gate A scope.
+- Deferred: all-active branches, bodies/files, co-author trailers, reviews/deployments, weekly deep reconcile, AI, multi-user/organization features.

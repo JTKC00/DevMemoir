@@ -1,8 +1,9 @@
 # DevMemoir Architecture Report
 
-**Status:** Proposed  
-**Decision date:** 2026-08-21  
-**Scope:** v0.1 foundation through a credible multi-user SaaS path  
+**Status:** Reconciled — GO WITH CONDITIONS
+**Reconciled against:** [ADVERSARIAL_REVIEW_GROK.md](./ADVERSARIAL_REVIEW_GROK.md)
+**Decision date:** 2026-08-21
+**Scope:** v0.1 foundation through a credible multi-user SaaS path
 **Audience:** Product owner and implementers
 
 ## Executive decision
@@ -13,15 +14,15 @@ Build DevMemoir as a **TypeScript modular monolith in a pnpm monorepo**, with th
 2. a Fastify HTTP application for GitHub callbacks, webhooks, and the internal API;
 3. a Node.js worker for backfills, normalization, and reconciliation.
 
-Use PostgreSQL as the system of record and, initially, a PostgreSQL-backed durable job queue. Keep the API and worker as separately runnable processes even if v0.1 temporarily co-hosts them. Deploy containers on Railway and use Neon PostgreSQL. Develop against local Docker PostgreSQL.
+Use PostgreSQL as the system of record and, initially, a PostgreSQL-backed durable job queue. Keep the API and worker as separately runnable processes. Co-hosting the worker in the API is permitted for local development only, never for deployed private-repository ingestion. Deploy containers on Railway and use paid, always-on Neon PostgreSQL. Develop against local Docker PostgreSQL.
 
-This is Option B, implemented without microservices. It creates a hard reliability boundary around webhook and background processing while preserving one language, one repository, one schema, and one deployment model.
+This is Option B, implemented without microservices. It creates a hard reliability boundary around webhook and background processing while preserving one language, one repository, one schema, and one deployment model. Only `apps/api` and `apps/worker` may write GitHub-derived tables; `apps/web` is a tenant-scoped reader and browser-session boundary.
 
 ## 1. Goals, non-goals, and design principles
 
 ### Goals
 
-- Reliably answer “What have I been building on GitHub?” from durable historical and live data.
+- Reliably explain observed work in repositories the user explicitly connected, from durable historical and live data.
 - Support public and private repositories through a real GitHub App.
 - Survive duplicate, missing, delayed, and out-of-order delivery.
 - Resume interrupted imports without starting over.
@@ -45,6 +46,25 @@ This is Option B, implemented without microservices. It creates a hard reliabili
 - **Acknowledge only after durable receipt, then process asynchronously.**
 - **Store derived facts permanently; retain raw sensitive payloads briefly.**
 - **All tenant-owned queries include `tenant_id`, even while only one tenant exists.**
+- **DevMemoir records connected repositories, not every contribution a developer has ever made on GitHub.**
+- **Completeness is product data:** every view distinguishes observed, reachable-at-sync, known-unknown, and out-of-scope facts.
+
+### v0.1 product and completeness contract
+
+The v0.1 promise is deliberately narrower than the long-term vision:
+
+> DevMemoir records what happened in repositories you connected. It does not claim to contain every contribution your GitHub user has ever made.
+
+Installation tokens cannot see contributions to repositories that were not granted to the App, including most open-source contributions, organization repositories without an organization installation, and private repositories owned by somebody else. v0.1 must not use a user token to scrape around that boundary.
+
+Every timeline and import status exposes one of four completeness states:
+
+1. **Observed:** a source fact DevMemoir successfully stored.
+2. **Reachable at sync:** a commit/ref was reachable from the configured default branch or currently enumerated ref at the last successful sync.
+3. **Known unknown:** deleted refs, force-push gaps, unlinked actors, temporarily truncated/missed webhooks, or unavailable source facts.
+4. **Out of scope:** repositories not connected, Organizations in v0.1, reviews, Actions, submodule history, LFS objects, and source contents.
+
+The Milestone 1 UI uses the exact copy: **“Newest 100 commits currently reachable from the default branch of this connected repository.”** It must not label that slice “your GitHub history.”
 
 ## 2. Architecture options
 
@@ -185,9 +205,9 @@ Choose **Option B**. The winning property is not “more services”; it is that
 | SQL/migrations | Drizzle ORM + SQL migrations | Typed SQL with visible constraints and low abstraction leakage |
 | Jobs | pg-boss, isolated behind `JobPort` | Durable Postgres-backed jobs without Redis in v0.1 |
 | Tests | Vitest, Testcontainers, Playwright | Fast unit tests, real Postgres integration, browser onboarding E2E |
-| Observability | OpenTelemetry-compatible structured logs + Sentry | Correlation across delivery/job/API; simple hosted error visibility |
+| Observability | Allowlist-only structured logs; optional OpenTelemetry/Sentry after scrubber tests | Correlate opaque IDs without exporting private payloads, names, messages, bodies, or paths |
 | Deployment | Docker images on Railway | Persistent HTTP and worker processes, cron, low initial cost |
-| Database hosting | Neon Launch for production | Pooled standard Postgres, scale-to-zero characteristics, restore window |
+| Database hosting | Neon Launch, always-on for deployed private data | Pooled URL for web/API; direct URL for worker/pg-boss; paid restore window |
 
 Suggested monorepo boundaries:
 
@@ -208,54 +228,57 @@ Domain packages must not import framework packages. `apps/*` compose dependencie
 
 ### PostgreSQL options
 
-Pricing is volatile; values below are decision inputs verified on 2026-08-21, not contractual budgets.
+Provider prices and plan limits are volatile and excluded from the architecture decision. Re-verify the linked primary pages during procurement and maintain a measured monthly budget/alert; the durable criteria are connection mode, always-on behavior, backup/restore, portability, and operator burden.
 
 | Provider | Strengths | Constraints | v0.1 fit |
 |---|---|---|---|
-| Neon | Standard Postgres, built-in pooler, autoscaling/scale-to-zero behavior, database branching, 7-day restore window on Launch; Free currently includes 0.5 GB and 6-hour restore history; Launch typical spend is advertised around $15/month | Usage billing needs alerts; cold activation adds latency; restore/metrics features vary by plan | **Recommended** for low-idle owner workload; use paid Launch before treating private data as durable production data |
-| Supabase | Full Postgres, polished local CLI, Supavisor connection modes, optional Auth/Storage/Realtime; Pro is currently $25/month with 7 days of daily backups and 200 pooled connections on Micro | Product surface is broader than needed; project/compute pricing; PITR is a significant add-on; using proprietary features increases lock-in | Strong alternative if Supabase Auth/RLS becomes valuable |
-| Railway Postgres | Same project/private network and simplest topology | Operational assurances and database lifecycle are coupled to hosting plan; fewer database-specific development features | Convenient prototype choice, but not first choice for private historical data |
-| Render Postgres | Managed backups/PITR on paid databases, private network with Render services, independent compute/storage | Fixed always-on footprint is usually more expensive at tiny scale; free DB expires | Good all-in-one beta topology |
-| Self-managed Postgres | Maximum control, lowest raw VPS price, no product lock-in | Patching, monitoring, backup validation, encryption, restore drills, and HA are now the owner's problem | **Not appropriate** for v0.1 private data |
+| Neon | Standard Postgres, built-in pooler, optional autoscaling/branching, paid restore capability | Public cross-provider path from Railway; cold activation if allowed; plan-dependent restore/metrics; direct versus pooled topology must be explicit | **Recommended** with paid, always-on compute and a restore drill before real private-data reliance |
+| Supabase | Full Postgres, polished local tooling, explicit direct/session/transaction pooler modes, optional Auth/Storage/Realtime | Broader product surface; plan-dependent compute/PITR; proprietary features increase lock-in | Strong alternative if its auth/RLS/platform surface becomes valuable |
+| Railway Postgres | Same project/private network and simplest topology | Database lifecycle/assurances coupled to hosting and fewer database-specific development features | Convenient prototype, not first choice for durable private history without equivalent restore evidence |
+| Render Postgres | Managed paid backups/PITR, private network with Render services, independent compute/storage | More fixed always-on footprint and service configuration | Conservative all-in-one beta alternative |
+| Self-managed Postgres | Maximum control and no product API lock-in | Owner assumes patching, monitoring, encryption, backup validation, restore, and HA | **Not appropriate** for v0.1 private data |
 
-Supabase documents direct, session-pooler, and transaction-pooler connection modes; Neon and Supabase remain portable because the application uses ordinary PostgreSQL migrations rather than provider APIs. [Supabase connection guidance](https://supabase.com/docs/guides/database/connecting-to-postgres), [Supabase backups](https://supabase.com/docs/guides/platform/backups), [Supabase pricing](https://supabase.com/pricing), [Neon pricing](https://neon.com/pricing).
+Supabase documents direct, session-pooler, and transaction-pooler connection modes; Neon and Supabase remain portable because DevMemoir uses ordinary PostgreSQL migrations rather than provider APIs. [Supabase connection guidance](https://supabase.com/docs/guides/database/connecting-to-postgres), [Supabase backups](https://supabase.com/docs/guides/platform/backups), [Supabase pricing](https://supabase.com/pricing), [Neon pricing](https://neon.com/pricing).
 
-**Database decision:** local Docker PostgreSQL for development and tests; Neon Launch for deployed private-repository use. Run migrations through a one-shot release command using a direct/pool-compatible connection, never automatically from every app replica. Perform a quarterly `pg_dump` restore test to a separate local database.
+**Database decision:** local Docker PostgreSQL for development/tests; paid always-on Neon for deployed private-repository use. Web/API use the pooled URL with single-digit per-process pools; worker/pg-boss and one-shot migrations use the direct URL with a small pool. Do not depend on `LISTEN/NOTIFY` through the transaction pooler. Run migrations once per release, never from every replica. Complete an isolated provider-backup restore before Gate A and repeat quarterly.
 
 ### Hosting options
 
 | Platform | Webhooks | Jobs/workers | Scheduled work | Assessment |
 |---|---|---|---|---|
-| Railway | Persistent containers are suitable; simple custom domains | Persistent services and isolated workers | Native cron services; overlapping runs may be skipped | **Recommended v0.1:** least ceremony for mixed web/worker workload; Hobby currently starts at $5 included usage, then metered resources |
-| Render | Persistent web services | First-class background workers | Cron with at-most-one active run; up to 12 hours | Most predictable all-in-one alternative; modest fixed cost and more service configuration |
-| Fly.io | Excellent long-running containers and regional placement | Flexible Machines | Scheduler must be composed | Powerful but more networking/VM operations than v0.1 needs |
-| Vercel | Excellent Next.js frontend and webhook functions | Poor fit for a continuous worker; longer work needs another service | Cron invokes functions; Hobby cron is currently daily and imprecise | Good future frontend host, not the whole ingestion topology |
-| Netlify | Suitable webhook functions | Background functions currently capped at 15 minutes | Scheduled functions currently capped at 30 seconds | Good frontend/function platform; still needs an external durable worker for large backfills |
+| Railway | Persistent containers and custom domains | Persistent isolated worker services | Native cron services; overlap semantics must be verified | **Recommended v0.1:** least ceremony for mixed web/worker workload; cost is measured during M7, not assumed |
+| Render | Persistent web services | First-class background workers | Cron/overlap limits are plan/runtime dependent | Most predictable all-in-one alternative with more fixed service configuration |
+| Fly.io | Long-running containers and regional placement | Flexible Machines | Scheduler must be composed | Powerful but more networking/VM operations than v0.1 needs |
+| Vercel | Strong Next.js frontend and webhook functions | Poor fit for the required continuous worker without another service | Cron invokes request-scoped functions | Possible future frontend host, not the whole ingestion topology |
+| Netlify | Suitable webhook functions | Background/scheduled execution remains bounded and plan-dependent | Request/job limits require re-verification | Good frontend/function platform; still needs an external durable worker for large backfills |
 
 Primary references: [Railway services](https://docs.railway.com/services), [Railway pricing](https://docs.railway.com/pricing/plans), [Render service types](https://render.com/docs/service-types), [Render background workers](https://render.com/docs/background-workers), [Vercel cron constraints](https://vercel.com/docs/cron-jobs/usage-and-pricing), [Netlify function limits](https://docs.netlify.com/build/functions/configuration/).
 
 ### Initial deployment topology
 
 ```text
-GitHub ──HTTPS──> Railway API service ──transaction──> Neon PostgreSQL
-                         │                                │
-Browser ──HTTPS──> Railway Next.js service               │ jobs/outbox
-                         │                                ▼
-                         └────────────────────> Railway worker service
-                                                          │
-                                                          └──> GitHub API
+GitHub ──HTTPS──> Railway API ──pooled transaction──> Neon PostgreSQL
+                         │                                  ▲
+Browser ──HTTPS──> Railway Next.js ──read/API───────────────┤
+          host-only      │                                  │ direct, small pool
+          session        └──server-side auth handoff        │
+                                                            │
+                    Railway worker + pg-boss ────────────────┘
+                              │
+                              └──installation/App JWT──> GitHub API
 ```
 
-Use one region close to the database. Do not introduce Redis in v0.1. Deploy the API and worker from the same image with different commands. If cost pressure is material before launch, run the worker loop inside the API process for development only; production private-repository ingestion should use a separate worker process.
+Use one region close to the database and measure the public Railway↔Neon path. Do not introduce Redis in v0.1. Deploy API and worker from the same image with different commands. Running a worker loop inside the API is a local-development convenience only; deployed private ingestion always uses a separate worker. The App private key is available only to API and worker, not to web.
 
 ## 5. GitHub authentication and App design
 
 ### Credential roles
 
-- **GitHub OAuth login** proves which human is signing in. A GitHub App can perform the same user authorization flow and issue a GitHub App user access token; a separate OAuth App is unnecessary.
+- **GitHub OAuth login** proves which human is signing in. A GitHub App performs the user authorization flow; a separate OAuth App is unnecessary.
 - **GitHub App installation** is the repository-owner grant. It selects all or specific repositories and grants only configured repository permissions.
 - **Installation access token** authorizes server-to-server repository reads for one installation. The service signs a short-lived JWT with the App private key and exchanges it for a token. Installation tokens expire after one hour and can be narrowed to repositories and permissions. Do not persist them. [GitHub installation authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation).
-- **GitHub App user access token** acts as the user and is useful for login and user-scoped endpoints. With expiration enabled it is short lived; the refresh token is longer lived. Store a refresh token only when a concrete user-scoped feature needs it. [GitHub credential types](https://docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/github-credential-types).
+- **GitHub App user access token** acts as the user for login/user-scoped endpoints. v0.1 uses it only long enough to resolve the stable GitHub account and then discards it; `github_user_credentials` remains unpopulated unless a later user-scoped feature is approved. User-to-server token expiration stays enabled. [GitHub credential types](https://docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/github-credential-types).
+- **GitHub App JWT** authenticates as the App. It mints installation tokens and powers the six-hour App webhook-delivery audit. Only API/worker may mint it.
 
 ### Recommended v0.1 permissions
 
@@ -265,12 +288,14 @@ All permissions are repository-level and **read-only**:
 |---|---|---|
 | Metadata: read | Implicit baseline; repository identity/metadata and installation repository list | repo ID, name, visibility, owner, topics, archive state |
 | Contents: read | Required by commit and release endpoints and Git refs | commits, branches, tags, releases |
-| Pull requests: read | PR list/details/files and merge state | PR metadata, title/body, labels, timestamps, changed-file summary |
-| Issues: read | Issue list/details, labels, milestones | issue metadata, title/body, lifecycle |
+| Pull requests: read | PR list/details and merge state | PR metadata, title, labels, timestamps; bodies/files are not collected in M1 |
+| Issues: read | Issue list/details, labels, milestones | issue metadata, title, lifecycle; bodies are not collected in M1 |
 
-Do **not** request Administration, Checks, Actions, Workflows, Deployments, Discussions, Members, or any write permission in v0.1. Contents read technically permits source retrieval, so enforce a product rule that DevMemoir never calls blob/content/archive endpoints. GitHub confirms commit listing requires Contents read, PR listing requires Pull requests read, issue listing requires Issues read, and releases require Contents read. [GitHub permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps), [commits](https://docs.github.com/en/rest/commits/commits), [pull requests](https://docs.github.com/en/rest/pulls/pulls), [issues](https://docs.github.com/en/rest/issues/issues), [releases](https://docs.github.com/en/rest/releases/releases).
+Do **not** request Administration, Checks, Actions, Workflows, Deployments, Discussions, Members, or any write permission in v0.1. Contents read is unavoidably broader than the product. GitHub confirms commit listing requires Contents read, PR listing requires Pull requests read, issue listing requires Issues read, and releases require Contents read. [GitHub permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps), [commits](https://docs.github.com/en/rest/commits/commits), [pull requests](https://docs.github.com/en/rest/pulls/pulls), [issues](https://docs.github.com/en/rest/issues/issues), [releases](https://docs.github.com/en/rest/releases/releases).
 
-### Webhook subscriptions
+The GitHub adapter is a **permit-list**, not a deny-list. It permits installation inventory; repository metadata/languages/topics; branches/tags; commit list/get as JSON; PRs; issues; and releases. Compare is avoided by default; if used for ancestry/range metadata, `files[].patch` is discarded inside response parsing before logging, tracing, persistence, or job serialization. The adapter rejects `/contents`, `/git/blobs`, `/zipball`, `/tarball`, clones, source/file contents, and diff/patch media types.
+
+### Webhook subscriptions and mandatory handlers
 
 Subscribe only to:
 
@@ -280,6 +305,8 @@ Subscribe only to:
 - `pull_request`;
 - `issues`;
 - `release`.
+
+The webhook route also accepts `ping` and `github_app_authorization` with 2xx. A revoked `github_app_authorization` drops any user token material if it ever exists; it does not mutate repository facts. Signed but unsupported event types are acknowledged and metered rather than returned as 4xx. Unknown actions on subscribed events become `ignored`. Add `installation_target` with Organization work, not M1.
 
 MVP-later candidates:
 
@@ -291,18 +318,33 @@ MVP-later candidates:
 | Actions/workflow runs | Later | High event volume and weak direct authorship; cost/privacy concerns |
 | Checks/statuses | Later | Operational noise; usually redundant with workflow data |
 
-### Onboarding flow
+### Required GitHub App settings
 
-1. User selects “Continue with GitHub.”
-2. API starts the GitHub App user-authorization flow with signed `state`, PKCE where supported, and a short expiry.
-3. Callback resolves the stable GitHub user ID and upserts `users` and `github_identities`; create a secure application session.
-4. User selects “Connect repositories” and is redirected to the GitHub App installation page.
-5. Setup callback validates `state`, records `installation_id`, and verifies the installation belongs to the signed-in GitHub identity.
-6. API lists installation repositories; user confirms authorized selections. GitHub remains the access authority.
-7. A backfill job is committed and progress is shown.
-8. Webhooks begin immediately; backfill and webhook writes converge idempotently.
+| Setting | v0.1 value |
+|---|---|
+| Request user authorization during installation | **Off**; login and installation remain separate, preserving `state` |
+| OAuth callback URL | Fastify OAuth callback only |
+| Setup URL | Fastify installation setup/claim entry only; distinct from OAuth callback |
+| Redirect on update | On, with installation inventory polling as fallback |
+| User-to-server token expiration | On |
+| App visibility | Private until multi-user/Marketplace readiness |
 
-For v0.1, enforce an `OWNER_GITHUB_USER_ID` allowlist after login. Everything else—the App installation, tenant row, repository grants, jobs, and tokens—uses the multi-user architecture unchanged.
+### Chosen session and callback topology
+
+DevMemoir uses a one-time server-side auth handoff rather than a parent-domain cookie:
+
+1. Web asks API to start login. API creates a 10-minute `auth_transaction` containing a hashed one-time `state`, PKCE `S256` verifier, return origin, and consumed flag. The verifier stays server-side.
+2. GitHub returns to the Fastify OAuth callback. API atomically consumes `state`, exchanges the code with PKCE, resolves `github_account_id`, applies `OWNER_GITHUB_USER_ID`, and creates/links the DevMemoir user.
+3. API rotates the login transaction into a one-time handoff code, stores only its hash, and redirects to the fixed web origin.
+4. Next.js exchanges the handoff server-to-server exactly once, receives an opaque application-session token, and sets a host-only `__Host-devmemoir_session` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`). A new session ID is created after login.
+5. Browser state-changing requests require CSRF protection in addition to the session cookie. Redirect targets are allowlisted; no arbitrary return URL is accepted.
+6. An authenticated web session asks API for an installation URL. Its signed one-time `state` binds tenant, user, expected GitHub account, expiry, and nonce.
+7. Setup callback with valid state calls `GET /app/installations/{installation_id}` and requires `account.type == User` plus `account.id == signed-in github_account_id`. Organization installations are rejected in v0.1.
+8. GitHub-originated installation with no state is never bound in the callback. API redirects to an authenticated web claim page; the web session submits `installation_id`, and API performs the same account check before binding.
+9. API always paginates `GET /installation/repositories`; it never treats the repository array in `installation.created` as complete.
+10. A backfill job is committed and progress is shown. Webhooks may arrive first; backfill and live writes converge idempotently.
+
+For v0.1, enforce `OWNER_GITHUB_USER_ID` before tenant creation. Everything else—the installation, tenant rows, repository grants, jobs, and session model—uses the multi-user architecture unchanged.
 
 ## 6. Ingestion architecture
 
@@ -345,44 +387,56 @@ Default-branch commit history is the v0.1 completeness boundary. Enumerating eve
 
 ### Incremental synchronization
 
-- Repository/PR/issue lists use an overlap window: request objects updated since `cursor_time - 10 minutes`, upsert by external ID, and advance the cursor to the maximum source `updated_at` only after the page set succeeds.
-- Commits use branch head SHA plus comparison/listing. Re-read from a 24-hour overlap window during daily reconciliation to tolerate force-pushes and clock anomalies.
-- Releases, branches, and tags are small enough to list and diff during daily reconciliation.
+- PRs, issues, and releases use a 10-minute overlap on source `updated_at`. The job defines a bounded window, completes every page, commits entity upserts plus the window checkpoint atomically, and only then advances `high_water_at`. The next run begins at `high_water_at - overlap`; it never advances a cursor per page. Equal timestamps are re-read and upserts accept `incoming.github_updated_at >= stored.github_updated_at` so same-second fields can fill without regressing newer state.
+- Commit synchronization is **ref-head based**, not time-cursor based. Store every tracked branch `head_sha`. If the new head equals the stored head, no-op. Otherwise walk/list from the new head until the old head or a configured request/commit bound. If the old head is not an ancestor, or the push is forced/diverged, mark commits reachable only from that ref as unreachable and import the new walk. Preserve commit rows as observed history; never delete them because a ref moved.
+- A 24-hour committer-date overlap is an additional repair heuristic, not the primary commit cursor. GitHub commit `since` is a Git committer-date filter and cannot prove force-push completeness.
+- Releases, branches, and tags are listed/diffed during daily reconciliation; payload caps and multi-tag webhook omissions make API inventory authoritative.
 - Use ETags/`If-None-Match` where supported. A 304 is a successful check, not an empty result.
-- Store rate limit remaining/reset values on each job. Pause until `Retry-After` or reset plus jitter. Installation requests currently have a minimum primary budget of 5,000/hour, but secondary limits still apply. [GitHub rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+- Store rate-limit remaining/reset values on each job. Honor `Retry-After` and reset headers with jitter. Limit each installation to one or two GitHub requests in flight; secondary limits are expected before the primary 5,000/hour budget during large backfills. [GitHub rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
 
 ### Webhook receipt and processing
 
-1. Read the exact raw bytes with a strict size limit.
-2. Verify `X-Hub-Signature-256` using constant-time HMAC comparison before JSON parsing.
-3. Validate required headers and supported event type.
-4. In one database transaction, insert `webhook_deliveries` keyed by `X-GitHub-Delivery`, store a limited raw payload, and enqueue/record an outbox job.
-5. Return `202` quickly. A duplicate delivery returns `200/202` without adding another job.
-6. Worker claims the delivery, validates its schema, upserts source entities using GitHub source timestamps, emits/updates canonical events, and marks processing status.
-7. Unknown actions are retained and marked ignored, not treated as successful known processing.
+1. Perform cheap method/content-type/header checks and reject declared/streamed bodies above 2 MB with 413. GitHub can omit payloads above its own 25 MB cap; reconciliation repairs those gaps.
+2. Read the bounded exact raw bytes and verify `X-Hub-Signature-256` using constant-time HMAC comparison before JSON parsing. During secret rotation, accept current or previous secret for a short, dated overlap window.
+3. Parse only after signature success. Zod envelopes strip/passthrough unknown fields and validate only fields DevMemoir persists. A deleted/ghost actor is nullable and cannot crash a projector.
+4. In one database transaction, insert or update `webhook_deliveries` keyed by `X-GitHub-Delivery`, store encrypted limited-retention payload bytes, and create/ensure one logical processing job through the outbox.
+5. Return 2xx promptly after durable receipt. Invalid signatures/bodies are not stored. Signed unsupported event types and unknown actions are acknowledged as `ignored` with a metric, not 4xx/5xx.
+6. Worker claims the row, moves it through the state machine, re-fetches authoritative source facts where required, applies source-timestamp upserts, projects events, and marks the row `processed` or `ignored` only after the transaction succeeds.
+7. For `push`, persist only `ref`, `before`, `after`, `forced`, repository/installation IDs, and receipt metadata needed to enqueue `sync_commits`. Never create commit rows from `payload.commits[]`. A zero `after` SHA/branch delete updates ref reachability and does not invent commit history.
 
-GitHub delivery GUIDs are globally unique, payloads can be delayed or arrive out of order, and the secure signature header is HMAC-SHA256. [Webhook headers](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [webhook troubleshooting](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/troubleshooting-webhooks).
+`X-GitHub-Delivery` identifies the GitHub event, not a successful HTTP/worker attempt. Redeliveries keep the same GUID. The row state machine is:
+
+| State | Meaning | Same-GUID receipt behavior |
+|---|---|---|
+| `received` | Durable receipt exists; job not yet claimed | Ensure the existing logical job is queued |
+| `processing` | Worker lease active | Return 2xx; do not create a parallel job; lease recovery resumes if stale |
+| `failed` | Transient processing failure | Re-enqueue/resume the same row according to retry policy |
+| `dead_letter` | Retry budget exhausted/deterministic failure | Explicit redelivery or owner retry reopens the same row and job; preserve audit fields |
+| `processed` | Source/event transaction completed | Return 2xx; no new job |
+| `ignored` | Authenticated but unsupported/non-domain event/action | Return 2xx; no new job |
+
+Store `receipt_count`, `last_received_at`, processing attempts, sanitized error code, and job/lease reference. The GUID unique constraint prevents a second event row; entity and event natural keys provide the deeper idempotency when different deliveries describe the same GitHub entity. [Webhook headers](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [webhook troubleshooting](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/troubleshooting-webhooks).
 
 ### Reconciliation schedule
 
-| Scope | v0.1 interval | Purpose |
+| Scope | Gate A interval | Purpose |
 |---|---|---|
 | Webhook delivery processing | continuous | Near-real-time updates |
-| Failed GitHub App delivery audit | every 6 hours | Detect/redeliver failures within GitHub's three-day window |
-| Recently active repositories | every 6 hours, 24-hour overlap | Repair recent PR/issue/commit/release drift |
-| All authorized repositories | daily | Inventory, metadata, branches/tags, cursors, permissions |
-| Deep rolling reconciliation | weekly, partition repositories | Re-list full PR/issues/releases and bounded commit windows |
+| Failed GitHub App delivery audit | every 6 hours | App-JWT audit/redelivery within GitHub's three-day window |
+| Recently active repositories | every 6 hours, bounded overlap/head walk | Repair recent PR/issue/commit/release drift without full re-list |
+| All authorized repositories | daily | Paginated inventory, metadata, branches/tags, cursors, permissions |
+| Deep rolling reconciliation | after Gate A / v0.2 | Partitioned full PR/issue/release and bounded commit checks if measured drift justifies it |
 | Backup restore drill | quarterly | Prove application-level recoverability |
 
-GitHub does not automatically redeliver failed webhooks; a response taking over 10 seconds is recorded as failed, and deliveries can be redelivered for three days. [Failed delivery behavior](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries), [redelivery window](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks).
+The delivery audit uses an App JWT (not a user or installation token), pages newest-first, stops when `delivered_at` is older than its durable cursor, and requests redelivery only when no attempt for the GUID succeeded. GitHub does not automatically redeliver failed webhooks; a response taking over 10 seconds is recorded as failed, and deliveries can be redelivered for three days. [Failed delivery behavior](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries), [redelivery window](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks).
 
 ### Idempotency and ordering
 
-- Delivery dedupe key: `github_delivery_guid` unique.
-- Source entities: `(repository_id, github_id)` for PR/issues/releases; `(repository_id, sha)` for commits.
+- Receipt identity: global unique `github_delivery_guid`; it is an event key, not a success flag.
+- Source entities: `(tenant_id, repository_id, github_id)` for PR/issues/releases; `(tenant_id, repository_id, sha)` for commits.
 - Canonical event key: `(tenant_id, repository_id, source_system, source_kind, source_external_id, verb)`. Repository scope prevents the same commit SHA in forks from colliding.
-- Jobs have a unique logical key such as `backfill:{repository_id}:{stage}:{generation}`.
-- Source updates apply only when incoming `github_updated_at >= stored.github_updated_at`; equal timestamps still allow missing fields to be filled.
+- Jobs have a unique logical key such as `delivery:{delivery_id}` or `backfill:{repository_id}:{stage}:{generation}`. Re-enqueue uses the same logical key after failed/stale state recovery.
+- Every writer applies the same stale-update rule. Backfill, webhook-triggered fetch, and reconciliation converge even when they race.
 - Deletions/force pushes set reachability/tombstone status. They do not erase previously observed history unless a user deletion policy requires it.
 - Never sequence truth by webhook receive time. Keep `occurred_at`, `source_updated_at`, `first_observed_at`, and `last_observed_at` separately.
 
@@ -399,7 +453,7 @@ GitHub does not automatically redeliver failed webhooks; a response taking over 
 
 ### Source entities versus development events
 
-Source tables represent GitHub's current facts. `development_events` is the stable activity vocabulary used by timelines and later analysis.
+Source tables represent GitHub's current facts in **connected repositories**. `development_events` is the stable fact projection used by timelines and later analysis; it is not proof that every fact is a personal accomplishment.
 
 ```text
 GitHub source entity       Canonical events
@@ -411,35 +465,46 @@ repository             -> repository.created, repository.archived, repository.re
 tag                     -> tag.created, tag.deleted
 ```
 
-Do not double-count a merged PR as both “closed” and “merged” in default analytics. Preserve both lifecycle facts if needed, but mark `merged` as the primary contribution event.
+Preserve lifecycle facts, then collapse them in the default view/projector rules:
+
+- a merged PR is not also rendered as a separate “closed” accomplishment;
+- `commit.authored` and `commit.committed` for the same SHA/person render once, preferring author;
+- a merger/committer does not inherit authorship of the PR or squash content;
+- collaborator events remain **project context** unless the connected owner is the actor;
+- `actor_kind == bot` is hidden by default, while bot facts remain queryable;
+- release publication may be explicitly classified as a project milestone even when another actor published it;
+- issue closure remains its own lifecycle fact and is not attributed to a PR author by inference.
 
 ### `development_events` shape
 
 | Field | Meaning |
 |---|---|
 | `id` | Internal UUIDv7 |
-| `tenant_id`, `repository_id` | Isolation and project context |
-| `actor_github_account_id` | Stable external actor when GitHub can resolve it |
-| `event_type`, `verb` | Controlled vocabulary |
+| `tenant_id`, `repository_id` | Isolation and connected-project context |
+| `actor_github_account_id` | Stable external actor when GitHub can resolve it; nullable for `ghost`/unknown |
+| `actor_kind` | `user`, `bot`, or `unknown`, derived from GitHub account type |
+| `event_type`, `verb` | Controlled factual vocabulary |
 | `source_kind`, `source_external_id` | Trace back to source row |
 | `contribution_role` | author, committer, opener, merger, releaser, maintainer |
+| `context_kind` | `personal`, `project`, or `unknown`; deterministic/queryable, never AI-inferred in v0.1 |
 | `occurred_at`, `source_updated_at` | Historical ordering and stale-update defense |
-| `title`, `summary_input` | Non-AI factual text suitable for future classification |
-| `additions`, `deletions`, `files_changed` | Optional quantitative context, never a score |
-| `language_context`, `labels`, `path_hints` | Structured JSONB features |
-| `attribution_confidence` | exact GitHub actor, linked commit author, email match, unknown |
+| `title`, `summary_input` | Minimal factual text suitable for future classification |
+| `additions`, `deletions`, `files_changed` | Optional future quantitative context, never a score |
+| `language_context`, `labels`, `path_hints` | Optional/versioned features; paths are not populated in v0.1 |
+| `attribution_confidence` | exact GitHub actor, parsed co-author later, or unknown; no raw-email matching by default |
+| `completeness_state` | observed/reachable-at-sync/known-unknown/out-of-scope metadata for view copy |
 | `visibility_snapshot` | public/private/internal at observation time |
 | `classification`, `classification_source`, `classification_version` | Nullable future feature/refactor/etc. labels |
 
-### Future classification inputs
+### Retained inputs and future classification
 
-Permanently retain commit subject/body, PR/issue title and body (subject to user controls), labels, milestone, release name/body, timestamps, changed file **paths** and aggregate line counts, languages, and relationship links such as PR merge commit SHA and closing issues. Do not retain diff patches or source blobs.
+v0.1 permanently retains commit messages, PR/issue/release titles and factual lifecycle metadata, labels/milestones where useful, timestamps, languages, and relationship IDs such as PR merge commit SHA. PR/issue/release bodies default to **not collected** until an explicit owner control and later experiment approve them. `commit_files`, file paths, line counts, patches, blobs, and source contents are not populated in v0.1.
 
-Rule-based classification can precede AI: conventional commit prefixes, labels, file-path groups (`docs/`, tests, CI), release links, and PR metadata. Classifications are versioned annotations, never destructive rewrites of source facts.
+Rule-based classification can later use conventional commit prefixes, labels, release links, and PR metadata. `Co-authored-by` trailers may be parsed into versioned attribution after an experiment, but raw Git author/committer emails are never stored. Classifications are annotations, never destructive rewrites of source facts.
 
-### Attribution policy
+### Default memoir query and attribution policy
 
-The memoir view defaults to events attributable to the GitHub account linked to the connected DevMemoir user. A commit is exact when GitHub returns a linked author/committer account ID. Unlinked commits remain repository context with `unknown` or low-confidence attribution; do not silently equate display names. Email-based linking is opt-in and should store an HMAC of normalized email rather than exposing the address. Repository-level releases may be shown as project milestones even when the actor differs, with a visible context label.
+The default memoir query includes events whose actor is the GitHub account linked to the DevMemoir user, plus explicitly marked project milestones; it excludes bots and applies the collapse rules above. A commit is exact when GitHub returns a linked author/committer account ID. Unlinked commits remain visible only as project/unknown context and are never matched by display name. Repository-level facts remain accessible in a separate project-context view.
 
 ## 8. Initial PostgreSQL schema
 
@@ -450,37 +515,39 @@ Use UUIDv7 internal keys, `bigint` for GitHub numeric IDs, `timestamptz` everywh
 | `tenants` | `id PK`, `slug UNIQUE`, `created_at`, `deletion_requested_at` |
 | `users` | `id PK`, `primary_tenant_id FK`, `display_name`, `created_at`, `deleted_at` |
 | `tenant_members` | `(tenant_id, user_id) PK`, `role`, `created_at`; future membership model |
-| `github_accounts` | `id PK`, `github_account_id bigint UNIQUE`, `account_type`, mutable `login`, `node_id`, `avatar_url`, `profile_updated_at`; represents any GitHub actor, not necessarily a DevMemoir user |
-| `github_identities` | `id PK`, `user_id FK`, `github_account_id FK`, `linked_at`, `verified_at`, UNIQUE `(user_id,github_account_id)`; links a DevMemoir user to an external account |
-| `github_user_credentials` | `github_identity_id PK/FK`, encrypted refresh/access material only if required, `expires_at`, `key_version` |
+| `github_accounts` | `id PK`, `github_account_id bigint UNIQUE`, `account_type`, `actor_kind`, mutable `login`, `node_id`, `avatar_url`, `profile_updated_at`; represents any GitHub actor, including `Bot` and `ghost`, without raw Git email |
+| `github_identities` | `id PK`, `user_id FK UNIQUE`, `github_account_id FK UNIQUE`, `linked_at`, `verified_at`; v0.1 is one DevMemoir user to exactly one verified GitHub user account |
+| `github_user_credentials` | optional `github_identity_id PK/FK`, encrypted refresh/access material, `expires_at`, `key_version`; deliberately unpopulated in M1 and added only if a later API flow truly requires a user token |
+| `auth_transactions` | `id PK`, hashed single-use state, encrypted PKCE verifier, return path allowlist value, GitHub account/install claims, `expires_at`, `consumed_at`; short retention and never exposed to the browser |
+| `application_sessions` | `id PK`, `user_id FK`, hashed session token, `created_at`, `expires_at`, `revoked_at`, last-seen metadata allowlist; browser receives only the opaque host-only cookie |
 | `github_installations` | `id PK`, `tenant_id FK`, `github_installation_id bigint UNIQUE`, `account_github_account_id FK`, `status`, `permissions jsonb`, `repository_selection`, `suspended_at`, `deleted_at` |
 | `repositories` | `id PK`, `tenant_id FK`, `github_repository_id bigint`, `node_id`, mutable `owner_login/name/full_name`, visibility flags, default branch, description, topics/languages jsonb, `github_created_at/updated_at/pushed_at`, `archived_at/deleted_at`; UNIQUE `(tenant_id,github_repository_id)`, index `(tenant_id,pushed_at DESC)` |
 | `repository_access` | `id PK`, `tenant_id FK`, `repository_id FK`, `installation_id FK`, `access_status`, `selected_at`, `revoked_at`; UNIQUE `(tenant_id,repository_id,installation_id)`, index `(tenant_id,access_status)` |
 | `repository_name_history` | `id PK`, `tenant_id FK`, `repository_id FK`, owner/name/full_name, `valid_from`, `valid_to`; index on tenant/repository/time |
 | `branches` | `id PK`, `tenant_id FK`, `repository_id FK`, `name`, `head_sha`, `protected`, `last_seen_at`, `deleted_at`, UNIQUE `(tenant_id,repository_id,name)` |
-| `tags` | `id PK`, `tenant_id FK`, `repository_id FK`, `name`, `target_sha`, `tagger_*`, `last_seen_at`, `deleted_at`, UNIQUE `(tenant_id,repository_id,name)` |
-| `commits` | `id PK`, `tenant_id FK`, `repository_id FK`, `sha`, author/committer GitHub account FKs nullable, message, author/committer timestamps, parent SHAs jsonb, stats, verification fields, `first_seen_at`; UNIQUE `(tenant_id,repository_id,sha)`; indexes on tenant/repository/author date and actor/date |
-| `commit_files` | `tenant_id FK`, `(commit_id,path) PK`, status, additions/deletions/changes, previous path; **no patch column** |
+| `tags` | `id PK`, `tenant_id FK`, `repository_id FK`, `name`, `target_sha`, nullable tagger GitHub account, `last_seen_at`, `deleted_at`, UNIQUE `(tenant_id,repository_id,name)` |
+| `commits` | `id PK`, `tenant_id FK`, `repository_id FK`, `sha`, nullable author/committer GitHub account FKs, message, author/committer timestamps, parent SHAs jsonb, stats, verification fields, `first_seen_at`; no raw author/committer email; UNIQUE `(tenant_id,repository_id,sha)` |
+| `commit_files` | deferred schema placeholder: `tenant_id FK`, `(commit_id,path) PK`, status and counts, previous path; **not populated in v0.1 and no patch column** |
 | `commit_refs` | `tenant_id FK`, `(commit_id,branch_id) PK`, `last_seen_at`, `reachable` |
-| `pull_requests` | `id PK`, `tenant_id FK`, `repository_id FK`, `github_pull_request_id bigint`, `number`, actor account FKs, state/draft, title/body, head/base refs and SHAs, labels jsonb, created/updated/closed/merged timestamps, merge commit SHA, stats; UNIQUE `(tenant_id,repository_id,github_pull_request_id)`, UNIQUE `(tenant_id,repository_id,number)` |
-| `issues` | `id PK`, `tenant_id FK`, `repository_id FK`, `github_issue_id bigint`, `number`, actor account FKs, state/reason, title/body, labels/milestone jsonb, created/updated/closed timestamps; same two uniqueness patterns |
-| `releases` | `id PK`, `tenant_id FK`, `repository_id FK`, `github_release_id bigint`, author account FK, tag/name/body, draft/prerelease, target, created/published/updated timestamps; UNIQUE `(tenant_id,repository_id,github_release_id)` |
-| `development_events` | fields from section 7; UNIQUE `(tenant_id,repository_id,source_system,source_kind,source_external_id,verb)`; indexes `(tenant_id,occurred_at DESC)`, `(tenant_id,repository_id,occurred_at DESC)`, `(tenant_id,actor_github_account_id,occurred_at DESC)` |
-| `webhook_deliveries` | `id PK`, `tenant_id FK nullable until installation resolution`, `github_delivery_guid varchar(64) UNIQUE`, event/action, installation/repository external IDs, headers allowlist jsonb, `payload_ciphertext bytea`, `payload_key_version`, received/processed timestamps, status, attempts, error_code, `payload_expires_at`; indexes on status/received and expiry; invalid-signature bodies are not retained |
-| `sync_jobs` | `id PK`, `tenant_id`, installation/repository FKs, kind/stage/status, `logical_key UNIQUE`, attempt/max_attempts, scheduled/started/finished/heartbeat timestamps, rate-limit snapshot, error_code/sanitized message |
-| `sync_cursors` | `tenant_id FK`, `(repository_id,resource_type) PK`, cursor jsonb, high_water_at, etag, last_success_at, last_full_reconcile_at, schema_version |
-| `outbox` | `id PK`, `tenant_id FK`, aggregate type/id, event type, payload jsonb, created/published timestamps; index tenant/unpublished |
+| `pull_requests` | `id PK`, tenant/repository and GitHub IDs, actor account FKs, state/draft, title, nullable body, refs/SHAs, labels, lifecycle timestamps, merge SHA, stats; body remains null in v0.1; tenant-scoped external-ID and number uniqueness |
+| `issues` | `id PK`, tenant/repository and GitHub IDs, actor account FKs, state/reason, title, nullable body, labels/milestone, lifecycle timestamps; body remains null in v0.1; tenant-scoped external-ID and number uniqueness |
+| `releases` | `id PK`, tenant/repository and GitHub IDs, author account FK, tag/name, nullable body, draft/prerelease, target and timestamps; body remains null in v0.1 |
+| `development_events` | fields from section 7; UNIQUE `(tenant_id,repository_id,source_system,source_kind,source_external_id,verb)`; indexes by tenant/time, repository/time, and actor/time |
+| `webhook_deliveries` | `id PK`, nullable tenant until installation resolution, delivery GUID UNIQUE, event/action, installation/repository external IDs, allowlisted headers, encrypted payload, key version, first/last received timestamps, `receipt_count`, state, processing lease, attempts, error code, processed timestamp, `payload_expires_at`; indexes on state/time and expiry; invalid-signature bodies are never retained |
+| `sync_jobs` | `id PK`, tenant/installation/repository FKs, kind/stage/state, `logical_key UNIQUE`, attempt/max attempts, schedule/lease/heartbeat timestamps, rate-limit snapshot, sanitized error code/message |
+| `sync_cursors` | tenant/repository/resource key, cursor jsonb, high-water/head SHA, ETag, last success/full reconcile timestamps, schema version |
+| `outbox` | `id PK`, `tenant_id FK`, aggregate type/id, event type, minimal payload jsonb, created/published timestamps; index tenant/unpublished |
 | `audit_log` | `id PK`, tenant/user IDs, action, target type/id, metadata allowlist, occurred_at; no private content |
 
-All collected private/source tables carry `tenant_id` directly so future RLS does not depend on fragile multi-hop joins. This intentionally duplicates source facts if two tenants authorize the same repository; the privacy and deletion boundary is worth more than storage deduplication at expected scale. Foreign keys should normally restrict tenant/user deletion until the explicit deletion workflow runs. Source rows use `ON DELETE CASCADE` only inside a repository purge transaction. Add database checks for valid states and nonnegative stats.
+All collected private/source tables carry `tenant_id` directly. The first schema enables and forces RLS for the non-owner application roles on every tenant table, with the tenant context set transaction-locally; migrations and the narrowly scoped queue role remain separate. API and worker use tenant-scoped repositories, while the web process has read-only access through the API/session boundary. CI must prove cross-tenant negative cases both through repository code and direct SQL. This intentionally duplicates source facts when two tenants authorize the same repository: the privacy/deletion boundary is worth the storage at expected scale. Foreign keys restrict tenant/user deletion until the explicit purge workflow runs; cascades are limited to that transaction. Add checks for valid states and nonnegative statistics.
 
 ### Permanent versus limited-retention data
 
-**Permanent while connected/retained:** stable IDs, repository metadata/history, normalized source records, commit messages, PR/issue/release semantic content according to user setting, aggregate stats, file paths, events, cursors, and minimal audit history.
+**Permanent while connected/retained:** stable IDs, repository metadata/history, normalized source records, commit messages, titles and lifecycle metadata, selected labels/milestones, events, cursors, and minimal audit history. Bodies, file paths, file counts, patches, blobs, and source content are outside the v0.1 retained set.
 
-**Limited retention (default 30 days):** raw webhook payloads and sanitized processing errors. Shorten to 7 days after operational confidence. Failed/dead-letter payloads may be retained up to 90 days with explicit restricted access.
+**Limited retention:** valid raw webhook payloads and sanitized processing errors expire after **7 days by default**. A deterministic failure may retain its encrypted dead-letter payload for investigation, but an automatic hard cap between 14 and 30 days must be configured; v0.1 uses 30 days. Successful processing never extends payload expiry.
 
-**Never store:** GitHub App installation tokens, App JWTs, repository clones, blobs, file contents, diff patches, Actions logs/artifacts, secret values, or arbitrary request headers.
+**Never store:** raw Git author/committer emails, GitHub App installation tokens, App JWTs, repository clones, blobs, file contents, diff patches, Actions logs/artifacts, secret values, or arbitrary request headers.
 
 ## 9. Privacy and security review
 
@@ -488,201 +555,202 @@ All collected private/source tables carry `tenant_id` directly so future RLS doe
 
 | Threat | Required control |
 |---|---|
-| App private key theft compromises all installations | Provider secret store initially; never DB/git/log; restrict service access to API/worker; rotate and delete old keys; move to sign-only KMS/HSM before public beta |
-| Installation token leakage | Mint just in time, keep in memory, scope down where useful, redact authorization headers, never enqueue or persist token |
-| OAuth/user refresh token theft | Avoid storing unless required; envelope-encrypt with AES-256-GCM and versioned KMS-managed key; separate decrypt permission |
-| Forged/replayed webhook | Verify raw-body HMAC-SHA256 constant-time; GUID unique constraint; size/content-type limits; reject before parsing |
-| Cross-tenant data access | Tenant-scoped repository methods, compound ownership checks, negative integration tests; add PostgreSQL RLS before multi-user beta as defense in depth |
-| Private content in logs/traces | Structured allowlist logging; no payload/body/message/path logging; scrub exception context and APM breadcrumbs |
-| Overcollection via Contents permission | Endpoint allowlist blocks contents/blobs/archive/compare patches; no cloning; record outbound endpoint metrics |
-| Database or backup disclosure | TLS, provider encryption at rest, paid backups, least-privilege DB roles, restricted exports, restore audit |
-| Dependency/supply-chain compromise | Lockfile, automated updates, provenance-aware CI, secret scanning, minimal runtime image, dependency audit |
-| Future AI provider receives private data unexpectedly | Per-tenant opt-in, preview exact data class, no training by contract/config, DPA and retention review, prompt/output audit with redaction |
+| App private key theft compromises all installations | Provider secret store; never DB/git/log; API/worker only; documented overlapping-key rotation and old-key revocation; sign-only KMS/HSM before public beta |
+| Installation token leakage | Mint just in time, keep in memory, optionally scope down, redact authorization headers, never enqueue/persist; web never receives App credentials |
+| OAuth/session theft or fixation | PKCE S256; hashed single-use state and handoff codes; short-lived auth transactions; host-only Secure HttpOnly SameSite=Lax cookie; rotation/revocation; CSRF on mutations |
+| Installation claimed by wrong user | Compare installation account ID/type with the signed-in GitHub account; reject mismatch; no-state setup claims require an authenticated session and authoritative re-verification |
+| Forged/replayed/oversized webhook | 2 MB application-body cap before buffering, HMAC-SHA256 over raw bytes, constant-time compare, GUID state machine, content-type/field limits, rotation overlap for current/previous webhook secrets |
+| Cross-tenant data access | Direct tenant IDs, forced RLS for application roles from the first schema, transaction-local tenant context, scoped repositories, direct-SQL and service negative tests |
+| Private content in logs/traces | Structured allowlist logger and tested exception scrubber in M1; no arbitrary objects; Sentry/OTel disabled until scrubber fixtures prove private strings absent |
+| Overcollection via Contents permission | Central outbound endpoint permit-list blocks contents/blobs/archives and strips compare patches; no cloning; denial tests and endpoint metrics |
+| Database or backup disclosure | TLS, provider encryption, paid backups, separate least-privilege pooled/direct roles, restricted exports, restore audit |
+| Future AI provider receives private data | Explicit per-tenant opt-in, exact data-class preview, no training by contract/config, DPA/retention review, redacted evidence-linked audit |
 
-The GitHub App private key grants access across installations and must receive the strongest protection. GitHub explicitly recommends minimum permissions, secure credentials, webhook secrets, expiring tokens, and deletion capability. [GitHub App security practices](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/best-practices-for-creating-a-github-app).
+The GitHub App private key grants access across installations and receives the strongest protection. GitHub recommends minimum permissions, secure credentials, webhook secrets, expiring tokens, and deletion capability. [GitHub App security practices](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/best-practices-for-creating-a-github-app).
 
-### Data minimization
+### Data minimization and presentation
 
-**Required:** external IDs, timestamps, repository visibility/access state, commit messages and linkage, PR/issue/release titles and lifecycle, installation/cursor state, normalized events.
+**Required in v0.1:** external IDs, timestamps, visibility/access state, commit messages and linkage, PR/issue/release titles and lifecycle, selected labels/milestones, installation/cursor state, and normalized events.
 
-**Useful but optional/user-controlled:** PR/issue/release bodies, changed file paths, line-count aggregates, labels, languages, low-confidence commit email linking.
+**Deferred and off by default:** PR/issue/release bodies, changed file paths, file/line statistics, comments/reviews, and co-author trailer parsing. Enabling a later data class requires an owner-facing control, retention decision, endpoint-budget measurement, and schema/privacy review.
 
-**Prefer not to store:** raw source, patches, comments/reviews in v0.1, workflow logs, artifacts, full webhook payloads beyond debugging retention, user email addresses.
+**Never infer identity from:** raw commit email or display name. Store neither raw Git author/committer email nor low-confidence email links. `ghost` and unresolved actors remain nullable/unknown project context.
 
-Offer a “metadata-minimal” mode later that stores titles/messages but omits bodies and file paths. In all modes, UI must mark private repositories and prevent public sharing by default.
+Commit messages and other retained private text are rendered with safe length limits, never sent to third-party error/search/analytics systems, and never made publicly indexable. The UI marks private repositories and prevents public sharing by default.
 
 ### Disconnect and deletion
 
-- **Uninstall/disconnect:** immediately stop token creation and jobs; mark access revoked; retain history privately for a configurable grace period (proposed 30 days) or delete immediately at user request.
-- **Repository removed from installation:** stop new collection; retain/detach history under the same policy.
-- **Account deletion:** create auditable deletion job, revoke sessions/tokens, purge tenant rows and payloads, then request/track provider backup expiry. Return confirmation without claiming backup erasure before provider retention expires.
-- Provide export-before-delete in a later phase; deletion must not depend on it.
+- **Uninstall/disconnect:** immediately stop token creation and jobs; mark access revoked; retain history privately for a documented grace period (default proposal 30 days) or delete immediately at user request.
+- **Repository removed from installation:** stop new collection and authoritative reads; retain/detach history under the same policy.
+- **Account deletion:** revoke sessions, stop jobs, purge live tenant rows and payloads with an auditable job, then track provider backup expiry. Confirmation distinguishes live deletion from backup-retention expiry.
+- Export may arrive later; deletion cannot depend on export. Gate A requires expiry and deletion tests before real private-owner data is relied upon.
 
 ## 10. Reliability model
 
 ### Failure handling
 
-| Failure | Behavior |
+| Failure | Required behavior |
 |---|---|
-| Webhook handler crash before commit | GitHub records failure; six-hour delivery audit requests redelivery; API reconciliation also repairs state |
-| Crash after commit before response | Redelivery hits GUID unique constraint and returns success |
-| Worker crash | Job lease/heartbeat expires; another worker retries; page transaction prevents half-page checkpoint |
-| GitHub 5xx/network error | Exponential backoff with full jitter: 5s base, cap 15m, max 8 transient attempts |
-| GitHub primary/secondary rate limit | Honor `Retry-After`/`X-RateLimit-Reset`; pause installation lane; reduce concurrency; never hot-loop |
+| Webhook crash before durable receipt | Return failure; GitHub delivery audit requests redelivery with an App JWT; reconciliation remains the data backstop |
+| Crash after receipt commit, before response | Same GUID increments receipt metadata; if state is `received`, `processing`, `failed`, or `dead_letter`, ensure processing is pending/resumable; no-op only for `processed`/`ignored` |
+| Worker killed during processing | Lease/heartbeat expires; the same logical job resumes; source-page transaction and cursor update are atomic |
+| Processing transaction committed before job acknowledgement | Retry observes source/event uniqueness and completes the delivery state transition without double projection |
+| `push` payload is incomplete, truncated, or forced | Never persist payload commit objects; enqueue an authoritative ref-head sync using `ref`, `before`, `after`, and `forced` |
+| GitHub 5xx/network error | Exponential backoff with full jitter: 5s base, 15m cap, maximum 8 transient attempts |
+| Primary/secondary rate limit | Honor `Retry-After`/`X-RateLimit-Reset`; pause installation lane, lower concurrency, and never hot-loop |
 | Database outage | Webhook returns failure because durability is unavailable; delivery audit/redelivery and reconciliation recover later |
-| Duplicate/replay | Delivery GUID and entity/event unique constraints make it a no-op with observation timestamps updated |
-| Delayed/out-of-order update | Apply by source timestamps and authoritative re-fetch ambiguous entities |
-| Partial backfill | Resume last committed stage/page with overlapping upserts |
-| Deployment during delivery | Graceful shutdown stops accepting traffic, finishes current transaction, releases jobs; duplicate-safe redelivery |
-| Poison payload | After 5 deterministic failures, mark dead-letter with error code and restricted payload; alert owner |
+| Same-GUID redelivery after deterministic failure | Reopen/retain the auditable delivery, create or ensure one logical job, and retry after code/config repair; the GUID is identity, not proof of success |
+| Delayed/out-of-order update | Compare source timestamps and authoritatively re-fetch ambiguous entities |
+| Partial backfill | Resume the last committed stage/page with idempotent ref-head overlap |
+| Poison payload | After 5 deterministic attempts mark `dead_letter`, alert with an error code only, expire encrypted payload by the 30-day hard cap; owner retry requeues the same delivery |
 
-Retry classifications matter: do not retry authentication/permission 401/403 indefinitely; refresh installation state. Treat 404 as ambiguous until repository inventory confirms access loss. Treat schema/validation failures as deterministic and alert.
+Retry classification is explicit: do not retry 401/403 indefinitely; refresh installation/capability state. Treat 404 as ambiguous until paginated repository inventory confirms loss. A valid signed payload with an unknown event/action is `ignored`, not a 4xx or poison retry. Schema validators strip unknown fields and preserve supported nullable/`ghost` actors.
 
 ### Early-stage proportionality
 
-Use pg-boss leases, retries, and cron rather than Redis plus a separate scheduler. Keep dead-letter state in PostgreSQL and provide an authenticated owner-only retry action. Introduce Redis/SQS only when database job contention, independent scaling, or measured throughput requires it.
+Use pg-boss leases, retries, and cron through `JobPort`. The worker uses the direct Neon URL; polling every 1–2 seconds is acceptable, and `LISTEN/NOTIFY` is allowed only on a direct session connection. Keep recovery truth in source rows/cursors so a queue rebuild cannot lose progress. Introduce Redis/SQS only when measured database contention or independent scaling justifies it.
 
 ### Service objectives for v0.1
 
 - 99% of valid webhook receipts durably acknowledged within 2 seconds under expected load.
 - 95% of supported events visible within 2 minutes.
-- Daily reconciliation completes for all authorized repositories.
-- Zero known cross-tenant reads.
-- Backfill progress is monotonic and restartable; no manual database edits required.
+- Six-hour reconciliation completes for active repositories; daily inventory/reconciliation completes for all authorized repositories.
+- Zero known cross-tenant reads; every tenant table is protected by service checks and RLS.
+- Backfill progress is monotonic and restartable with no manual database edits.
 
-## 11. MVP roadmap
+## 11. MVP roadmap and release gates
 
-### v0.1 — Foundation
+### v0.1 — Owner-only foundation
 
-- Owner-only GitHub App login and installation.
-- Explicit public/private repository authorization.
-- Historical import of repository metadata, default-branch commits, PRs, issues, branches/tags, and releases.
-- Supported webhooks and near-real-time normalization.
-- Durable resumable jobs, cursors, reconciliation, delivery audit, and basic operational status.
-- Minimal private activity page: repository, date, actor/role, event type, source link.
-- Disconnect and delete controls; raw payload expiry.
+M1–M6 form **Gate A**. Until all six pass, use only synthetic/sandbox private data; do not rely on DevMemoir as the durable record for real private-owner history.
 
-**Success test:** for a selected repository, the timeline consistently explains commits, merged PRs, issues, and releases across backfill plus new activity, and reconciliation repairs an intentionally skipped webhook.
+- **M1 vertical slice:** one allowlisted owner and selected repository; PKCE/session/install binding; repository metadata; newest 100 reachable default-branch commits; push signal to authoritative sync; durable delivery state machine; owner-attributed private timeline; allowlist logs.
+- **M2 installation inventory:** installation lifecycle, authoritative account verification, and complete paginated `/installation/repositories` inventory regardless of webhook list truncation.
+- **M3 restartable backfill:** ref-head traversal, atomic page checkpoints, explicit completeness states, branches/tags plus metadata-only PRs/issues/releases; bodies/files remain off.
+- **M4 canonical projection:** factual events, owner/project context, bot/default collapse rules, source links, and stale-update protection.
+- **M5 repair loops:** six-hour active-repository reconcile, daily all-repository inventory/reconcile, App-JWT failed-delivery audit, rate-limit lanes, and owner-visible health.
+- **M6 privacy/recovery:** 7-day raw payload expiry, <=30-day dead-letter cap, disconnect/delete, webhook/private-key rotation rehearsal, paid always-on Neon backup restore, and tenant-isolation evidence.
 
-### v0.2 — Dashboard & analytics
+The M1 activity page displays the exact scope statement **“Newest 100 commits currently reachable from the default branch of this connected repository.”** It does not claim to show a user's full GitHub history. The default view shows the connected owner plus explicit project milestones, collapses duplicate authored/committed and merged/closed facts, and hides bots by default.
 
-- Cross-repository calendar/timeline, project attention by time/event counts (never productivity score), filters.
-- Rule-based classifications and project milestones.
-- Review/deployment experiments, richer attribution controls, exports.
-- Data-quality/completeness indicators.
+**Gate A success:** kill/restart and same-GUID failed-redelivery tests recover without double projection; a push payload commit list is ignored in favor of GitHub API facts; an intentionally missed delivery is repaired; private fixtures are absent from logs/errors; installation mismatch and cross-tenant reads are denied; expiry, deletion, rotation, and restore drills pass.
 
-### v0.3 — AI Chronicle
+### v0.2 — Quality and dashboard (Gate B)
 
-- Explicit opt-in AI summaries for week/month/year and project evolution.
-- Evidence-linked statements, prompt/model versioning, redaction controls, evaluation set, regenerate/delete.
-- Optional Python analysis service only if experiments justify it.
+M7 is a thinner soak/copy milestone after Gate A: run the owner flow for two weeks, validate completeness wording and quality indicators, measure Railway–Neon latency/cost, tune concurrency, and deliver cross-repository calendar/filter views. Counts describe project activity, never personal productivity.
 
-### v0.4 — Multi-user beta
+### v0.3 — Evidence and controlled experiments
 
-- Remove owner allowlist, tenant RLS, quotas, plan limits, support tooling, abuse controls.
-- Formal privacy/terms/DPA review, incident runbook, stronger KMS-backed key custody.
-- Billing and per-user installation lifecycle.
+- Evaluate all-active-branch history, per-commit file statistics, co-author attribution, bodies, reviews/deployments, and weekly deep reconcile independently.
+- Each new data class requires an endpoint-budget result, privacy/retention decision, explicit owner control when content-sensitive, migration, and updated completeness copy.
+- Rule-based classifications remain versioned annotations over source facts.
 
-### Later
+### v0.4 — Opt-in AI chronicle
 
-- Organizations, team-aware permissions, public profiles/sharing, Discussions/Actions integrations, richer deployment signals, external imports.
+- Explicit opt-in summaries with evidence links, exact input preview, prompt/model versioning, redaction, evaluation, regenerate/delete, vendor DPA/retention review, and no-training configuration.
+- Add a Python analysis service only if a measured experiment justifies a separate runtime.
+
+### Multi-user beta (Gate C)
+
+Before removing the owner allowlist: revalidate forced RLS and direct-SQL isolation, quotas/abuse controls, per-user installation lifecycle, incident/support runbooks, formal privacy/terms/DPA review, and stronger sign-only key custody. Organizations, teams, public profiles/sharing, Discussions/Actions, and external imports remain later work.
 
 ## 12. Testing strategy
 
-### Unit tests
+### Unit and contract tests
 
-- Raw-body signature verification including Unicode, wrong secret, missing/malformed headers, timing-safe comparison.
-- Payload-to-domain mapping for every supported action.
-- Event key construction and stale-update rejection.
-- Retry classification/backoff and rate-limit scheduling.
-- Attribution confidence and rule-based classification.
-- Secret/log redaction.
+- Raw-body HMAC verification over Unicode bytes, wrong/current/previous secrets, malformed headers, constant-time comparison, content type, and 2 MB rejection before parse.
+- Tolerant Zod schemas strip unknown fields, accept nullable/`ghost` actors, map every supported action, and mark unknown event/actions `ignored`.
+- Endpoint permit-list allows only named API shapes; contents/blob/archive calls are denied and compare responses cannot retain `patch`.
+- Push mapping persists only `ref`, `before`, `after`, `forced`, delivery/install/repository IDs and enqueues authoritative ref-head sync; injected payload commit messages never reach source/event tables.
+- Event keys, source-timestamp stale-update defense, attribution/collapse/bot rules, retry classes, and rate-limit scheduling.
+- Allowlist logger and exception scrubber prove a canary private repository name, commit message, body, path, payload, token, and secret are absent from logs/metrics/errors.
 
 ### Integration tests with real PostgreSQL
 
-- Two concurrent inserts of the same delivery produce one job.
-- Replayed delivery is a no-op.
-- Newer then older payload cannot regress source state.
-- Page upsert and cursor update are atomic.
-- Worker lease expiry resumes safely.
-- Pagination follows mocked `Link` headers and handles empty/final pages.
-- Backfill restart/resume and overlap window.
-- Rename preserves repository internal identity and history.
-- Installation repository removal/re-add.
-- Private-repository 403/404 classification.
-- Uninstall cancels jobs and blocks token minting.
-- Permission changes update capability state.
-- Tenant A cannot query any Tenant B row through every repository method.
-- Migrations apply from empty DB and upgrade a previous snapshot; down migrations are not required in production, but rollback procedure is tested.
+- Concurrent first receipts of the same GUID create one logical processing job and increment auditable receipt metadata.
+- Redelivery after `received`, worker-killed `processing`, `failed`, and owner-retried `dead_letter` resumes/requeues; only `processed` and `ignored` are terminal no-ops.
+- Kill a worker before and after source transaction commit; lease recovery yields one source fact/event and a completed delivery.
+- Newer then older source data cannot regress state; ref-head forced push updates reachability without deleting preserved commits.
+- Page upsert plus cursor/high-water update is atomic; restart and 24-hour supplemental overlap do not replace ref-head traversal.
+- Installation repository inventory follows every `Link` page even when `installation.created` contains a truncated repository list.
+- `/setup` and callback reject a non-allowlisted GitHub user, state replay/expiry, PKCE mismatch, open redirect, installation-account mismatch, and unauthenticated no-state claims.
+- `ping` and `github_app_authorization` return 2xx with intended side effects; uninstall/permission changes cancel or gate jobs/token minting.
+- Tenant A cannot read/write Tenant B through repository methods **or direct SQL under each application role**; migration owner/queue exceptions are narrowly verified.
+- Web database role cannot write GitHub-derived tables; API/worker roles can only perform their scoped operations.
+- Raw payload expiry deletes successes at 7 days and dead letters by 30 days without deleting normalized facts.
+- Migrations apply from empty DB and upgrade a previous snapshot; production rollback/restore procedure is exercised.
 
-### End-to-end tests
+### End-to-end and operational tests
 
-- GitHub test App/sandbox account: login → install on one repository → backfill → visible event.
-- Send a signed fixture twice; one timeline event appears.
-- Create/merge a PR and observe near-real-time event.
-- Suppress one webhook, run reconciliation, and observe repair.
-- Rename repository; links/name change without duplicate project.
-- Remove private repository permission; UI shows disconnected and no further API reads occur.
-- Uninstall App; jobs stop and disconnect state appears.
-- Account deletion removes live rows and invalidates session.
+- Sandbox GitHub App: PKCE login → selected installation → verified account binding → paginated inventory → newest 100 reachable default-branch commits → exact completeness copy.
+- Deliver a push fixture whose embedded commits disagree with mocked GitHub API results; the timeline reflects only authoritative API facts.
+- Fail processing, redeliver the same GUID, then repair/retry; one correct event appears. Repeat with a worker kill and deployment drain.
+- Create/merge a PR: preserve lifecycle facts but default timeline shows one merged accomplishment, does not inherit PR authorship to the merger, and hides bot activity.
+- Suppress a webhook; six-hour active reconcile repairs it. App-JWT delivery audit discovers a failed receipt without a user/installation token.
+- Rename/remove/re-add a private repository; internal identity is stable and reads stop while access is absent.
+- Uninstall and account deletion revoke access/sessions, stop jobs, remove live rows, and accurately report backup-retention status.
+- Rotate webhook and App secrets with an overlap window; old material is revoked after traffic proves the new material.
+- Restore paid always-on Neon backup into an isolated environment and verify tenant counts/cursors without exposing content in output.
 
-Use recorded, redacted GitHub fixtures for most CI tests. Run live GitHub tests nightly/manual because API behavior and rate limits make them unsuitable for every commit.
+Use recorded, redacted GitHub fixtures for most CI. Run live sandbox tests nightly/manual because API behavior and rate limits make them unsuitable for every commit. Gate A requires the failure, privacy, isolation, expiry/deletion, rotation, and restore cases above—not only the happy path.
 
 ## 13. Observability
 
-Every request/job log carries only opaque IDs: `request_id`, delivery GUID, job ID, tenant ID, installation ID, repository internal ID, event type, attempt, duration, result, and rate-limit bucket. Never log repository names, commit messages, bodies, file paths, payloads, or tokens by default.
+M1 ships a single structured **allowlist** logger. Callers provide named scalar fields only: opaque request/delivery/job/tenant/installation/repository IDs, event type, state/result, attempt, duration, and rate-limit bucket. Arbitrary objects, HTTP bodies/headers, GitHub responses, SQL parameters, repository names, commit messages, bodies, paths, payloads, tokens, and secrets are rejected or dropped. Exception serialization keeps an error class/code and scrubbed stack only.
+
+Sentry, OpenTelemetry exporters, session replay, and third-party search/analytics are disabled until canary-fixture tests prove the shared scrubber removes every private string from errors, breadcrumbs, attributes, and transport envelopes. Enabling one is a reviewed configuration change, not an environment-variable accident.
 
 Minimum metrics:
 
-- webhook receipt count/latency/signature failures/duplicates by event type;
-- delivery processing lag and dead-letter count;
-- queue depth, oldest job age, attempts, duration by job kind;
-- GitHub request count/status/remaining quota per installation;
-- backfill stage progress and last reconciliation age;
-- database errors and pool saturation;
-- raw-payload expiry backlog.
+- webhook receipt/processing count, latency, signature/size failure, state transition, same-GUID receipt count, and dead-letter count by event type;
+- queue depth/oldest age/attempts/duration, worker heartbeat, and lease recovery by job kind;
+- GitHub endpoint-name/status/quota and installation-lane pause, never URL/query/body content;
+- backfill stage, ref-head/checkpoint progress, active/all reconciliation age, and failed-delivery audit age;
+- pooled/direct database errors, connection count, pool saturation, and transaction duration;
+- 7-day payload-expiry and 30-day dead-letter purge backlog.
 
-Alerts for oldest supported webhook >10 minutes, dead-letter >0, reconciliation older than 36 hours, repeated auth failures, and payload deletion lag >24 hours.
+Alert for supported processing lag >10 minutes, dead-letter >0, active reconcile >12 hours, all-repository reconcile >36 hours, repeated auth/install mismatch, worker heartbeat loss, pool exhaustion, or payload deletion lag >24 hours. Run the private-canary log test in CI and immediately before enabling any new telemetry sink.
 
 ## 14. ADR summary
 
-The proposed records are in [`docs/architecture/adr`](./adr/):
+The seven records in [`docs/architecture/adr`](./adr/) remain accepted after reconciliation; their amendments are binding rather than optional notes:
 
-1. Option B TypeScript modular monolith with separate process boundaries.
-2. PostgreSQL as durable system of record; Neon hosted, Docker local.
-3. GitHub App user authorization plus per-installation access tokens.
-4. Durable-accept/async-process webhook architecture.
-5. PostgreSQL-backed jobs initially.
-6. Normalized development-event projection over source entities.
-7. Railway container hosting with separable API/worker processes.
+1. TypeScript modular monolith with separate web/API/worker processes and explicit writer authority/session handoff.
+2. PostgreSQL/Neon system of record with pooled web/API, direct worker/migrations, first-schema forced RLS, and v0.1 minimization.
+3. GitHub App PKCE login plus verified installation binding; App/installation credentials never become browser sessions.
+4. Durable webhook receipt **state machine**; a GUID identifies a delivery, while terminal success is only `processed`/`ignored`; push payload commits are never source facts.
+5. pg-boss behind `JobPort`, direct worker connectivity, lease/poll semantics, and queue-independent cursor recovery.
+6. One factual development-event projection with owner/project context, bot/collapse rules, nullable actors, and explicit completeness.
+7. Railway plus paid always-on Neon, separated production worker, small role-specific pools, and a measured cross-provider network gate.
 
-## 15. Highest risks, unresolved decisions, and readiness
+## 15. Highest risks, experiments, and readiness
 
 ### Five highest architectural risks
 
-1. **Historical completeness and attribution:** Git history, deleted branches, rebases, squash merges, and unlinked commit identities prevent a perfect personal record.
-2. **Private-data exposure:** Contents permission is broader than actual needs; a logging, endpoint, tenant, or AI boundary mistake could expose sensitive material.
-3. **Webhook gaps mistaken for truth:** GitHub does not automatically retry failed deliveries, so delivery auditing and reconciliation are product-critical, not optional polish.
-4. **Rate-limit/backfill growth:** Per-commit detail calls and many repositories can exhaust primary or secondary limits unless page checkpoints, concurrency lanes, and endpoint budgets are measured.
-5. **Premature schema semantics:** Double-counting PR merges/commits or confusing project context with personal contribution can make analytics untrustworthy even when ingestion is technically correct.
+1. **Completeness mistaken for personal history:** deleted refs, force-push gaps, squash/rebase behavior, and unlinked actors make the observable connected-repository slice incomplete by construction.
+2. **Private-data exposure:** the GitHub permission envelope is broader than retained data; endpoint, log/telemetry, session, tenant, backup, or future-AI mistakes can expose private facts.
+3. **Delivery identity mistaken for success:** a unique GUID without the explicit resumable state machine can permanently suppress a failed delivery.
+4. **Rate-limit/backfill growth:** per-entity calls and many repositories can exhaust limits unless ref-head checkpoints, small installation lanes, and endpoint budgets are measured.
+5. **Semantic over-attribution:** double-counted lifecycle events, bots, and collaborator/project activity can produce a technically correct but personally misleading memoir.
 
-### Unresolved decisions and required experiments
+### Deferred decisions and required experiments
 
 | Decision | Experiment before commitment |
 |---|---|
-| Default-branch-only versus all-active-branch commit backfill | Run both on the owner's 5 largest/divergent repositories; measure unique commits, requests, time, and perceived missing history |
-| Whether to fetch per-commit file stats in v0.1 | Sample 10k commits; measure requests, rate-limit cost, storage, and classification value |
-| pg-boss operational fit | Kill workers mid-page and during deployment; load 100k jobs; verify lease recovery, queue latency, and DB contention |
-| PR/issue full body default | Compare usefulness and privacy/storage impact; expose owner control before public beta |
-| Railway + Neon region/network behavior | Deploy vertical slice; measure webhook p95, DB connection stability, cold behavior, and monthly projected cost for two weeks |
-| GitHub identity matching | Audit a representative owner history and quantify exact linked, committer-only, ambiguous, and unmatched commits |
+| Default branch versus all active branch history | After Gate A, run both on the owner's five largest/divergent repositories; measure unique reachable commits, requests, time, and perceived gaps |
+| Per-commit files/statistics | After Gate A, sample 10k commits; measure rate-limit/storage/classification value; keep paths/counts off until the review passes |
+| pg-boss operational fit | During M1/M7, kill workers before/after transaction commit and load 100k jobs; verify lease recovery, polling latency, and DB contention |
+| PR/issue/release bodies | Later privacy experiment with explicit owner control and retention review; bodies remain unrequested/unpopulated through Gate A |
+| Weekly deep reconcile | Compare repair yield and API cost after six-hour active/daily all loops have production evidence |
+| Railway + Neon network/cost | Deploy the vertical slice in aligned regions for a two-week soak; measure webhook p95, connection stability, and projected monthly cost |
+| Identity/co-author attribution | Audit exact GitHub account links, nullable/ghost actors, and trailer value; never store raw Git emails or match display names |
 
 ### Exact first implementation milestone
 
-Create the GitHub App and smallest deployable vertical slice for **one allowlisted owner and one selected repository**: authenticate, install, import repository metadata plus the newest 100 default-branch commits, receive and verify a `push` webhook, durably deduplicate it, normalize commit events, and render one chronological activity page. Restart the worker midway and replay the webhook to prove resume/idempotency.
+Create the smallest deployable slice for **one allowlisted owner and one selected connected repository**. Configure the GitHub App with install-time OAuth disabled; implement PKCE S256, single-use server-side state/handoff, host-only session, and verified installation-account binding. Deploy web/API with a small pooled Neon URL and a separate always-on worker with the direct URL. Import repository metadata and the newest 100 commits reachable from the current default-branch head, render the exact completeness copy and owner-attributed collapsed timeline, then accept a signed `push` only as a durable sync signal.
 
-Detailed milestones and acceptance tests are in [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md).
+M1 is accepted only when same-GUID redelivery from a failed state and worker kills both recover, embedded push commits are ignored for authoritative API facts, installation mismatch/endpoint denial/cross-tenant tests pass, and private canary strings are absent from logs/errors. [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) contains the ordered milestones and release gates.
 
-### Assessment
+### Reconciliation assessment
 
-**GO WITH CONDITIONS.** Begin implementation once the GitHub App permissions are verified against a private test repository, paid restorable PostgreSQL is selected before any irreplaceable private history is relied upon, log redaction is present in the first slice, and the first milestone includes idempotency/restart tests. No unresolved decision blocks the vertical slice.
+**GO WITH CONDITIONS.** This patch resolves the formal review's three architecture-document blockers: delivery GUID semantics, authoritative push ingestion, and auth/session/installation binding. Implementation may begin against sandbox data once GitHub App settings/permissions and the pooled/direct connection topology are verified. Gate A—not M1 alone—must pass before relying on real private-owner history: paid always-on restorable Neon, M1 privacy telemetry controls, M1–M6 recovery/isolation/expiry/deletion/rotation evidence, and accurate completeness copy are mandatory. No deferred experiment above blocks the vertical slice.
