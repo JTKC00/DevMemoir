@@ -37,4 +37,16 @@ describe("worker delivery contract", () => {
     expect(store.deliveries.get("delivery-1")?.state).toBe("processed");
     expect(store.commits.has("tenant-1:repository-1:authoritative-head")).toBe(true);
   });
+
+  it("does not reopen a terminal delivery from a stale queued job", async () => {
+    for (const state of ["processed", "ignored"] as const) {
+      const store = new InMemoryM1Store();
+      const jobs = new InMemoryJobPort();
+      const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: `terminal-${state}`, eventName: "push", repositoryGithubId: 10, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
+      await store.updateDelivery(delivery.record.id, { state }, "tenant-1");
+      await processDelivery({ deliveryId: delivery.record.id, payload: { tenantId: "tenant-1", deliveryId: delivery.record.id, repositoryGithubId: 10 } }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
+      expect(store.deliveries.get(delivery.record.guid)?.state).toBe(state);
+      expect(store.deliveries.get(delivery.record.guid)?.processingAttempts).toBe(0);
+    }
+  });
 });

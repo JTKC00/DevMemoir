@@ -14,29 +14,67 @@ async function waitFor(predicate: () => boolean, timeoutMs = 20_000): Promise<vo
 }
 
 describeIntegration("real pg-boss adapter", () => {
-  it("creates queues, deduplicates a logical key, survives restart, and retries a failed handler", async () => {
+  it("deduplicates concurrent producers, keeps IDs real, and recovers after a worker restart", async () => {
     const key = `integration:${randomUUID()}`;
-    const sender = new PgBossJobPort(databaseUrl as string);
-    const worker = new PgBossJobPort(databaseUrl as string);
+    const producerA = new PgBossJobPort(databaseUrl as string);
+    const producerB = new PgBossJobPort(databaseUrl as string);
+    const workerC = new PgBossJobPort(databaseUrl as string);
+    const workerD = new PgBossJobPort(databaseUrl as string);
     let attempts = 0;
-    let received = false;
+    let businessEffects = 0;
+    let succeeded = false;
+    let firstFailureObserved = false;
     try {
-      await sender.start();
-      await worker.start();
-      const firstId = await sender.enqueue("webhook_delivery", key, { canary: "pgboss" });
-      const duplicateId = await sender.enqueue("webhook_delivery", key, { canary: "pgboss" });
-      expect(duplicateId).toBe(firstId);
-      await worker.work("webhook_delivery", async (job) => {
+      await producerA.start();
+      await producerB.start();
+
+      const concurrentIds = await Promise.all([
+        producerA.enqueue("webhook_delivery", key, { canary: "pgboss" }),
+        producerB.enqueue("webhook_delivery", key, { canary: "pgboss" }),
+      ]);
+      const realIds = concurrentIds.filter((id): id is string => Boolean(id));
+      expect(realIds).toHaveLength(1);
+      expect(concurrentIds).not.toContain(key);
+      expect(realIds[0]).toMatch(/^[0-9a-f-]{36}$/i);
+
+      const duplicateId = await producerA.enqueue("webhook_delivery", key, { canary: "pgboss-duplicate" });
+      expect(duplicateId).not.toBe(key);
+      expect(duplicateId === undefined || duplicateId === realIds[0]).toBe(true);
+
+      await producerA.stop();
+      await producerB.stop();
+      await workerC.start();
+      expect(await workerC.has(realIds[0] as string, "webhook_delivery")).toBe(true);
+
+      await workerC.work("webhook_delivery", async (job) => {
         attempts += 1;
         expect(job.logicalKey).toBe(key);
-        if (attempts === 1) throw new Error("intentional retry canary");
-        received = true;
+        if (attempts === 1) {
+          firstFailureObserved = true;
+          throw new Error("intentional retry canary");
+        }
+        businessEffects += 1;
+        succeeded = true;
       });
-      await waitFor(() => received);
+      await waitFor(() => firstFailureObserved);
+      await workerC.stop();
+
+      await workerD.start();
+      expect(await workerD.has(realIds[0] as string, "webhook_delivery")).toBe(true);
+      await workerD.work("webhook_delivery", async (job) => {
+        attempts += 1;
+        expect(job.logicalKey).toBe(key);
+        businessEffects += 1;
+        succeeded = true;
+      });
+      await waitFor(() => succeeded, 30_000);
       expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(businessEffects).toBe(1);
     } finally {
-      await worker.stop().catch(() => undefined);
-      await sender.stop().catch(() => undefined);
+      await workerD.stop().catch(() => undefined);
+      await workerC.stop().catch(() => undefined);
+      await producerB.stop().catch(() => undefined);
+      await producerA.stop().catch(() => undefined);
     }
-  }, 30_000);
+  }, 60_000);
 });

@@ -76,7 +76,8 @@ export type DeliveryRecord = {
   lastReceivedAt: Date;
   receiptCount: number;
   processingAttempts: number;
-  jobId?: string;
+  /** A real pg-boss UUID; null clears a stale owner after a restart/race. */
+  jobId?: string | null;
   errorCode?: string;
   processedAt?: Date;
   payloadExpiresAt: Date;
@@ -137,6 +138,8 @@ export interface M1Store {
   recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void>;
   updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void>;
   getDelivery(id: string, tenantId?: string): Promise<DeliveryRecord | undefined>;
+  /** Claim one non-terminal delivery without reopening processed/ignored work. */
+  claimDeliveryForProcessing(id: string, tenantId?: string): Promise<DeliveryRecord | undefined>;
   ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string>;
   setBranchHead(tenantId: string, repositoryId: string, ref: string, headSha: string | null): Promise<void>;
   getBranchHead(tenantId: string, repositoryId: string, ref: string): Promise<string | null>;
@@ -245,6 +248,13 @@ export class InMemoryM1Store implements M1Store {
     Object.assign(delivery, patch);
   }
   async getDelivery(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> { return [...this.deliveries.values()].find((value) => value.id === id); }
+  async claimDeliveryForProcessing(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> {
+    const delivery = [...this.deliveries.values()].find((value) => value.id === id);
+    if (!delivery || delivery.state === "processed" || delivery.state === "ignored") return undefined;
+    delivery.state = "processing";
+    delivery.processingAttempts += 1;
+    return { ...delivery };
+  }
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {
     const existing = this.jobs.get(logicalKey);
     if (existing) return existing.id;
