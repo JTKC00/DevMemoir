@@ -75,6 +75,29 @@ Create a GitHub App for the owner account; do not commit its private key or any 
 
 The API uses an app-authenticated Octokit request for installation verification and an installation-authenticated client for repository, ref, and commit reads. Endpoint calls are permit-listed.
 
+### Manual M1 GitHub App E2E checklist
+
+Run this checklist in a temporary HTTPS environment when owner-created GitHub App credentials and a public callback are available. Record the result and timestamp for each item; do not paste private keys, tokens, webhook secrets, or raw private payloads into tickets or logs.
+
+1. Create the GitHub App under the allowlisted owner account.
+2. Set the user authorization callback to `${API_ORIGIN}/auth/github/callback`.
+3. Set the setup URL to `${API_ORIGIN}/github/setup` and enable setup URL redirection.
+4. Set the webhook URL to `${API_ORIGIN}/webhooks/github` and configure a random webhook secret.
+5. Set only Metadata read, Contents read, Pull requests read, and Issues read permissions.
+6. Subscribe to `push`, `ping`, `github_app_authorization`, `installation`, and `installation_repositories`.
+7. Set `OWNER_GITHUB_USER_ID` to the owner’s numeric GitHub account ID and verify it is not a login name.
+8. Load the App ID, client ID, private key, and current webhook secret into the environment; keep the private key out of source control.
+9. Verify the webhook secret used by GitHub matches the runtime secret and that any previous secret is only a rotation overlap value.
+10. Provision the database first, then set the explicit `DATABASE_API_URL`, `DATABASE_WORKER_URL`, `DATABASE_QUEUE_URL`, and release-only `DATABASE_MIGRATIONS_URL` login-principal URLs; Web uses the API and has no database URL.
+11. Confirm the temporary HTTPS host routes both callback and webhook paths to the API and that the API, worker, queue, and migration processes are running with their separate roles.
+12. Open the Web login flow and complete GitHub authorization; verify the host-only session cookie and CSRF-protected browser handoff.
+13. Start GitHub App installation and verify the installation is rebound to the exact allowlisted owner account.
+14. Select exactly one private repository and verify it is the repository shown by the M1 UI.
+15. Verify the initial import reports the exact newest 100 commits reachable from the current default branch.
+16. Push a test commit, confirm GitHub delivers the signed webhook, and verify worker processing fetches the authoritative ref/head before writing facts.
+17. Redeliver the same GUID and replay a failed/dead-letter receipt; verify one canonical delivery/job, no duplicate business effect, and terminal `processed`/`ignored` receipts remain no-ops.
+18. Open the private activity page and inspect application/worker logs and database canaries for absence of raw payloads, private source content, tokens, secrets, and cross-tenant data.
+
 ## Verification
 
 ```bash
