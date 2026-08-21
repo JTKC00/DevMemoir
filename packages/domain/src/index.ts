@@ -14,6 +14,19 @@ export type DeliveryState = (typeof DELIVERY_STATES)[number];
 
 export const TERMINAL_DELIVERY_STATES = new Set<DeliveryState>(["processed", "ignored"]);
 
+export const REPOSITORY_ACCESS_STATUSES = [
+  "accessible",
+  "access_removed",
+  "installation_suspended",
+  "unavailable",
+  "disconnected",
+] as const;
+export type RepositoryAccessStatus = (typeof REPOSITORY_ACCESS_STATUSES)[number];
+
+export function repositoryAccessIsAvailable(status: RepositoryAccessStatus): boolean {
+  return status === "accessible";
+}
+
 export type DeliveryTransition = "noop" | "ensure_job" | "requeue";
 
 export function deliveryRedeliveryAction(state: DeliveryState): DeliveryTransition {

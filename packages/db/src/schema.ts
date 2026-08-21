@@ -84,9 +84,10 @@ export const githubInstallations = pgTable("github_installations", {
   repositorySelection: varchar("repository_selection", { length: 30 }),
   suspendedAt: nullableTime("suspended_at"),
   deletedAt: nullableTime("deleted_at"),
+  lastInventoryAt: nullableTime("last_inventory_at"),
   createdAt: time("created_at"),
   updatedAt: time("updated_at"),
-}, (table) => [uniqueIndex("github_installations_external_id_unique").on(table.githubInstallationId), index("github_installations_tenant_idx").on(table.tenantId)]);
+}, (table) => [uniqueIndex("github_installations_external_id_unique").on(table.githubInstallationId), uniqueIndex("github_installations_tenant_id_unique").on(table.tenantId, table.id), index("github_installations_tenant_idx").on(table.tenantId)]);
 
 /** Minimal cross-tenant routing metadata used to resolve a webhook installation. */
 export const installationRoutes = pgTable("installation_routes", {
@@ -111,14 +112,19 @@ export const repositories = pgTable("repositories", {
   topics: jsonb("topics").$type<string[]>().notNull().default([]),
   languages: jsonb("languages").$type<Record<string, number>>().notNull().default({}),
   archivedAt: nullableTime("archived_at"),
+  disabled: boolean("disabled").notNull().default(false),
   githubCreatedAt: nullableTime("github_created_at"),
   githubUpdatedAt: nullableTime("github_updated_at"),
   githubPushedAt: nullableTime("github_pushed_at"),
+  firstSeenAt: nullableTime("first_seen_at"),
+  lastSeenAt: nullableTime("last_seen_at"),
+  lastAuthoritativeObservedAt: nullableTime("last_authoritative_observed_at"),
   deletedAt: nullableTime("deleted_at"),
   createdAt: time("created_at"),
   updatedAt: time("updated_at"),
 }, (table) => [
   uniqueIndex("repositories_tenant_external_id_unique").on(table.tenantId, table.githubRepositoryId),
+  uniqueIndex("repositories_tenant_id_unique").on(table.tenantId, table.id),
   index("repositories_tenant_pushed_idx").on(table.tenantId, table.githubPushedAt),
 ]);
 
@@ -127,10 +133,24 @@ export const repositoryAccess = pgTable("repository_access", {
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
   repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
   installationId: uuid("installation_id").notNull().references(() => githubInstallations.id),
-  accessStatus: varchar("access_status", { length: 30 }).notNull().default("selected"),
-  selectedAt: time("selected_at"),
+  accessStatus: varchar("access_status", { length: 30 }).notNull().default("accessible"),
+  selected: boolean("selected").notNull().default(false),
+  selectedAt: nullableTime("selected_at"),
   revokedAt: nullableTime("revoked_at"),
-}, (table) => [uniqueIndex("repository_access_unique").on(table.tenantId, table.repositoryId, table.installationId), uniqueIndex("repository_access_one_selected_per_tenant_idx").on(table.tenantId).where(sql`access_status = 'selected'`), index("repository_access_status_idx").on(table.tenantId, table.accessStatus)]);
+  lastSeenAt: nullableTime("last_seen_at"),
+  lastAuthoritativeObservedAt: nullableTime("last_authoritative_observed_at"),
+}, (table) => [uniqueIndex("repository_access_unique").on(table.tenantId, table.repositoryId, table.installationId), uniqueIndex("repository_access_one_selected_per_tenant_idx").on(table.tenantId).where(sql`selected = true`), index("repository_access_status_idx").on(table.tenantId, table.accessStatus)]);
+
+export const repositoryNameHistory = pgTable("repository_name_history", {
+  id: id(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  ownerLogin: varchar("owner_login", { length: 255 }).notNull(),
+  name: varchar("name", { length: 255 }).notNull(),
+  fullName: varchar("full_name", { length: 511 }).notNull(),
+  validFrom: time("valid_from"),
+  validTo: nullableTime("valid_to"),
+}, (table) => [index("repository_name_history_lookup_idx").on(table.tenantId, table.repositoryId, table.validFrom)]);
 
 export const branches = pgTable("branches", {
   id: id(),
@@ -296,6 +316,7 @@ export const schema = {
   installationRoutes,
   repositories,
   repositoryAccess,
+  repositoryNameHistory,
   branches,
   commits,
   developmentEvents,
@@ -307,6 +328,6 @@ export const schema = {
   outbox,
 };
 
-export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, branches, commits, developmentEvents, commitRefs, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
+export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, repositoryNameHistory, branches, commits, developmentEvents, commitRefs, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
 
 export const now = sql`now()`;

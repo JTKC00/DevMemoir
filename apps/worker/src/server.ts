@@ -16,6 +16,7 @@ const dependencies: QueueDependencies = { config, store, jobs, githubForInstalla
 await jobs.work("webhook_delivery", async (job) => processQueueJob(job, dependencies));
 await jobs.work("repository_backfill", async (job) => processQueueJob(job, dependencies));
 await jobs.work("sync_commits", async (job) => processQueueJob(job, dependencies));
+await jobs.work("installation_inventory", async (job) => processQueueJob(job, dependencies));
 logger.info({ result: "started" });
 
 const shutdown = async () => {

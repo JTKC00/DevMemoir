@@ -1,9 +1,19 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { claimInstallation, connectRepository, startInstallation } from "./actions";
+import { claimInstallation, connectRepository, refreshInventory, startInstallation, unselectRepository } from "./actions";
 
-type ConnectRepository = { id: number; fullName: string; private: boolean; defaultBranch: string };
-type ConnectOptions = { connected: boolean; repositories: ConnectRepository[] };
+type ConnectRepository = {
+  id: string;
+  fullName: string;
+  private: boolean;
+  defaultBranch: string;
+  selected: boolean;
+  accessStatus: string;
+  lastAuthoritativeObservedAt?: string;
+  archived?: boolean;
+  disabled?: boolean;
+};
+type ConnectOptions = { connected: boolean; installationStatus?: string; lastInventoryAt?: string; repositories: ConnectRepository[] };
 
 async function apiGet(path: string): Promise<Response> {
   const requestHeaders = await headers();
@@ -32,17 +42,32 @@ export default async function ConnectPage({ searchParams }: { searchParams: Prom
       <p>Choose the repositories that DevMemoir may read. Installation ownership is checked against your signed-in GitHub user.</p>
       <form action={startInstallation}><button type="submit">Install GitHub App</button></form>
     </section> : null}
-    {options.connected && options.repositories.length === 0 && !params.claim ? <section className="card"><p>Installation connected. No repository inventory is available yet.</p></section> : null}
-    {options.connected && options.repositories.length > 0 ? <section className="card">
-      <h2>2. Select one repository</h2>
-      <p>Milestone 1 supports exactly one connected repository.</p>
+    {options.connected ? <section className="card">
+      <h2>2. Repository access</h2>
+      <p className="muted">GitHub App access and DevMemoir tracking are separate. This inventory is authoritative only after a complete GitHub pagination run.</p>
+      <p className="muted">{options.lastInventoryAt ? `Last synchronized: ${new Date(options.lastInventoryAt).toLocaleString()}` : "Inventory refresh is pending."}</p>
+      <form action={refreshInventory}><button type="submit">Refresh repository access</button></form>
+      {options.repositories.length === 0 ? <p className="muted">No accessible repositories are recorded yet.</p> : <div className="repository-list">
+        {options.repositories.map((repository) => {
+          const accessible = repository.accessStatus === "accessible";
+          return <article className="repository-row" key={repository.id}>
+            <div><strong>{repository.fullName}</strong> <span className="muted">{repository.private ? "private" : "public"}</span></div>
+            <div className="muted">GitHub access: {accessible ? "accessible" : repository.accessStatus.replaceAll("_", " ")}</div>
+            <div className="muted">DevMemoir: {repository.selected ? "actively tracking" : "not selected"}{repository.lastAuthoritativeObservedAt ? ` · observed ${new Date(repository.lastAuthoritativeObservedAt).toLocaleString()}` : ""}</div>
+            {repository.archived || repository.disabled ? <div className="muted">{repository.archived ? "archived" : ""}{repository.archived && repository.disabled ? " · " : ""}{repository.disabled ? "disabled" : ""}</div> : null}
+            {repository.selected ? <form action={unselectRepository}><input type="hidden" name="repositoryId" value={repository.id} /><button type="submit">Stop tracking</button></form> : null}
+          </article>;
+        })}
+      </div>}
+      <h3>Choose a repository to track</h3>
+      <p className="muted">M2 keeps the existing M1 limit of one actively tracked repository. Inventory access alone does not start a historical import.</p>
       <form action={connectRepository}>
-        <label htmlFor="fullName">Repository</label>
-        <select id="fullName" name="fullName" required defaultValue="">
+        <label htmlFor="repositoryId">Accessible repository</label>
+        <select id="repositoryId" name="repositoryId" required defaultValue="">
           <option value="" disabled>Select a repository</option>
-          {options.repositories.map((repository) => <option key={repository.id} value={repository.fullName}>{repository.fullName}{repository.private ? " (private)" : ""}</option>)}
+          {options.repositories.filter((repository) => repository.accessStatus === "accessible" && !repository.selected).map((repository) => <option key={repository.id} value={repository.id}>{repository.fullName}{repository.private ? " (private)" : ""}</option>)}
         </select>
-        <button type="submit">Connect repository</button>
+        <button type="submit">Start tracking</button>
       </form>
     </section> : null}
   </main>;

@@ -6,9 +6,9 @@ import type { AppConfig } from "@devmemoir/config";
 import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, parseWebhook } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import type { JobPort } from "@devmemoir/jobs";
-import { deliveryLogicalKey } from "@devmemoir/jobs";
+import { deliveryLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
-import type { M1Store, SessionRecord } from "@devmemoir/db";
+import { RepositorySelectionError, type M1Store, type SessionRecord } from "@devmemoir/db";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
 import { verifyGithubSignature, webhookBodyLimit } from "./webhook.js";
 
@@ -80,7 +80,14 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     return session;
   };
 
-  app.get("/health", async () => ({ ok: true, service: "api", m1: true }));
+  const enqueueInventoryRefresh = async (tenantId: string, installationGithubId: number, operationId: string): Promise<void> => {
+    const logicalKey = installationInventoryLogicalKey(installationGithubId, operationId);
+    const payload = { kind: "installation_inventory", tenantId, installationGithubId, installationId: installationGithubId, inventoryOperationId: operationId };
+    await deps.store.ensureJob(logicalKey, payload);
+    await deps.jobs.enqueue("installation_inventory", logicalKey, payload);
+  };
+
+  app.get("/health", async () => ({ ok: true, service: "api", m1: true, m2: true }));
 
   app.get<{ Querystring: { returnPath?: string } }>("/auth/github/start", async (request, reply) => {
     const started = await auth.startLogin(request.query.returnPath ?? "/");
@@ -141,7 +148,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     if (!signedInUser) return reply.code(400).send({ error: "installation_user_not_found" });
     const installation = await deps.github.getInstallation(installationId);
     if (installation.account.type !== "User" || installation.account.id !== signedInUser?.githubAccountId) return reply.code(403).send({ error: "installation_account_mismatch" });
+    if (installation.suspended_at) return reply.code(409).send({ error: "installation_suspended" });
     await deps.store.saveInstallation({ id: createId(), tenantId: signedInUser.tenantId, githubInstallationId: installationId, accountGithubAccountId: installation.account.id });
+    await enqueueInventoryRefresh(signedInUser.tenantId, installationId, `initial:${createId()}`);
     return reply.redirect(new URL("/connect?connected=1", deps.config.WEB_ORIGIN).toString());
   });
 
@@ -153,7 +162,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     const installation = await deps.github.getInstallation(installationId);
     const signedInUser = await deps.store.getUserById(session.userId);
     if (installation.account.type !== "User" || installation.account.id !== signedInUser?.githubAccountId) return reply.code(403).send({ error: "installation_account_mismatch" });
+    if (installation.suspended_at) return reply.code(409).send({ error: "installation_suspended" });
     await deps.store.saveInstallation({ id: createId(), tenantId: session.tenantId, githubInstallationId: installationId, accountGithubAccountId: installation.account.id });
+    await enqueueInventoryRefresh(session.tenantId, installationId, `initial:${createId()}`);
     return { connected: true };
   });
 
@@ -162,38 +173,74 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     if (!session) return;
     const installation = (await deps.store.listInstallations(session.tenantId))[0];
     if (!installation) return { connected: false, repositories: [] };
-    const client = deps.installationGithub?.(installation.githubInstallationId) ?? deps.github;
-    const firstPage = await client.listInstallationRepositories(1, 100);
-    return { connected: true, repositories: firstPage.repositories.map((repository) => ({ id: repository.id, fullName: repository.full_name, name: repository.name, owner: repository.owner?.login, private: repository.private, defaultBranch: repository.default_branch })) };
+    const repositories = await deps.store.listRepositoryInventory(session.tenantId, installation.id);
+    return {
+      connected: true,
+      installationStatus: installation.status ?? "active",
+      lastInventoryAt: installation.lastInventoryAt?.toISOString(),
+      repositories: repositories.map((repository) => ({
+        id: repository.id,
+        githubRepositoryId: repository.githubRepositoryId,
+        fullName: repository.fullName,
+        name: repository.name,
+        owner: repository.ownerLogin,
+        private: repository.private,
+        defaultBranch: repository.defaultBranch,
+        selected: repository.selected === true,
+        accessStatus: repository.accessStatus ?? "accessible",
+        firstSeenAt: repository.firstSeenAt?.toISOString(),
+        lastSeenAt: repository.lastSeenAt?.toISOString(),
+        lastAuthoritativeObservedAt: repository.lastAuthoritativeObservedAt?.toISOString(),
+        archived: repository.archived === true,
+        disabled: repository.disabled === true,
+      })),
+    };
   });
 
-  app.post<{ Body: { owner?: string; repo?: string } }>("/connect/repository", async (request, reply) => {
+  app.post("/connect/repositories/refresh", async (request, reply) => {
+    const session = await requireCsrf(request as RequestWithSession, reply);
+    if (!session) return;
+    const installation = (await deps.store.listInstallations(session.tenantId))[0];
+    if (!installation || (installation.status && installation.status !== "active")) return reply.code(409).send({ error: "installation_unavailable" });
+    const operationId = createId();
+    await enqueueInventoryRefresh(session.tenantId, installation.githubInstallationId, operationId);
+    return reply.code(202).send({ queued: true });
+  });
+
+  app.post<{ Body: { repositoryId?: string; owner?: string; repo?: string } }>("/connect/repository", async (request, reply) => {
     const session = await requireCsrf(request as RequestWithSession, reply);
     if (!session) return;
     const owner = request.body?.owner;
     const repo = request.body?.repo;
-    if (!owner || !repo) return reply.code(400).send({ error: "owner_and_repo_required" });
-    const connectedRepositories = await deps.store.listRepositories(session.tenantId);
-    if (connectedRepositories.length > 0 && connectedRepositories[0]?.fullName !== `${owner}/${repo}`) return reply.code(409).send({ error: "m1_supports_one_repository" });
-    if (connectedRepositories[0]?.fullName === `${owner}/${repo}`) return reply.code(200).send({ repository: connectedRepositories[0], completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
-    const installation = (await deps.store.listInstallations(session.tenantId))[0];
+    if (!request.body?.repositoryId && (!owner || !repo)) return reply.code(400).send({ error: "owner_and_repo_required" });
+    const repository = request.body?.repositoryId ? await deps.store.getRepositoryById(session.tenantId, request.body.repositoryId) : await deps.store.getRepositoryByFullName(session.tenantId, `${owner}/${repo}`);
+    if (!repository) return reply.code(404).send({ error: "repository_not_in_authoritative_inventory" });
+    const installation = (await deps.store.listInstallations(session.tenantId)).find((value) => value.id === repository.installationId);
     if (!installation) return reply.code(409).send({ error: "installation_required" });
-    const client = deps.installationGithub?.(installation.githubInstallationId) ?? deps.github;
-    const githubRepository = await client.getRepository(owner, repo);
-    const repository: import("@devmemoir/db").RepositoryRecord = { id: createId(), tenantId: session.tenantId, installationId: installation.id, githubRepositoryId: githubRepository.id, ownerLogin: githubRepository.owner?.login ?? owner, name: githubRepository.name, fullName: githubRepository.full_name, private: githubRepository.private, ...(githubRepository.visibility ? { visibility: githubRepository.visibility } : {}), defaultBranch: githubRepository.default_branch, ...(githubRepository.description ? { description: githubRepository.description } : {}) };
-    let connectedRepository: import("@devmemoir/db").RepositoryRecord;
+    if (installation.status && installation.status !== "active") return reply.code(409).send({ error: "installation_unavailable" });
+    let connectedRepository: import("@devmemoir/db").RepositoryRecord | undefined;
     try {
-      connectedRepository = await deps.store.saveRepository(repository);
+      connectedRepository = await deps.store.selectRepository(session.tenantId, repository.id);
     } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") return reply.code(409).send({ error: "m1_supports_one_repository" });
+      if (error instanceof RepositorySelectionError || (typeof error === "object" && error !== null && "code" in error && error.code === "one_repository_only")) return reply.code(409).send({ error: "m1_supports_one_repository" });
       throw error;
     }
-    if (connectedRepository.id !== repository.id) return reply.code(200).send({ repository: connectedRepository, completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
+    if (!connectedRepository) return reply.code(409).send({ error: "repository_access_unavailable" });
+    const client = deps.installationGithub?.(installation.githubInstallationId) ?? deps.github;
     const head = await client.getRefHead({ owner: connectedRepository.ownerLogin, repo: connectedRepository.name, ref: connectedRepository.defaultBranch });
     const jobPayload = { kind: "repository_backfill", tenantId: connectedRepository.tenantId, repositoryId: connectedRepository.id, installationId: installation.githubInstallationId, owner: connectedRepository.ownerLogin, repo: connectedRepository.name, ref: `refs/heads/${connectedRepository.defaultBranch}`, before: "0".repeat(40), after: head ?? "0".repeat(40), forced: false };
     await deps.store.ensureJob(`backfill:${connectedRepository.id}`, jobPayload);
     await deps.jobs.enqueue("repository_backfill", `backfill:${connectedRepository.id}`, jobPayload);
     return reply.code(201).send({ repository: connectedRepository, completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
+  });
+
+  app.post<{ Body: { repositoryId?: string } }>("/connect/repository/unselect", async (request, reply) => {
+    const session = await requireCsrf(request as RequestWithSession, reply);
+    if (!session) return;
+    if (!request.body?.repositoryId) return reply.code(400).send({ error: "repository_required" });
+    const repository = await deps.store.unselectRepository(session.tenantId, request.body.repositoryId);
+    if (!repository) return reply.code(404).send({ error: "repository_not_found" });
+    return { repository: { id: repository.id, selected: repository.selected === true, accessStatus: repository.accessStatus } };
   });
 
   app.post("/webhooks/github", { config: { rawBody: true } }, async (request, reply) => {
@@ -209,9 +256,10 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     let parsed;
     try { parsed = parseWebhook(eventName, parsedBody); } catch { return reply.code(400).send({ error: "invalid_webhook_payload" }); }
     const knownAction = isKnownAction(eventName, parsed.action);
-    // M1 stores receipts for every signed event, but only push is a sync
-    // signal. Other event families are intentionally terminally ignored.
-    const ignored = parsed.kind !== "push" || !knownAction;
+    const inventorySignal = ["installation", "installation_repositories", "repository"].includes(eventName) && knownAction && Boolean(parsed.installationGithubId);
+    // M2 lifecycle events are durable signals for an authoritative inventory
+    // refresh. Their embedded repository arrays are never treated as truth.
+    const ignored = (!inventorySignal && parsed.kind !== "push") || !knownAction;
     const installation = parsed.installationGithubId ? await deps.store.getInstallation(parsed.installationGithubId) : undefined;
     const payloadCiphertext = encryptSecret(raw.toString("utf8"), deps.config.ENCRYPTION_KEY_BASE64);
     const tenantId = installation?.tenantId;
@@ -244,7 +292,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       deliveryId: delivery.record.id,
       deliveryGuid: delivery.record.guid,
       eventName: delivery.record.eventName,
+      ...(delivery.record.action ? { action: delivery.record.action } : {}),
       ...(delivery.record.installationGithubId ? { installationId: delivery.record.installationGithubId } : {}),
+      ...(delivery.record.installationGithubId ? { installationGithubId: delivery.record.installationGithubId } : {}),
       ...(delivery.record.repositoryGithubId ? { repositoryGithubId: delivery.record.repositoryGithubId } : {}),
       ...(canonicalPush ? { ref: delivery.record.ref, before: delivery.record.before ?? "0".repeat(40), after: delivery.record.after ?? "0".repeat(40), forced: delivery.record.forced ?? false } : {}),
     };

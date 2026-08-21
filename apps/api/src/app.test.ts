@@ -116,12 +116,23 @@ describe("M1 webhook receipt", () => {
     const response = await app.inject({ method: "GET", url: `/github/setup?installation_id=22&setup_action=install&state=${encodeURIComponent(state)}` });
     expect(response.statusCode).toBe(302);
     expect(store.installations.get(22)?.tenantId).toBe("tenant-1");
+    expect([...jobs.jobs.values()].map((job) => job.kind)).toEqual(["installation_inventory"]);
   });
 
   it("handles signed ping and unsupported actions as acknowledged states", async () => {
     expect((await send("guid-ping", "ping", { zen: "hello" })).statusCode).toBe(202);
     expect((await send("guid-unknown", "issues", { action: "transferred" })).statusCode).toBe(202);
     expect(store.unroutedWebhooks.has("guid-unknown")).toBe(true);
+  });
+
+  it("routes installation repository changes to a worker refresh without trusting payload arrays", async () => {
+    const response = await send("guid-inventory", "installation_repositories", { action: "added", installation: { id: 22 }, repositories_added: [{ id: 999, name: "private-name-must-not-be-a-source" }] });
+    expect(response.statusCode).toBe(202);
+    const queued = [...jobs.jobs.values()];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.kind).toBe("webhook_delivery");
+    expect(JSON.stringify(queued[0]?.payload)).not.toContain("private-name-must-not-be-a-source");
+    expect((queued[0]?.payload as { eventName?: string }).eventName).toBe("installation_repositories");
   });
 
   it("rejects invalid signatures and bodies over 2 MB before persistence", async () => {

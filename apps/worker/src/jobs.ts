@@ -4,6 +4,7 @@ import { commitSyncLogicalKey, type JobPort, type QueueJob, type SyncJobPayload 
 import type { Logger } from "@devmemoir/observability";
 import { processDelivery } from "./processor.js";
 import { synchronizeRefHead } from "./sync.js";
+import { refreshInstallationInventory } from "./inventory.js";
 
 export type QueueDependencies = {
   store: M1Store;
@@ -18,6 +19,15 @@ export async function processBackfill(payload: SyncJobPayload, deps: QueueDepend
   if (!payload.repositoryId || !payload.installationId) throw new Error("Backfill job is missing repository or installation context");
   const repository = await deps.store.getRepositoryById(payload.tenantId, payload.repositoryId);
   if (!repository) throw new Error("Repository not found for backfill");
+  if (repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) {
+    if (payload.deliveryId) await deps.store.updateDelivery(payload.deliveryId, { state: "ignored", processedAt: new Date() }, payload.tenantId);
+    return;
+  }
+  const installation = await deps.store.getInstallation(payload.installationId);
+  if (installation && installation.status && installation.status !== "active") {
+    if (payload.deliveryId) await deps.store.updateDelivery(payload.deliveryId, { state: "ignored", processedAt: new Date() }, payload.tenantId);
+    return;
+  }
   const github = deps.githubForInstallation(payload.installationId);
   const ref = payload.ref ?? `refs/heads/${repository.defaultBranch}`;
   const refName = ref.replace(/^refs\/heads\//, "").replace(/^heads\//, "");
@@ -39,11 +49,23 @@ export async function processBackfill(payload: SyncJobPayload, deps: QueueDepend
   if (payload.deliveryId) await deps.store.updateDelivery(payload.deliveryId, { state: "processed", processedAt: new Date() }, payload.tenantId);
 }
 
+export async function processInstallationInventory(payload: SyncJobPayload, deps: QueueDependencies): Promise<void> {
+  if (!payload.tenantId || !payload.installationGithubId) throw new Error("Inventory job is missing tenant or installation context");
+  const installation = await deps.store.getInstallation(payload.installationGithubId);
+  if (!installation || (installation.status && installation.status !== "active")) return;
+  const result = await refreshInstallationInventory({ tenantId: payload.tenantId, installationGithubId: payload.installationGithubId }, deps.githubForInstallation(payload.installationGithubId), deps.store);
+  deps.logger.info({ installation_id: String(payload.installationGithubId), result: `${result.observed}/${result.added}/${result.updated}/${result.removed}` });
+}
+
 export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): Promise<void> {
   if (kind.kind === "webhook_delivery") {
     const payload = kind.payload as SyncJobPayload;
     if (!payload.deliveryId) throw new Error("Webhook job is missing delivery id");
     await processDelivery({ deliveryId: payload.deliveryId, payload }, deps);
+    return;
+  }
+  if (kind.kind === "installation_inventory") {
+    await processInstallationInventory(kind.payload as SyncJobPayload, deps);
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);
