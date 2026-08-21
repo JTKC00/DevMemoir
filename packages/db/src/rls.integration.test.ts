@@ -50,4 +50,15 @@ describeIntegration("M1 PostgreSQL RLS", () => {
     await expect(admin.query("insert into commits (id,tenant_id,repository_id,sha,message,first_seen_at,last_seen_at) values ($1,$2,$3,'canary','message',now(),now())", [randomUUID(), tenantA, repoA])).rejects.toThrow();
     await admin.query("rollback");
   });
+
+  it("worker role can write only the tenant selected in its transaction", async () => {
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_worker");
+    await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
+    const visible = await admin.query<{ id: string }>("select id from repositories order by id");
+    expect(visible.rows.map((row) => row.id)).toEqual([repoA]);
+    await admin.query("insert into commits (id,tenant_id,repository_id,sha,message,first_seen_at,last_seen_at) values ($1,$2,$3,'worker-canary','message',now(),now())", [randomUUID(), tenantA, repoA]);
+    await expect(admin.query("insert into commits (id,tenant_id,repository_id,sha,message,first_seen_at,last_seen_at) values ($1,$2,$3,'cross-tenant','message',now(),now())", [randomUUID(), tenantB, repoB])).rejects.toThrow();
+    await admin.query("rollback");
+  });
 });

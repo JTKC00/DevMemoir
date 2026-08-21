@@ -1,10 +1,9 @@
-import { decryptSecret, parseWebhook } from "@devmemoir/domain";
 import type { AppConfig } from "@devmemoir/config";
 import type { GithubClient } from "@devmemoir/github";
 import type { JobPort, SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import type { M1Store } from "@devmemoir/db";
-import { synchronizeRefHead } from "./sync.js";
+import { processBackfill } from "./jobs.js";
 
 export type WorkerDependencies = {
   config: AppConfig;
@@ -21,18 +20,27 @@ export async function processDelivery(input: { deliveryId: string; payload: Sync
   if (!delivery) throw new Error("Delivery not found");
   await deps.store.updateDelivery(delivery.id, { state: "processing", processingAttempts: delivery.processingAttempts + 1 }, delivery.tenantId);
   try {
-    const github = deps.githubForInstallation(input.payload.installationId);
     const tenantId = input.payload.tenantId ?? delivery.tenantId;
-    const repository = tenantId ? await deps.store.getRepositoryById(tenantId, input.payload.repositoryId) : undefined;
+    const repository = tenantId
+      ? input.payload.repositoryId
+        ? await deps.store.getRepositoryById(tenantId, input.payload.repositoryId)
+        : input.payload.repositoryGithubId
+          ? await deps.store.getRepositoryByGithubId(tenantId, input.payload.repositoryGithubId)
+          : undefined
+      : undefined;
     if (!repository) {
-      if (input.rawPayload) parseWebhook(delivery.eventName, JSON.parse(decryptSecret(input.rawPayload, deps.config.ENCRYPTION_KEY_BASE64)));
       await deps.store.updateDelivery(delivery.id, { state: "ignored", processedAt: now() }, delivery.tenantId);
       return;
     }
-    if (input.payload.ref) {
-      await synchronizeRefHead({ tenantId: repository.tenantId, repository, installationId: input.payload.installationId, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID, ref: input.payload.ref, before: input.payload.before, after: input.payload.after, forced: input.payload.forced }, github, deps.store);
+    const ref = input.payload.ref ?? `refs/heads/${repository.defaultBranch}`;
+    const refName = ref.replace(/^refs\/heads\//, "").replace(/^heads\//, "");
+    if (!ref.startsWith("refs/heads/") || refName !== repository.defaultBranch) {
+      await deps.store.updateDelivery(delivery.id, { state: "ignored", processedAt: now() }, delivery.tenantId);
+      return;
     }
-    await deps.store.updateDelivery(delivery.id, { state: "processed", processedAt: now() }, delivery.tenantId);
+    const installationId = input.payload.installationId ?? input.payload.installationGithubId;
+    if (!installationId) throw new Error("Webhook job is missing installation context");
+    await processBackfill({ ...input.payload, tenantId: repository.tenantId, repositoryId: repository.id, installationId, deliveryId: delivery.id, ref }, deps);
   } catch (error) {
     const attempts = delivery.processingAttempts + 1;
     const state = attempts >= 5 ? "dead_letter" : "failed";

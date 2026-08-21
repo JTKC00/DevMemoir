@@ -93,11 +93,33 @@ export type DeliveryInsertResult = {
   action: ReturnType<typeof deliveryRedeliveryAction>;
 };
 
+export type UnroutedWebhookRecord = {
+  guid: string;
+  eventName: string;
+  payloadCiphertext: string;
+  receivedAt: Date;
+  payloadExpiresAt: Date;
+};
+
+export type RefSyncContinuation = {
+  after: string;
+  previousHead: string | null;
+  nextPage: number;
+  forced: boolean;
+  reachableShas?: string[];
+};
+
+function branchName(ref: string): string {
+  if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
+  if (ref.startsWith("heads/")) return ref.slice("heads/".length);
+  return ref;
+}
+
 export interface M1Store {
   createAuthTransaction(record: AuthTransactionRecord): Promise<void>;
   consumeAuthState(stateHash: string, now: Date): Promise<AuthTransactionRecord | undefined>;
   attachAuthUser(stateHash: string, user: UserRecord): Promise<void>;
-  createHandoff(stateHash: string, handoffHash: string): Promise<void>;
+  createHandoff(stateHash: string, handoffHash: string, expiresAt?: Date): Promise<void>;
   consumeHandoff(handoffHash: string, now: Date): Promise<UserRecord | undefined>;
   createSession(session: SessionRecord): Promise<void>;
   getSession(tokenHash: string, now: Date): Promise<SessionRecord | undefined>;
@@ -107,17 +129,27 @@ export interface M1Store {
   saveInstallation(installation: InstallationRecord): Promise<void>;
   getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined>;
   listInstallations(tenantId: string): Promise<InstallationRecord[]>;
-  saveRepository(repository: RepositoryRecord): Promise<void>;
+  saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord>;
   getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined>;
   getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   listRepositories(tenantId: string): Promise<RepositoryRecord[]>;
   insertDelivery(input: Omit<DeliveryRecord, "id" | "state" | "firstReceivedAt" | "lastReceivedAt" | "receiptCount" | "processingAttempts"> & { now: Date }): Promise<DeliveryInsertResult>;
+  recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void>;
   updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void>;
   getDelivery(id: string, tenantId?: string): Promise<DeliveryRecord | undefined>;
   ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string>;
   setBranchHead(tenantId: string, repositoryId: string, ref: string, headSha: string | null): Promise<void>;
   getBranchHead(tenantId: string, repositoryId: string, ref: string): Promise<string | null>;
-  saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event: DevelopmentEvent, htmlUrl?: string): Promise<void>;
+  /** Atomically publish a completed walk only when the observed head is still current. */
+  finalizeRefSync(input: { tenantId: string; repositoryId: string; ref: string; expectedHead: string | null; headSha: string | null; invalidatePrevious: boolean; reachableShas: string[] }): Promise<boolean>;
+  /** Persist the source fact even when no event can be projected for it. */
+  saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void>;
+  saveDevelopmentEvent(tenantId: string, repositoryId: string, event: DevelopmentEvent, options?: { htmlUrl?: string; message?: string }): Promise<void>;
+  getRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<RefSyncContinuation | undefined>;
+  setRefSyncContinuation(tenantId: string, repositoryId: string, ref: string, continuation: RefSyncContinuation): Promise<void>;
+  clearRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<void>;
+  markBranchCommitsUnreachable(tenantId: string, repositoryId: string, ref: string): Promise<void>;
+  setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void>;
   listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]>;
 }
 
@@ -132,6 +164,10 @@ export class InMemoryM1Store implements M1Store {
   readonly branchHeads = new Map<string, string | null>();
   readonly commits = new Map<string, { tenantId: string; repositoryId: string; commit: CommitFact; htmlUrl?: string }>();
   readonly events: ActivityRecord[] = [];
+  readonly eventKeys = new Set<string>();
+  readonly unroutedWebhooks = new Map<string, UnroutedWebhookRecord>();
+  readonly refSyncContinuations = new Map<string, RefSyncContinuation>();
+  readonly commitReachability = new Map<string, boolean>();
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
 
@@ -150,10 +186,11 @@ export class InMemoryM1Store implements M1Store {
     await this.upsertUser(user);
   }
 
-  async createHandoff(stateHash: string, handoffHash: string): Promise<void> {
+  async createHandoff(stateHash: string, handoffHash: string, expiresAt?: Date): Promise<void> {
     const transaction = this.authTransactions.get(stateHash);
     if (!transaction) throw new Error("Auth transaction not found");
     transaction.handoffHash = handoffHash;
+    if (expiresAt) transaction.expiresAt = expiresAt;
   }
 
   async consumeHandoff(handoffHash: string, now: Date): Promise<UserRecord | undefined> {
@@ -175,7 +212,7 @@ export class InMemoryM1Store implements M1Store {
   async saveInstallation(installation: InstallationRecord): Promise<void> { this.installations.set(installation.githubInstallationId, { ...installation }); }
   async getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined> { return this.installations.get(githubInstallationId); }
   async listInstallations(tenantId: string): Promise<InstallationRecord[]> { return [...this.installations.values()].filter((installation) => installation.tenantId === tenantId).map((installation) => ({ ...installation })); }
-  async saveRepository(repository: RepositoryRecord): Promise<void> { this.repositories.set(`${repository.tenantId}:${repository.githubRepositoryId}`, { ...repository }); }
+  async saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord> { this.repositories.set(`${repository.tenantId}:${repository.githubRepositoryId}`, { ...repository }); return { ...repository }; }
   async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> { return this.repositories.get(`${tenantId}:${githubRepositoryId}`); }
   async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> { return [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.id === repositoryId); }
   async listRepositories(tenantId: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId).map((repository) => ({ ...repository })); }
@@ -200,6 +237,8 @@ export class InMemoryM1Store implements M1Store {
     return { record: { ...record }, created: true, action: "ensure_job" };
   }
 
+  async recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void> { if (!this.unroutedWebhooks.has(record.guid)) this.unroutedWebhooks.set(record.guid, { ...record }); }
+
   async updateDelivery(id: string, patch: Partial<DeliveryRecord>, _tenantId?: string): Promise<void> {
     const delivery = [...this.deliveries.values()].find((value) => value.id === id);
     if (!delivery) throw new Error("Delivery not found");
@@ -213,15 +252,48 @@ export class InMemoryM1Store implements M1Store {
     this.jobs.set(logicalKey, job);
     return job.id;
   }
-  async setBranchHead(tenantId: string, repositoryId: string, ref: string, headSha: string | null): Promise<void> { this.branchHeads.set(`${tenantId}:${repositoryId}:${ref}`, headSha); }
-  async getBranchHead(tenantId: string, repositoryId: string, ref: string): Promise<string | null> { return this.branchHeads.get(`${tenantId}:${repositoryId}:${ref}`) ?? null; }
-  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event: DevelopmentEvent, htmlUrl?: string): Promise<void> {
-    this.commits.set(`${tenantId}:${repositoryId}:${commit.sha}`, { tenantId, repositoryId, commit, ...(htmlUrl ? { htmlUrl } : {}) });
-    const existing = this.events.find((value) => value.repositoryId === repositoryId && value.sourceKind === event.sourceKind && value.sourceExternalId === event.sourceExternalId && value.verb === event.verb);
-    if (!existing) this.events.push({ ...event, ...(htmlUrl ? { htmlUrl } : {}), message: commit.message });
+  async setBranchHead(tenantId: string, repositoryId: string, ref: string, headSha: string | null): Promise<void> { this.branchHeads.set(`${tenantId}:${repositoryId}:${branchName(ref)}`, headSha); }
+  async getBranchHead(tenantId: string, repositoryId: string, ref: string): Promise<string | null> { return this.branchHeads.get(`${tenantId}:${repositoryId}:${branchName(ref)}`) ?? null; }
+  async finalizeRefSync(input: { tenantId: string; repositoryId: string; ref: string; expectedHead: string | null; headSha: string | null; invalidatePrevious: boolean; reachableShas: string[] }): Promise<boolean> {
+    const key = `${input.tenantId}:${input.repositoryId}:${branchName(input.ref)}`;
+    const current = this.branchHeads.get(key) ?? null;
+    if (current !== input.expectedHead) return false;
+    if (input.invalidatePrevious) await this.markBranchCommitsUnreachable(input.tenantId, input.repositoryId, input.ref);
+    for (const sha of input.reachableShas) await this.setCommitReachability(input.tenantId, input.repositoryId, input.ref, sha, true);
+    this.branchHeads.set(key, input.headSha);
+    this.refSyncContinuations.delete(key);
+    return true;
   }
+  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void> {
+    this.commits.set(`${tenantId}:${repositoryId}:${commit.sha}`, { tenantId, repositoryId, commit, ...(htmlUrl ? { htmlUrl } : {}) });
+    if (event) await this.saveDevelopmentEvent(tenantId, repositoryId, event, { ...(htmlUrl ? { htmlUrl } : {}), message: commit.message });
+  }
+  async saveDevelopmentEvent(tenantId: string, repositoryId: string, event: DevelopmentEvent, options?: { htmlUrl?: string; message?: string }): Promise<void> {
+    const key = `${tenantId}:${repositoryId}:${event.sourceKind}:${event.sourceExternalId}:${event.verb}`;
+    const existingIndex = this.events.findIndex((value) => this.eventKeys.has(`${tenantId}:${repositoryId}:${value.sourceKind}:${value.sourceExternalId}:${value.verb}`) && value.repositoryId === repositoryId && value.sourceKind === event.sourceKind && value.sourceExternalId === event.sourceExternalId && value.verb === event.verb);
+    if (existingIndex === -1) {
+      this.events.push({ ...event, ...(options?.htmlUrl ? { htmlUrl: options.htmlUrl } : {}), ...(options?.message ? { message: options.message } : {}) });
+      this.eventKeys.add(key);
+    } else {
+      const existing = this.events[existingIndex];
+      if (existing) this.events[existingIndex] = { ...existing, ...(options?.htmlUrl ? { htmlUrl: options.htmlUrl } : {}), ...(options?.message ? { message: options.message } : {}) };
+    }
+  }
+  async getRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<RefSyncContinuation | undefined> { return this.refSyncContinuations.get(`${tenantId}:${repositoryId}:${branchName(ref)}`); }
+  async setRefSyncContinuation(tenantId: string, repositoryId: string, ref: string, continuation: RefSyncContinuation): Promise<void> { this.refSyncContinuations.set(`${tenantId}:${repositoryId}:${branchName(ref)}`, { ...continuation }); }
+  async clearRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<void> { this.refSyncContinuations.delete(`${tenantId}:${repositoryId}:${branchName(ref)}`); }
+  async markBranchCommitsUnreachable(tenantId: string, repositoryId: string, ref: string): Promise<void> {
+    const prefix = `${tenantId}:${repositoryId}:${branchName(ref)}:`;
+    for (const key of this.commitReachability.keys()) if (key.startsWith(prefix)) this.commitReachability.set(key, false);
+  }
+  async setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void> { this.commitReachability.set(`${tenantId}:${repositoryId}:${branchName(ref)}:${sha}`, reachable); }
   async listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]> {
-    return this.events.filter((event) => (!repositoryId || event.repositoryId === repositoryId) && [...this.repositories.values()].some((repository) => repository.tenantId === tenantId && repository.id === event.repositoryId)).sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
+    return this.events.filter((event) => {
+      const repository = [...this.repositories.values()].find((value) => value.tenantId === tenantId && value.id === event.repositoryId);
+      if (!repository || (repositoryId && event.repositoryId !== repositoryId)) return false;
+      if (event.sourceKind !== "commit") return true;
+      const reachabilityKey = `${tenantId}:${repository.id}:${branchName(`refs/heads/${repository.defaultBranch}`)}:${event.sourceExternalId}`;
+      return !this.commitReachability.has(reachabilityKey) || this.commitReachability.get(reachabilityKey) === true;
+    }).sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
   }
 }
-

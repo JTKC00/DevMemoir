@@ -6,6 +6,17 @@ import { z } from "zod";
 
 export const API_VERSION = "2022-11-28";
 
+/**
+ * GitHub's GET /git/ref/:ref route takes `heads/<branch>` (or
+ * `tags/<tag>`), not the display-only branch name and not the fully
+ * qualified `refs/heads/<branch>` value returned in API responses.
+ */
+export function githubRefParameter(ref: string): string {
+  const normalized = ref.replace(/^refs\//, "");
+  if (normalized.startsWith("heads/") || normalized.startsWith("tags/")) return normalized;
+  return `heads/${normalized}`;
+}
+
 const ALLOWED_ENDPOINTS = new Set([
   "GET /installation/repositories",
   "GET /app/installations/{installation_id}",
@@ -226,9 +237,14 @@ export class InstallationGithubClient implements GithubClient {
 
   async getRefHead(input: { owner: string; repo: string; ref: string }): Promise<string | null> {
     assertGithubEndpointAllowed("GET /repos/{owner}/{repo}/git/ref/{ref}");
-    const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}/git/ref/{ref}", { owner: input.owner, repo: input.repo, ref: input.ref });
-    const data = z.object({ object: z.object({ sha: z.string() }).strip() }).strip().parse(response.data);
-    return data.object.sha;
+    try {
+      const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}/git/ref/{ref}", { owner: input.owner, repo: input.repo, ref: githubRefParameter(input.ref) });
+      const data = z.object({ object: z.object({ sha: z.string() }).strip() }).strip().parse(response.data);
+      return data.object.sha;
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "status" in error && error.status === 404) return null;
+      throw error;
+    }
   }
 }
 

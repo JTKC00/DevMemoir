@@ -88,6 +88,14 @@ export const githubInstallations = pgTable("github_installations", {
   updatedAt: time("updated_at"),
 }, (table) => [uniqueIndex("github_installations_external_id_unique").on(table.githubInstallationId), index("github_installations_tenant_idx").on(table.tenantId)]);
 
+/** Minimal cross-tenant routing metadata used to resolve a webhook installation. */
+export const installationRoutes = pgTable("installation_routes", {
+  githubInstallationId: bigint("github_installation_id", { mode: "number" }).primaryKey(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  createdAt: time("created_at"),
+  updatedAt: time("updated_at"),
+});
+
 export const repositories = pgTable("repositories", {
   id: id(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
@@ -122,7 +130,7 @@ export const repositoryAccess = pgTable("repository_access", {
   accessStatus: varchar("access_status", { length: 30 }).notNull().default("selected"),
   selectedAt: time("selected_at"),
   revokedAt: nullableTime("revoked_at"),
-}, (table) => [uniqueIndex("repository_access_unique").on(table.tenantId, table.repositoryId, table.installationId), index("repository_access_status_idx").on(table.tenantId, table.accessStatus)]);
+}, (table) => [uniqueIndex("repository_access_unique").on(table.tenantId, table.repositoryId, table.installationId), uniqueIndex("repository_access_one_selected_per_tenant_idx").on(table.tenantId).where(sql`access_status = 'selected'`), index("repository_access_status_idx").on(table.tenantId, table.accessStatus)]);
 
 export const branches = pgTable("branches", {
   id: id(),
@@ -174,11 +182,23 @@ export const developmentEvents = pgTable("development_events", {
   sourceUpdatedAt: nullableTime("source_updated_at"),
   title: text("title"),
   summaryInput: text("summary_input"),
+  sourceUrl: text("source_url"),
   completenessState: varchar("completeness_state", { length: 40 }).notNull().default("observed"),
   visibility: varchar("visibility", { length: 20 }).notNull().default("unknown"),
 }, (table) => [
   uniqueIndex("development_events_source_unique").on(table.tenantId, table.repositoryId, table.sourceSystem, table.sourceKind, table.sourceExternalId, table.verb),
   index("development_events_tenant_date_idx").on(table.tenantId, table.occurredAt),
+]);
+
+export const commitRefs = pgTable("commit_refs", {
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  commitId: uuid("commit_id").notNull().references(() => commits.id),
+  branchId: uuid("branch_id").notNull().references(() => branches.id),
+  lastSeenAt: time("last_seen_at"),
+  reachable: boolean("reachable").notNull().default(true),
+}, (table) => [
+  primaryKey({ columns: [table.tenantId, table.commitId, table.branchId] }),
+  index("commit_refs_branch_reachable_idx").on(table.tenantId, table.branchId, table.reachable),
 ]);
 
 export const webhookDeliveries = pgTable("webhook_deliveries", {
@@ -210,6 +230,15 @@ export const webhookDeliveries = pgTable("webhook_deliveries", {
   uniqueIndex("webhook_deliveries_guid_unique").on(table.githubDeliveryGuid),
   index("webhook_deliveries_state_idx").on(table.state, table.lastReceivedAt),
 ]);
+
+export const unroutedWebhookDeliveries = pgTable("unrouted_webhook_deliveries", {
+  id: id(),
+  githubDeliveryGuid: varchar("github_delivery_guid", { length: 128 }).notNull(),
+  eventName: varchar("event_name", { length: 80 }).notNull(),
+  payloadCiphertext: text("payload_ciphertext").notNull(),
+  receivedAt: time("received_at"),
+  payloadExpiresAt: time("payload_expires_at"),
+}, (table) => [uniqueIndex("unrouted_webhook_deliveries_guid_unique").on(table.githubDeliveryGuid)]);
 
 export const syncJobs = pgTable("sync_jobs", {
   id: id(),
@@ -264,17 +293,20 @@ export const schema = {
   authTransactions,
   applicationSessions,
   githubInstallations,
+  installationRoutes,
   repositories,
   repositoryAccess,
   branches,
   commits,
   developmentEvents,
+  commitRefs,
   webhookDeliveries,
+  unroutedWebhookDeliveries,
   syncJobs,
   syncCursors,
   outbox,
 };
 
-export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, branches, commits, developmentEvents, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
+export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, branches, commits, developmentEvents, commitRefs, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
 
 export const now = sql`now()`;

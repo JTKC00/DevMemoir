@@ -7,9 +7,9 @@ import { processQueueJob, type QueueDependencies } from "./jobs.js";
 
 const config = loadConfig();
 const baseGithub = new OctokitGithubClient({ appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_APP_PRIVATE_KEY, apiVersion: config.GITHUB_API_VERSION, webhookSecret: config.GITHUB_WEBHOOK_SECRET });
-const pool = createPool(config.DATABASE_DIRECT_URL, config.DATABASE_POOL_MAX);
+const pool = createPool(config.DATABASE_WORKER_URL, config.DATABASE_POOL_MAX);
 const store = new PostgresM1Store(pool);
-const jobs = new PgBossJobPort(config.DATABASE_DIRECT_URL);
+const jobs = new PgBossJobPort(config.DATABASE_QUEUE_URL);
 const logger = createLogger();
 await jobs.start();
 const dependencies: QueueDependencies = { config, store, jobs, githubForInstallation: (installationId) => createInstallationGithubClient(baseGithub, installationId), logger };

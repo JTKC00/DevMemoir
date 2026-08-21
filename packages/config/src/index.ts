@@ -6,6 +6,10 @@ const configSchema = z.object({
   API_ORIGIN: z.string().url().default("http://localhost:4000"),
   WEB_ORIGIN: z.string().url().default("http://localhost:3000"),
   DATABASE_URL: z.string().min(1),
+  DATABASE_API_URL: z.string().min(1).optional(),
+  DATABASE_WORKER_URL: z.string().min(1).optional(),
+  DATABASE_QUEUE_URL: z.string().min(1).optional(),
+  DATABASE_MIGRATIONS_URL: z.string().min(1).optional(),
   DATABASE_DIRECT_URL: z.string().min(1).optional(),
   DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(20).default(5),
   GITHUB_APP_ID: z.coerce.number().int().positive(),
@@ -27,6 +31,10 @@ const configSchema = z.object({
 });
 
 export type AppConfig = z.infer<typeof configSchema> & {
+  DATABASE_API_URL: string;
+  DATABASE_WORKER_URL: string;
+  DATABASE_QUEUE_URL: string;
+  DATABASE_MIGRATIONS_URL: string;
   DATABASE_DIRECT_URL: string;
 };
 
@@ -43,8 +51,15 @@ export function loadConfig(input: NodeJS.ProcessEnv | Record<string, string | un
     const details = result.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ");
     throw new ConfigError(`Invalid configuration: ${details}`);
   }
+  if (result.data.NODE_ENV === "production" && (!result.data.DATABASE_API_URL || !result.data.DATABASE_WORKER_URL || !result.data.DATABASE_QUEUE_URL || !result.data.DATABASE_MIGRATIONS_URL)) {
+    throw new ConfigError("Production requires explicit DATABASE_API_URL, DATABASE_WORKER_URL, DATABASE_QUEUE_URL, and DATABASE_MIGRATIONS_URL role URLs");
+  }
   return {
     ...result.data,
+    DATABASE_API_URL: result.data.DATABASE_API_URL ?? result.data.DATABASE_URL,
+    DATABASE_WORKER_URL: result.data.DATABASE_WORKER_URL ?? result.data.DATABASE_DIRECT_URL ?? result.data.DATABASE_URL,
+    DATABASE_QUEUE_URL: result.data.DATABASE_QUEUE_URL ?? result.data.DATABASE_DIRECT_URL ?? result.data.DATABASE_URL,
+    DATABASE_MIGRATIONS_URL: result.data.DATABASE_MIGRATIONS_URL ?? result.data.DATABASE_DIRECT_URL ?? result.data.DATABASE_URL,
     DATABASE_DIRECT_URL: result.data.DATABASE_DIRECT_URL ?? result.data.DATABASE_URL,
   };
 }

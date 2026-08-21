@@ -16,10 +16,18 @@ describe("typed configuration", () => {
   it("loads defaults and derives the direct URL", () => {
     const config = loadConfig(valid);
     expect(config.DATABASE_DIRECT_URL).toBe(config.DATABASE_URL);
+    expect(config.DATABASE_API_URL).toBe(config.DATABASE_URL);
+    expect(config.DATABASE_WORKER_URL).toBe(config.DATABASE_URL);
+    expect(config.DATABASE_QUEUE_URL).toBe(config.DATABASE_URL);
+    expect(config.DATABASE_MIGRATIONS_URL).toBe(config.DATABASE_URL);
     expect(config.CSRF_HEADER).toBe("x-devmemoir-csrf");
   });
 
   it("rejects missing required secret material", () => {
     expect(() => loadConfig({ ...valid, SESSION_SECRET: "short" })).toThrow(ConfigError);
+  });
+
+  it("requires explicit database role URLs in production", () => {
+    expect(() => loadConfig({ ...valid, NODE_ENV: "production" })).toThrow(ConfigError);
   });
 });

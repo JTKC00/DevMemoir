@@ -53,7 +53,7 @@ export class AuthService {
     const user: UserRecord = existing ?? { userId: createId(), tenantId: createId(), githubAccountId: githubUser.id, login: githubUser.login, displayName: githubUser.login };
     await this.store.attachAuthUser(stateHash, user);
     const handoffCode = createOpaqueToken(32);
-    await this.store.createHandoff(stateHash, hashOpaqueToken(handoffCode, this.config.SESSION_SECRET));
+    await this.store.createHandoff(stateHash, hashOpaqueToken(handoffCode, this.config.SESSION_SECRET), new Date(this.now().getTime() + this.config.HANDOFF_TTL_SECONDS * 1000));
     return { handoffCode, returnPath: transaction.returnPath, user };
   }
 

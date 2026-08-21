@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS github_installations (
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL
 );
+-- Webhook routing contains only the installation-to-tenant lookup needed
+-- before a request can establish a tenant-local RLS context.
+CREATE TABLE IF NOT EXISTS installation_routes (
+  github_installation_id bigint PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL
+);
 CREATE TABLE IF NOT EXISTS repositories (
   id uuid PRIMARY KEY,
   tenant_id uuid NOT NULL REFERENCES tenants(id),
@@ -108,9 +116,19 @@ CREATE TABLE IF NOT EXISTS development_events (
   source_system varchar(40) NOT NULL DEFAULT 'github', source_kind varchar(40) NOT NULL, source_external_id varchar(255) NOT NULL,
   event_type varchar(60) NOT NULL, verb varchar(60) NOT NULL, actor_github_account_id uuid REFERENCES github_accounts(id),
   actor_kind varchar(20) NOT NULL DEFAULT 'unknown', contribution_role varchar(40) NOT NULL, context_kind varchar(20) NOT NULL DEFAULT 'unknown',
-  occurred_at timestamptz NOT NULL, source_updated_at timestamptz, title text, summary_input text,
+  occurred_at timestamptz NOT NULL, source_updated_at timestamptz, title text, summary_input text, source_url text,
   completeness_state varchar(40) NOT NULL DEFAULT 'observed', visibility varchar(20) NOT NULL DEFAULT 'unknown',
   UNIQUE (tenant_id, repository_id, source_system, source_kind, source_external_id, verb)
+);
+ALTER TABLE development_events ADD COLUMN IF NOT EXISTS source_url text;
+
+CREATE TABLE IF NOT EXISTS commit_refs (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  commit_id uuid NOT NULL REFERENCES commits(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  last_seen_at timestamptz NOT NULL,
+  reachable boolean NOT NULL DEFAULT true,
+  PRIMARY KEY (tenant_id, commit_id, branch_id)
 );
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
   id uuid PRIMARY KEY, tenant_id uuid REFERENCES tenants(id), github_delivery_guid varchar(128) NOT NULL UNIQUE,
@@ -119,6 +137,14 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   payload_ciphertext text, payload_key_version varchar(40), first_received_at timestamptz NOT NULL, last_received_at timestamptz NOT NULL,
   receipt_count integer NOT NULL DEFAULT 1, state varchar(30) NOT NULL DEFAULT 'received', processing_attempts integer NOT NULL DEFAULT 0,
   lease_expires_at timestamptz, job_id varchar(255), sanitized_error_code varchar(120), processed_at timestamptz,
+  payload_expires_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unrouted_webhook_deliveries (
+  id uuid PRIMARY KEY,
+  github_delivery_guid varchar(128) NOT NULL UNIQUE,
+  event_name varchar(80) NOT NULL,
+  payload_ciphertext text NOT NULL,
+  received_at timestamptz NOT NULL,
   payload_expires_at timestamptz NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sync_jobs (
@@ -141,6 +167,8 @@ CREATE TABLE IF NOT EXISTS outbox (
 
 CREATE INDEX IF NOT EXISTS commits_tenant_repo_date_idx ON commits (tenant_id, repository_id, committed_at);
 CREATE INDEX IF NOT EXISTS development_events_tenant_date_idx ON development_events (tenant_id, occurred_at);
+CREATE INDEX IF NOT EXISTS commit_refs_branch_reachable_idx ON commit_refs (tenant_id, branch_id, reachable);
+CREATE UNIQUE INDEX IF NOT EXISTS repository_access_one_selected_per_tenant_idx ON repository_access (tenant_id) WHERE access_status = 'selected';
 CREATE INDEX IF NOT EXISTS webhook_deliveries_state_idx ON webhook_deliveries (state, last_received_at);
 CREATE INDEX IF NOT EXISTS sync_jobs_tenant_state_idx ON sync_jobs (tenant_id, state);
 
@@ -152,8 +180,16 @@ DO $$ BEGIN
   CREATE ROLE devmemoir_api NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN
-  CREATE ROLE devmemoir_worker NOLOGIN;
+CREATE ROLE devmemoir_worker NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE ROLE devmemoir_migrations NOLOGIN;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE ROLE devmemoir_queue NOLOGIN;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE SCHEMA IF NOT EXISTS pgboss AUTHORIZATION devmemoir_queue;
+GRANT USAGE, CREATE ON SCHEMA pgboss TO devmemoir_queue;
 ALTER TABLE github_installations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE github_installations FORCE ROW LEVEL SECURITY;
 
@@ -175,16 +211,20 @@ ALTER TABLE sync_cursors ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sync_cursors FORCE ROW LEVEL SECURITY;
 ALTER TABLE outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE outbox FORCE ROW LEVEL SECURITY;
+ALTER TABLE commit_refs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE commit_refs FORCE ROW LEVEL SECURITY;
 
 -- The application sets app.tenant_id transaction-locally. Owners/migrations bypass through a separate role.
 DO $$ DECLARE table_name text; BEGIN
-  FOREACH table_name IN ARRAY ARRAY['github_installations','repositories','repository_access','branches','commits','development_events','webhook_deliveries','sync_jobs','sync_cursors','outbox'] LOOP
+  FOREACH table_name IN ARRAY ARRAY['github_installations','repositories','repository_access','branches','commits','development_events','commit_refs','webhook_deliveries','sync_jobs','sync_cursors','outbox'] LOOP
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', table_name);
     EXECUTE format('CREATE POLICY tenant_isolation ON %I USING (tenant_id::text = current_setting(''app.tenant_id'', true)) WITH CHECK (tenant_id::text = current_setting(''app.tenant_id'', true))', table_name);
   END LOOP;
 END $$;
 
 GRANT USAGE ON SCHEMA public TO devmemoir_web, devmemoir_api, devmemoir_worker;
-GRANT SELECT ON repositories, repository_access, branches, commits, development_events, webhook_deliveries, sync_jobs, sync_cursors TO devmemoir_web;
-GRANT SELECT, INSERT, UPDATE ON repositories, repository_access, branches, commits, development_events, webhook_deliveries, sync_jobs, sync_cursors, outbox TO devmemoir_api, devmemoir_worker;
-GRANT SELECT, INSERT, UPDATE ON tenants, users, tenant_members, github_accounts, github_identities, auth_transactions, application_sessions, github_installations TO devmemoir_api;
+GRANT SELECT ON repositories, repository_access, branches, commits, development_events, commit_refs TO devmemoir_web;
+GRANT SELECT, INSERT, UPDATE ON repositories, repository_access, branches, commits, development_events, commit_refs, webhook_deliveries, sync_jobs, sync_cursors, outbox TO devmemoir_api, devmemoir_worker;
+GRANT SELECT, INSERT, UPDATE ON tenants, users, tenant_members, github_accounts, github_identities, auth_transactions, application_sessions, github_installations, installation_routes TO devmemoir_api;
+GRANT SELECT, INSERT, UPDATE ON github_accounts, github_installations, installation_routes TO devmemoir_worker;
+GRANT INSERT, SELECT ON unrouted_webhook_deliveries TO devmemoir_api;

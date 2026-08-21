@@ -2,6 +2,7 @@ import { headers } from "next/headers";
 
 type ActivityResponse = {
   completeness: string;
+  repository?: { id: string; fullName: string; private: boolean };
   events: Array<{ id: string; occurredAt: string; verb: string; contributionRole: string; contextKind: string; actorKind: string; message?: string; sourceUrl?: string }>;
 };
 
@@ -18,9 +19,9 @@ export default async function HomePage() {
   const activity = await loadActivity();
   const apiOrigin = process.env.API_ORIGIN ?? "http://localhost:4000";
   return <main>
-    <header><h1>DevMemoir</h1>{!activity ? <a className="button" href={`${apiOrigin}/auth/github/start?returnPath=/`}>Continue with GitHub</a> : null}</header>
+    <header><h1>DevMemoir</h1>{!activity ? <a className="button" href={`${apiOrigin}/auth/github/start?returnPath=/`}>Continue with GitHub</a> : activity.repository ? <a className="button" href="/connect">Manage connection</a> : <a className="button" href="/connect">Connect GitHub</a>}</header>
     {!activity ? <section className="card"><p>Connect a GitHub App installation to see observed work in a repository you selected.</p><p className="muted">This is not a complete GitHub history.</p></section> : <>
-      <section className="card"><strong>{activity.completeness}</strong><p className="muted">Observed facts from the connected repository are shown below.</p></section>
+      <section className="card">{activity.repository ? <><strong>{activity.repository.fullName}</strong><p className="muted">{activity.completeness}</p></> : <><strong>No repository connected</strong><p className="muted">Connect one repository to begin the Milestone 1 import.</p></>}</section>
       <section className="card">{activity.events.length === 0 ? <p className="muted">No activity has been imported yet.</p> : activity.events.map((event) => <article className="event" key={event.id}>
         <div><strong>{event.verb}</strong> <span className="muted">({event.contributionRole}, {event.contextKind})</span></div>
         <time className="muted" dateTime={event.occurredAt}>{new Date(event.occurredAt).toLocaleString()}</time>

@@ -9,9 +9,9 @@
     "build": "pnpm -r --if-present build",
     "dev": "pnpm --parallel --filter @devmemoir/web --filter @devmemoir/api --filter @devmemoir/worker dev",
     "lint": "pnpm -r --if-present lint",
-    "test": "pnpm -r --if-present test",
+    "test": "pnpm build && pnpm -r --if-present test",
     "test:watch": "pnpm -r --if-present test:watch",
-    "typecheck": "pnpm -r --if-present typecheck",
+    "typecheck": "pnpm build && pnpm -r --if-present typecheck",
     "db:generate": "pnpm --filter @devmemoir/db db:generate",
     "db:migrate": "pnpm --filter @devmemoir/db db:migrate"
   },

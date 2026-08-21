@@ -3,12 +3,12 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import rawBody from "fastify-raw-body";
 import type { AppConfig } from "@devmemoir/config";
-import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, minimalPushSignal, parseWebhook } from "@devmemoir/domain";
+import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, parseWebhook } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import type { JobPort } from "@devmemoir/jobs";
 import { deliveryLogicalKey } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
-import type { DeliveryRecord, M1Store, SessionRecord } from "@devmemoir/db";
+import type { M1Store, SessionRecord } from "@devmemoir/db";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
 import { verifyGithubSignature, webhookBodyLimit } from "./webhook.js";
 
@@ -98,7 +98,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     } catch (error) {
       const status = error instanceof AuthFlowError ? error.statusCode : 502;
       deps.logger.warn({ event_type: "oauth_callback", result: "rejected" }, error);
-      return reply.code(status).send({ error: error instanceof Error ? error.message : "oauth_failed" });
+      return reply.code(status).send({ error: status === 403 ? "account_not_allowed" : status === 503 ? "oauth_unavailable" : "oauth_failed" });
     }
   });
 
@@ -108,7 +108,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       return await auth.exchangeHandoff(request.body.code);
     } catch (error) {
       const status = error instanceof AuthFlowError ? error.statusCode : 400;
-      return reply.code(status).send({ error: error instanceof Error ? error.message : "handoff_failed" });
+      return reply.code(status).send({ error: status === 503 ? "handoff_unavailable" : "handoff_failed" });
     }
   });
 
@@ -133,16 +133,38 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   app.get<{ Querystring: { installation_id?: string; setup_action?: string; state?: string } }>("/github/setup", async (request, reply) => {
     const installationId = Number(request.query.installation_id);
     if (!Number.isSafeInteger(installationId) || installationId <= 0) return reply.code(400).send({ error: "invalid_installation" });
-    const session = await sessionFromRequest(request as RequestWithSession);
-    if (!session) return reply.code(401).send({ error: "authenticated_claim_required" });
-    if (!request.query.state) return reply.code(400).send({ error: "installation_state_required" });
+    if (request.query.setup_action && request.query.setup_action !== "install") return reply.code(400).send({ error: "unsupported_setup_action" });
+    if (!request.query.state) return reply.redirect(new URL(`/connect?installation_id=${installationId}&claim=1`, deps.config.WEB_ORIGIN).toString());
     const transaction = await deps.store.consumeAuthState(hashOpaqueToken(request.query.state, deps.config.SESSION_SECRET), now());
-    if (!transaction || transaction.userId !== session.userId) return reply.code(400).send({ error: "invalid_installation_state" });
+    if (!transaction?.userId) return reply.code(400).send({ error: "invalid_installation_state" });
+    const signedInUser = await deps.store.getUserById(transaction.userId);
+    if (!signedInUser) return reply.code(400).send({ error: "installation_user_not_found" });
+    const installation = await deps.github.getInstallation(installationId);
+    if (installation.account.type !== "User" || installation.account.id !== signedInUser?.githubAccountId) return reply.code(403).send({ error: "installation_account_mismatch" });
+    await deps.store.saveInstallation({ id: createId(), tenantId: signedInUser.tenantId, githubInstallationId: installationId, accountGithubAccountId: installation.account.id });
+    return reply.redirect(new URL("/connect?connected=1", deps.config.WEB_ORIGIN).toString());
+  });
+
+  app.post<{ Body: { installation_id?: number } }>("/connect/claim", async (request, reply) => {
+    const session = await requireCsrf(request as RequestWithSession, reply);
+    if (!session) return;
+    const installationId = Number(request.body?.installation_id);
+    if (!Number.isSafeInteger(installationId) || installationId <= 0) return reply.code(400).send({ error: "invalid_installation" });
     const installation = await deps.github.getInstallation(installationId);
     const signedInUser = await deps.store.getUserById(session.userId);
     if (installation.account.type !== "User" || installation.account.id !== signedInUser?.githubAccountId) return reply.code(403).send({ error: "installation_account_mismatch" });
     await deps.store.saveInstallation({ id: createId(), tenantId: session.tenantId, githubInstallationId: installationId, accountGithubAccountId: installation.account.id });
-    return reply.redirect(new URL("/connect?connected=1", deps.config.WEB_ORIGIN).toString());
+    return { connected: true };
+  });
+
+  app.get("/connect/repositories", async (request, reply) => {
+    const session = await requireSession(request as RequestWithSession, reply);
+    if (!session) return;
+    const installation = (await deps.store.listInstallations(session.tenantId))[0];
+    if (!installation) return { connected: false, repositories: [] };
+    const client = deps.installationGithub?.(installation.githubInstallationId) ?? deps.github;
+    const firstPage = await client.listInstallationRepositories(1, 100);
+    return { connected: true, repositories: firstPage.repositories.map((repository) => ({ id: repository.id, fullName: repository.full_name, name: repository.name, owner: repository.owner?.login, private: repository.private, defaultBranch: repository.default_branch })) };
   });
 
   app.post<{ Body: { owner?: string; repo?: string } }>("/connect/repository", async (request, reply) => {
@@ -153,16 +175,25 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     if (!owner || !repo) return reply.code(400).send({ error: "owner_and_repo_required" });
     const connectedRepositories = await deps.store.listRepositories(session.tenantId);
     if (connectedRepositories.length > 0 && connectedRepositories[0]?.fullName !== `${owner}/${repo}`) return reply.code(409).send({ error: "m1_supports_one_repository" });
+    if (connectedRepositories[0]?.fullName === `${owner}/${repo}`) return reply.code(200).send({ repository: connectedRepositories[0], completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
     const installation = (await deps.store.listInstallations(session.tenantId))[0];
     if (!installation) return reply.code(409).send({ error: "installation_required" });
     const client = deps.installationGithub?.(installation.githubInstallationId) ?? deps.github;
     const githubRepository = await client.getRepository(owner, repo);
     const repository: import("@devmemoir/db").RepositoryRecord = { id: createId(), tenantId: session.tenantId, installationId: installation.id, githubRepositoryId: githubRepository.id, ownerLogin: githubRepository.owner?.login ?? owner, name: githubRepository.name, fullName: githubRepository.full_name, private: githubRepository.private, ...(githubRepository.visibility ? { visibility: githubRepository.visibility } : {}), defaultBranch: githubRepository.default_branch, ...(githubRepository.description ? { description: githubRepository.description } : {}) };
-    await deps.store.saveRepository(repository);
-    const head = await client.getRefHead({ owner: repository.ownerLogin, repo: repository.name, ref: repository.defaultBranch });
-    const jobPayload = { tenantId: repository.tenantId, repositoryId: repository.id, installationId: installation.githubInstallationId, owner: repository.ownerLogin, repo: repository.name, ref: `refs/heads/${repository.defaultBranch}`, before: "0".repeat(40), after: head ?? "0".repeat(40), forced: false };
-    await deps.jobs.enqueue("repository_backfill", `backfill:${repository.id}`, jobPayload);
-    return reply.code(201).send({ repository, completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
+    let connectedRepository: import("@devmemoir/db").RepositoryRecord;
+    try {
+      connectedRepository = await deps.store.saveRepository(repository);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") return reply.code(409).send({ error: "m1_supports_one_repository" });
+      throw error;
+    }
+    if (connectedRepository.id !== repository.id) return reply.code(200).send({ repository: connectedRepository, completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
+    const head = await client.getRefHead({ owner: connectedRepository.ownerLogin, repo: connectedRepository.name, ref: connectedRepository.defaultBranch });
+    const jobPayload = { kind: "repository_backfill", tenantId: connectedRepository.tenantId, repositoryId: connectedRepository.id, installationId: installation.githubInstallationId, owner: connectedRepository.ownerLogin, repo: connectedRepository.name, ref: `refs/heads/${connectedRepository.defaultBranch}`, before: "0".repeat(40), after: head ?? "0".repeat(40), forced: false };
+    await deps.store.ensureJob(`backfill:${connectedRepository.id}`, jobPayload);
+    await deps.jobs.enqueue("repository_backfill", `backfill:${connectedRepository.id}`, jobPayload);
+    return reply.code(201).send({ repository: connectedRepository, completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
   });
 
   app.post("/webhooks/github", { config: { rawBody: true } }, async (request, reply) => {
@@ -178,12 +209,16 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     let parsed;
     try { parsed = parseWebhook(eventName, parsedBody); } catch { return reply.code(400).send({ error: "invalid_webhook_payload" }); }
     const knownAction = isKnownAction(eventName, parsed.action);
-    const ignored = parsed.kind === "ignored" || !knownAction;
+    // M1 stores receipts for every signed event, but only push is a sync
+    // signal. Other event families are intentionally terminally ignored.
+    const ignored = parsed.kind !== "push" || !knownAction;
     const installation = parsed.installationGithubId ? await deps.store.getInstallation(parsed.installationGithubId) : undefined;
-    const fallbackUser = installation ? undefined : await deps.store.getUserByGithubAccountId(deps.config.OWNER_GITHUB_USER_ID);
-    const tenantId = installation?.tenantId ?? fallbackUser?.tenantId;
-    if (!tenantId) return reply.code(202).send({ accepted: true, state: "ignored" });
     const payloadCiphertext = encryptSecret(raw.toString("utf8"), deps.config.ENCRYPTION_KEY_BASE64);
+    const tenantId = installation?.tenantId;
+    if (!tenantId) {
+      await deps.store.recordUnroutedWebhook({ guid, eventName, payloadCiphertext, receivedAt: now(), payloadExpiresAt: new Date(now().getTime() + 7 * 24 * 60 * 60 * 1000) });
+      return reply.code(202).send({ accepted: true, state: "ignored" });
+    }
     const delivery = await deps.store.insertDelivery({
       tenantId,
       guid,
@@ -196,13 +231,30 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       payloadExpiresAt: new Date(now().getTime() + 7 * 24 * 60 * 60 * 1000),
       now: now(),
     });
-    if (ignored) {
+    const canonicalPush = Boolean(delivery.record.ref && delivery.record.after);
+    if (ignored && (delivery.created || !canonicalPush)) {
       await deps.store.updateDelivery(delivery.record.id, { state: "ignored", processedAt: now() }, delivery.record.tenantId);
       return reply.code(202).send({ accepted: true, state: "ignored" });
     }
-    if (delivery.action === "noop" || (delivery.action === "ensure_job" && delivery.record.jobId)) return reply.code(202).send({ accepted: true, state: delivery.record.state });
+    if (delivery.action === "noop") return reply.code(202).send({ accepted: true, state: delivery.record.state });
     const logicalKey = deliveryLogicalKey(delivery.record.id);
-    const jobId = await deps.jobs.enqueue("webhook_delivery", logicalKey, { tenantId, deliveryId: delivery.record.id, deliveryGuid: guid, eventName, installationGithubId: parsed.installationGithubId, repositoryGithubId: parsed.repositoryGithubId, ...(parsed.push ? minimalPushSignal(guid, parsed) : {}) });
+    const jobPayload = {
+      kind: "webhook_delivery",
+      tenantId: delivery.record.tenantId,
+      deliveryId: delivery.record.id,
+      deliveryGuid: delivery.record.guid,
+      eventName: delivery.record.eventName,
+      ...(delivery.record.installationGithubId ? { installationId: delivery.record.installationGithubId } : {}),
+      ...(delivery.record.repositoryGithubId ? { repositoryGithubId: delivery.record.repositoryGithubId } : {}),
+      ...(canonicalPush ? { ref: delivery.record.ref, before: delivery.record.before ?? "0".repeat(40), after: delivery.record.after ?? "0".repeat(40), forced: delivery.record.forced ?? false } : {}),
+    };
+    await deps.store.ensureJob(logicalKey, jobPayload);
+    if (delivery.record.jobId && await deps.jobs.has(delivery.record.jobId, "webhook_delivery")) {
+      const state = delivery.record.state === "failed" || delivery.record.state === "dead_letter" ? "received" : delivery.record.state;
+      if (state !== delivery.record.state) await deps.store.updateDelivery(delivery.record.id, { state }, delivery.record.tenantId);
+      return reply.code(202).send({ accepted: true, state });
+    }
+    const jobId = await deps.jobs.enqueue("webhook_delivery", logicalKey, jobPayload);
     await deps.store.updateDelivery(delivery.record.id, { jobId, state: delivery.record.state === "failed" || delivery.record.state === "dead_letter" ? "received" : delivery.record.state }, delivery.record.tenantId);
     return reply.code(202).send({ accepted: true, state: delivery.record.state });
   });
@@ -210,8 +262,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   app.get<{ Querystring: { repositoryId?: string } }>("/api/activity", async (request, reply) => {
     const session = await requireSession(request as RequestWithSession, reply);
     if (!session) return;
+    const repositories = await deps.store.listRepositories(session.tenantId);
     const events = defaultTimelineEvents(await deps.store.listActivity(session.tenantId, request.query.repositoryId), deps.config.OWNER_GITHUB_USER_ID);
-    return { completeness: "Newest 100 commits currently reachable from the default branch of this connected repository.", events: events.map((event) => { const sourceUrl = (event as typeof event & { htmlUrl?: string }).htmlUrl; return { id: event.id, repositoryId: event.repositoryId, occurredAt: event.occurredAt.toISOString(), verb: event.verb, contributionRole: event.contributionRole, contextKind: event.contextKind, actorKind: event.actorKind, ...(event.summaryInput ? { message: event.summaryInput } : {}), ...(sourceUrl ? { sourceUrl } : {}) }; }) };
+    return { completeness: "Newest 100 commits currently reachable from the default branch of this connected repository.", ...(repositories[0] ? { repository: { id: repositories[0].id, fullName: repositories[0].fullName, private: repositories[0].private } } : {}), events: events.map((event) => { const sourceUrl = (event as typeof event & { htmlUrl?: string }).htmlUrl; return { id: event.id, repositoryId: event.repositoryId, occurredAt: event.occurredAt.toISOString(), verb: event.verb, contributionRole: event.contributionRole, contextKind: event.contextKind, actorKind: event.actorKind, ...(event.summaryInput ? { message: event.summaryInput } : {}), ...(sourceUrl ? { sourceUrl } : {}) }; }) };
   });
 
   app.setErrorHandler((error, request, reply) => {

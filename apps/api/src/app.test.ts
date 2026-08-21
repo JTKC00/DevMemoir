@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
 import { InMemoryM1Store } from "@devmemoir/db";
+import { createId, createOpaqueToken, encryptSecret, hashOpaqueToken } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
@@ -10,7 +11,7 @@ import { buildApi } from "./app.js";
 const secret = "current-secret-123456";
 const config: AppConfig = {
   NODE_ENV: "test", LOG_LEVEL: "error", API_ORIGIN: "http://localhost:4000", WEB_ORIGIN: "http://localhost:3000",
-  DATABASE_URL: "postgres://unused", DATABASE_DIRECT_URL: "postgres://unused", DATABASE_POOL_MAX: 2,
+  DATABASE_URL: "postgres://unused", DATABASE_API_URL: "postgres://unused", DATABASE_WORKER_URL: "postgres://unused", DATABASE_QUEUE_URL: "postgres://unused", DATABASE_MIGRATIONS_URL: "postgres://unused", DATABASE_DIRECT_URL: "postgres://unused", DATABASE_POOL_MAX: 2,
   GITHUB_APP_ID: 1, GITHUB_APP_CLIENT_ID: "client", GITHUB_APP_CLIENT_SECRET: "secret", GITHUB_APP_PRIVATE_KEY: "private-key",
   GITHUB_WEBHOOK_SECRET: secret, GITHUB_API_VERSION: "2022-11-28", OWNER_GITHUB_USER_ID: 7,
   ENCRYPTION_KEY_BASE64: Buffer.alloc(32, 4).toString("base64"), SESSION_SECRET: "session-secret-that-is-at-least-32-bytes-long",
@@ -36,9 +37,11 @@ describe("M1 webhook receipt", () => {
 
   beforeEach(async () => {
     store.deliveries.clear();
+    store.unroutedWebhooks.clear();
     store.jobs.clear();
     jobs.jobs.clear();
     await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
     app = await buildApi({ config, store, github, jobs, logger: createLogger(capture.sink) });
   });
 
@@ -71,10 +74,26 @@ describe("M1 webhook receipt", () => {
     expect(store.deliveries.get("guid-failed")?.state).toBe("received");
   });
 
+  it("keeps the first receipt as canonical when a redelivery body disagrees", async () => {
+    await send("guid-disagree", "push", { ref: "refs/heads/main", before: "a", after: "first", installation: { id: 22 }, repository: { id: 10 } });
+    await send("guid-disagree", "push", { ref: "refs/heads/main", before: "b", after: "second", installation: { id: 22 }, repository: { id: 10 } });
+    const payload = [...jobs.jobs.values()][0]?.payload as { after?: string } | undefined;
+    expect(payload?.after).toBe("first");
+    expect(store.deliveries.get("guid-disagree")?.after).toBe("first");
+  });
+
+  it("completes installation setup from state without an API session cookie", async () => {
+    const state = createOpaqueToken(32);
+    await store.createAuthTransaction({ id: createId(), stateHash: hashOpaqueToken(state, config.SESSION_SECRET), codeVerifierCiphertext: encryptSecret("unused", config.ENCRYPTION_KEY_BASE64), userId: "user-1", returnPath: "/connect", expiresAt: new Date(Date.now() + 60_000) });
+    const response = await app.inject({ method: "GET", url: `/github/setup?installation_id=22&setup_action=install&state=${encodeURIComponent(state)}` });
+    expect(response.statusCode).toBe(302);
+    expect(store.installations.get(22)?.tenantId).toBe("tenant-1");
+  });
+
   it("handles signed ping and unsupported actions as acknowledged states", async () => {
     expect((await send("guid-ping", "ping", { zen: "hello" })).statusCode).toBe(202);
     expect((await send("guid-unknown", "issues", { action: "transferred" })).statusCode).toBe(202);
-    expect(store.deliveries.get("guid-unknown")?.state).toBe("ignored");
+    expect(store.unroutedWebhooks.has("guid-unknown")).toBe(true);
   });
 
   it("rejects invalid signatures and bodies over 2 MB before persistence", async () => {

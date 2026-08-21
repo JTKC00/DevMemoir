@@ -8,6 +8,7 @@ import type {
   InstallationRecord,
   M1Store,
   RepositoryRecord,
+  RefSyncContinuation,
   SessionRecord,
   UserRecord,
 } from "./store.js";
@@ -16,6 +17,12 @@ type Row = QueryResultRow & Record<string, unknown>;
 
 function date(value: unknown): Date | undefined {
   return value instanceof Date ? value : typeof value === "string" ? new Date(value) : undefined;
+}
+
+function branchName(ref: string): string {
+  if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
+  if (ref.startsWith("heads/")) return ref.slice("heads/".length);
+  return ref;
 }
 
 function userFromRow(row: Row | undefined): UserRecord | undefined {
@@ -137,8 +144,8 @@ export class PostgresM1Store implements M1Store {
     await this.pool.query("update auth_transactions set github_account_id=$2,user_id=$3 where state_hash=$1", [stateHash, user.githubAccountId, user.userId]);
   }
 
-  async createHandoff(stateHash: string, handoffHash: string): Promise<void> {
-    await this.pool.query("update auth_transactions set handoff_hash=$2 where state_hash=$1 and consumed_at is not null", [stateHash, handoffHash]);
+  async createHandoff(stateHash: string, handoffHash: string, expiresAt?: Date): Promise<void> {
+    await this.pool.query("update auth_transactions set handoff_hash=$2,expires_at=coalesce($3,expires_at) where state_hash=$1 and consumed_at is not null", [stateHash, handoffHash, expiresAt ?? null]);
   }
 
   async consumeHandoff(handoffHash: string, now: Date): Promise<UserRecord | undefined> {
@@ -196,21 +203,27 @@ export class PostgresM1Store implements M1Store {
     return userFromRow(result.rows[0]);
   }
 
-  private async ensureGithubAccount(accountId: number, login?: string): Promise<string> {
-    const result = await this.pool.query<Row>("insert into github_accounts (id,github_account_id,account_type,actor_kind,login) values ($1,$2,'User','user',$3) on conflict (github_account_id) do update set login=coalesce(excluded.login,github_accounts.login) returning id", [createId(), accountId, login ?? null]);
+  private async ensureGithubAccount(client: Pool | PoolClient, accountId: number, login?: string, accountType = "User", actorKind = "user"): Promise<string> {
+    const result = await client.query<Row>("insert into github_accounts (id,github_account_id,account_type,actor_kind,login) values ($1,$2,$3,$4,$5) on conflict (github_account_id) do update set account_type=excluded.account_type,actor_kind=excluded.actor_kind,login=coalesce(excluded.login,github_accounts.login) returning id", [createId(), accountId, accountType, actorKind, login ?? null]);
     return String(result.rows[0]?.id);
   }
 
   async saveInstallation(installation: InstallationRecord): Promise<void> {
-    const accountId = await this.ensureGithubAccount(installation.accountGithubAccountId);
     await this.tenantQuery(installation.tenantId, async (client) => {
+      const accountId = await this.ensureGithubAccount(client, installation.accountGithubAccountId);
       await client.query(`insert into github_installations (id,tenant_id,github_installation_id,account_github_account_id,created_at,updated_at) values ($1,$2,$3,$4,now(),now()) on conflict (github_installation_id) do update set tenant_id=excluded.tenant_id,account_github_account_id=excluded.account_github_account_id,updated_at=now()`, [installation.id, installation.tenantId, installation.githubInstallationId, accountId]);
+      await client.query(`insert into installation_routes (github_installation_id,tenant_id,created_at,updated_at) values ($1,$2,now(),now()) on conflict (github_installation_id) do update set tenant_id=excluded.tenant_id,updated_at=now()`, [installation.githubInstallationId, installation.tenantId]);
     });
   }
 
   async getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined> {
-    const result = await this.pool.query<Row>("select id,tenant_id,github_installation_id,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.github_installation_id=$1 and gi.deleted_at is null", [githubInstallationId]);
-    return installationFromRow(result.rows[0]);
+    const route = await this.pool.query<Row>("select tenant_id from installation_routes where github_installation_id=$1", [githubInstallationId]);
+    const tenantId = route.rows[0]?.tenant_id;
+    if (!tenantId) return undefined;
+    return this.tenantQuery(String(tenantId), async (client) => {
+      const result = await client.query<Row>("select id,tenant_id,github_installation_id,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.github_installation_id=$1 and gi.deleted_at is null", [githubInstallationId]);
+      return installationFromRow(result.rows[0]);
+    });
   }
 
   async listInstallations(tenantId: string): Promise<InstallationRecord[]> {
@@ -220,25 +233,27 @@ export class PostgresM1Store implements M1Store {
     });
   }
 
-  async saveRepository(repository: RepositoryRecord): Promise<void> {
-    await this.tenantQuery(repository.tenantId, async (client) => {
+  async saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord> {
+    const savedId = await this.tenantQuery(repository.tenantId, async (client) => {
       const result = await client.query<Row>(`insert into repositories (id,tenant_id,github_repository_id,owner_login,name,full_name,private,visibility,default_branch,description,created_at,updated_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now()) on conflict (tenant_id,github_repository_id) do update set owner_login=excluded.owner_login,name=excluded.name,full_name=excluded.full_name,private=excluded.private,visibility=excluded.visibility,default_branch=excluded.default_branch,description=excluded.description,updated_at=now() returning id`, [repository.id, repository.tenantId, repository.githubRepositoryId, repository.ownerLogin, repository.name, repository.fullName, repository.private, repository.visibility ?? null, repository.defaultBranch, repository.description ?? null]);
       const repositoryId = String(result.rows[0]?.id ?? repository.id);
       await client.query(`insert into repository_access (id,tenant_id,repository_id,installation_id,access_status,selected_at) values ($1,$2,$3,$4,'selected',now()) on conflict (tenant_id,repository_id,installation_id) do update set access_status='selected',revoked_at=null`, [createId(), repository.tenantId, repositoryId, repository.installationId]);
+      return repositoryId;
     });
+    return savedId === repository.id ? repository : { ...repository, id: savedId };
   }
 
   async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> {
-    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,coalesce(ra.installation_id,'00000000-0000-0000-0000-000000000000') as installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.default_branch,r.description from repositories r left join lateral (select installation_id from repository_access where repository_id=r.id and tenant_id=r.tenant_id and access_status='selected' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 and r.github_repository_id=$2 and r.deleted_at is null", [tenantId, githubRepositoryId])).rows[0]));
+    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.default_branch,r.description from repositories r join lateral (select installation_id from repository_access where repository_id=r.id and tenant_id=r.tenant_id and access_status='selected' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 and r.github_repository_id=$2 and r.deleted_at is null", [tenantId, githubRepositoryId])).rows[0]));
   }
 
   async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
-    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,coalesce(ra.installation_id,'00000000-0000-0000-0000-000000000000') as installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.default_branch,r.description from repositories r left join lateral (select installation_id from repository_access where repository_id=r.id and tenant_id=r.tenant_id and access_status='selected' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 and r.id=$2 and r.deleted_at is null", [tenantId, repositoryId])).rows[0]));
+    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.default_branch,r.description from repositories r join lateral (select installation_id from repository_access where repository_id=r.id and tenant_id=r.tenant_id and access_status='selected' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 and r.id=$2 and r.deleted_at is null", [tenantId, repositoryId])).rows[0]));
   }
 
   async listRepositories(tenantId: string): Promise<RepositoryRecord[]> {
     return this.tenantQuery(tenantId, async (client) => {
-      const result = await client.query<Row>("select r.id,r.tenant_id,coalesce(ra.installation_id,'00000000-0000-0000-0000-000000000000') as installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.default_branch,r.description from repositories r left join lateral (select installation_id from repository_access where repository_id=r.id and tenant_id=r.tenant_id and access_status='selected' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 and r.deleted_at is null order by r.created_at asc", [tenantId]);
+      const result = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.default_branch,r.description from repositories r join lateral (select installation_id from repository_access where repository_id=r.id and tenant_id=r.tenant_id and access_status='selected' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 and r.deleted_at is null order by r.created_at asc", [tenantId]);
       return result.rows.map((row) => repositoryFromRow(row)).filter((row): row is RepositoryRecord => Boolean(row));
     });
   }
@@ -266,6 +281,10 @@ export class PostgresM1Store implements M1Store {
     } finally {
       client.release();
     }
+  }
+
+  async recordUnroutedWebhook(record: { guid: string; eventName: string; payloadCiphertext: string; receivedAt: Date; payloadExpiresAt: Date }): Promise<void> {
+    await this.pool.query("insert into unrouted_webhook_deliveries (id,github_delivery_guid,event_name,payload_ciphertext,received_at,payload_expires_at) values ($1,$2,$3,$4,$5,$6) on conflict (github_delivery_guid) do nothing", [createId(), record.guid, record.eventName, record.payloadCiphertext, record.receivedAt, record.payloadExpiresAt]);
   }
 
   async updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void> {
@@ -301,34 +320,114 @@ export class PostgresM1Store implements M1Store {
   }
 
   async setBranchHead(tenantId: string, repositoryId: string, ref: string, headSha: string | null): Promise<void> {
-    const name = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+    const name = branchName(ref);
     await this.tenantQuery(tenantId, async (client) => {
-      await client.query(`insert into branches (id,tenant_id,repository_id,name,head_sha,last_seen_at) values ($1,$2,$3,$4,$5,now()) on conflict (tenant_id,repository_id,name) do update set head_sha=excluded.head_sha,last_seen_at=now(),deleted_at=case when excluded.head_sha is null then now() else null end`, [createId(), tenantId, repositoryId, name, headSha]);
+      await client.query(`insert into branches (id,tenant_id,repository_id,name,head_sha,last_seen_at,reachable) values ($1,$2,$3,$4,$5,now(),$6) on conflict (tenant_id,repository_id,name) do update set head_sha=excluded.head_sha,last_seen_at=now(),reachable=excluded.reachable,deleted_at=case when excluded.head_sha is null then now() else null end`, [createId(), tenantId, repositoryId, name, headSha, headSha !== null]);
     });
   }
 
   async getBranchHead(tenantId: string, repositoryId: string, ref: string): Promise<string | null> {
-    const name = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+    const name = branchName(ref);
     return this.tenantQuery(tenantId, async (client) => {
       const result = await client.query<Row>("select head_sha from branches where tenant_id=$1 and repository_id=$2 and name=$3", [tenantId, repositoryId, name]);
       return result.rows[0]?.head_sha ? String(result.rows[0].head_sha) : null;
     });
   }
 
-  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event: DevelopmentEvent, htmlUrl?: string): Promise<void> {
-    const authorId = commit.author ? await this.ensureGithubAccount(commit.author.githubAccountId, commit.author.login) : undefined;
-    const committerId = commit.committer ? await this.ensureGithubAccount(commit.committer.githubAccountId, commit.committer.login) : undefined;
+  async finalizeRefSync(input: { tenantId: string; repositoryId: string; ref: string; expectedHead: string | null; headSha: string | null; invalidatePrevious: boolean; reachableShas: string[] }): Promise<boolean> {
+    const name = branchName(input.ref);
+    return this.tenantQuery(input.tenantId, async (client) => {
+      // Serialize publications for one tenant/repository/ref and make the
+      // compare-and-set decision in the same transaction as reachability.
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [`${input.tenantId}:${input.repositoryId}:${name}`]);
+      const existing = await client.query<Row>("select id,head_sha from branches where tenant_id=$1 and repository_id=$2 and name=$3 for update", [input.tenantId, input.repositoryId, name]);
+      const current = existing.rows[0]?.head_sha ? String(existing.rows[0].head_sha) : null;
+      if (existing.rows.length > 0 && current !== input.expectedHead) return false;
+      if (existing.rows.length === 0 && input.expectedHead !== null) return false;
+
+      let branchId: string;
+      if (existing.rows[0]?.id) {
+        branchId = String(existing.rows[0].id);
+        await client.query("update branches set head_sha=$4,last_seen_at=now(),reachable=$5,deleted_at=case when $4 is null then now() else null end where tenant_id=$1 and repository_id=$2 and name=$3", [input.tenantId, input.repositoryId, name, input.headSha, input.headSha !== null]);
+      } else {
+        const inserted = await client.query<Row>("insert into branches (id,tenant_id,repository_id,name,head_sha,last_seen_at,reachable) values ($1,$2,$3,$4,$5,now(),$6) returning id", [createId(), input.tenantId, input.repositoryId, name, input.headSha, input.headSha !== null]);
+        branchId = String(inserted.rows[0]?.id);
+      }
+      if (input.invalidatePrevious) await client.query("update commit_refs set reachable=false where tenant_id=$1 and branch_id=$2", [input.tenantId, branchId]);
+      if (input.reachableShas.length > 0) {
+        await client.query("insert into commit_refs (tenant_id,commit_id,branch_id,last_seen_at,reachable) select $1,c.id,$2,now(),true from commits c where c.tenant_id=$1 and c.repository_id=$3 and c.sha=any($4::text[]) on conflict (tenant_id,commit_id,branch_id) do update set last_seen_at=now(),reachable=true", [input.tenantId, branchId, input.repositoryId, input.reachableShas]);
+      }
+      await client.query("delete from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='commit_ref' and ref_name=$3", [input.tenantId, input.repositoryId, name]);
+      return true;
+    });
+  }
+
+  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void> {
     await this.tenantQuery(tenantId, async (client) => {
-      await client.query(`insert into commits (id,tenant_id,repository_id,sha,author_github_account_id,committer_github_account_id,message,authored_at,committed_at,parent_shas,verified,additions,deletions,first_seen_at,last_seen_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now()) on conflict (tenant_id,repository_id,sha) do update set author_github_account_id=excluded.author_github_account_id,committer_github_account_id=excluded.committer_github_account_id,message=excluded.message,authored_at=excluded.authored_at,committed_at=excluded.committed_at,parent_shas=excluded.parent_shas,verified=excluded.verified,additions=excluded.additions,deletions=excluded.deletions,last_seen_at=now()`, [createId(), tenantId, repositoryId, commit.sha, authorId ?? null, committerId ?? null, commit.message, commit.authoredAt ?? null, commit.committedAt ?? null, JSON.stringify(commit.parents), commit.verified ?? null, commit.additions ?? null, commit.deletions ?? null]);
-      await client.query(`insert into development_events (id,tenant_id,repository_id,source_system,source_kind,source_external_id,event_type,verb,actor_github_account_id,actor_kind,contribution_role,context_kind,occurred_at,source_updated_at,title,summary_input,completeness_state,visibility) values ($1,$2,$3,'github',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) on conflict (tenant_id,repository_id,source_system,source_kind,source_external_id,verb) do update set actor_github_account_id=excluded.actor_github_account_id,actor_kind=excluded.actor_kind,occurred_at=excluded.occurred_at,summary_input=excluded.summary_input`, [event.id, tenantId, repositoryId, event.sourceKind, event.sourceExternalId, event.eventType, event.verb, event.actorGithubAccountId ? await this.ensureGithubAccount(event.actorGithubAccountId) : null, event.actorKind, event.contributionRole, event.contextKind, event.occurredAt, event.sourceUpdatedAt ?? null, event.title ?? null, event.summaryInput ?? null, event.completenessState, event.visibility]);
-      void htmlUrl;
+      const authorId = commit.author ? await this.ensureGithubAccount(client, commit.author.githubAccountId, commit.author.login, commit.author.accountType ?? "User", commit.author.actorKind) : undefined;
+      const committerId = commit.committer ? await this.ensureGithubAccount(client, commit.committer.githubAccountId, commit.committer.login, commit.committer.accountType ?? "User", commit.committer.actorKind) : undefined;
+      const eventActorId = event?.actorGithubAccountId === undefined ? undefined : await this.ensureGithubAccount(client, event.actorGithubAccountId, undefined, event.actorKind === "bot" ? "Bot" : "User", event.actorKind);
+      await client.query(`insert into commits (id,tenant_id,repository_id,sha,author_github_account_id,committer_github_account_id,message,authored_at,committed_at,parent_shas,verified,additions,deletions,first_seen_at,last_seen_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now()) on conflict (tenant_id,repository_id,sha) do update set author_github_account_id=coalesce(excluded.author_github_account_id,commits.author_github_account_id),committer_github_account_id=coalesce(excluded.committer_github_account_id,commits.committer_github_account_id),message=case when excluded.message <> '' then excluded.message else commits.message end,authored_at=coalesce(excluded.authored_at,commits.authored_at),committed_at=coalesce(excluded.committed_at,commits.committed_at),parent_shas=case when jsonb_array_length(excluded.parent_shas) > 0 then excluded.parent_shas else commits.parent_shas end,verified=coalesce(excluded.verified,commits.verified),additions=coalesce(excluded.additions,commits.additions),deletions=coalesce(excluded.deletions,commits.deletions),last_seen_at=now()`, [createId(), tenantId, repositoryId, commit.sha, authorId ?? null, committerId ?? null, commit.message, commit.authoredAt ?? null, commit.committedAt ?? null, JSON.stringify(commit.parents), commit.verified ?? null, commit.additions ?? null, commit.deletions ?? null]);
+      if (event) await this.writeDevelopmentEvent(client, tenantId, repositoryId, event, eventActorId, htmlUrl, commit.message);
+    });
+  }
+
+  private async writeDevelopmentEvent(client: PoolClient, tenantId: string, repositoryId: string, event: DevelopmentEvent, actorId?: string, htmlUrl?: string, message?: string): Promise<void> {
+    await client.query(`insert into development_events (id,tenant_id,repository_id,source_system,source_kind,source_external_id,event_type,verb,actor_github_account_id,actor_kind,contribution_role,context_kind,occurred_at,source_updated_at,title,summary_input,source_url,completeness_state,visibility) values ($1,$2,$3,'github',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) on conflict (tenant_id,repository_id,source_system,source_kind,source_external_id,verb) do update set actor_github_account_id=coalesce(excluded.actor_github_account_id,development_events.actor_github_account_id),actor_kind=case when excluded.actor_github_account_id is not null then excluded.actor_kind else development_events.actor_kind end,contribution_role=excluded.contribution_role,context_kind=case when excluded.actor_github_account_id is not null then excluded.context_kind else development_events.context_kind end,occurred_at=excluded.occurred_at,source_updated_at=coalesce(excluded.source_updated_at,development_events.source_updated_at),summary_input=coalesce(excluded.summary_input,development_events.summary_input),source_url=coalesce(excluded.source_url,development_events.source_url),completeness_state=excluded.completeness_state,visibility=excluded.visibility`, [event.id, tenantId, repositoryId, event.sourceKind, event.sourceExternalId, event.eventType, event.verb, actorId ?? null, event.actorKind, event.contributionRole, event.contextKind, event.occurredAt, event.sourceUpdatedAt ?? null, event.title ?? null, event.summaryInput ?? message ?? null, htmlUrl ?? null, event.completenessState, event.visibility]);
+  }
+
+  async saveDevelopmentEvent(tenantId: string, repositoryId: string, event: DevelopmentEvent, options?: { htmlUrl?: string; message?: string }): Promise<void> {
+    await this.tenantQuery(tenantId, async (client) => {
+      const actorId = event.actorGithubAccountId === undefined ? undefined : await this.ensureGithubAccount(client, event.actorGithubAccountId, undefined, event.actorKind === "bot" ? "Bot" : "User", event.actorKind);
+      await this.writeDevelopmentEvent(client, tenantId, repositoryId, event, actorId, options?.htmlUrl, options?.message);
+    });
+  }
+
+  async getRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<RefSyncContinuation | undefined> {
+    const name = branchName(ref);
+    return this.tenantQuery(tenantId, async (client) => {
+      const result = await client.query<Row>("select cursor from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='commit_ref' and ref_name=$3", [tenantId, repositoryId, name]);
+      const cursor = result.rows[0]?.cursor;
+      if (!cursor || typeof cursor !== "object") return undefined;
+      const value = cursor as Record<string, unknown>;
+      if (typeof value.after !== "string" || typeof value.nextPage !== "number" || typeof value.forced !== "boolean") return undefined;
+      return { after: value.after, previousHead: typeof value.previousHead === "string" ? value.previousHead : null, nextPage: value.nextPage, forced: value.forced, reachableShas: Array.isArray(value.reachableShas) ? value.reachableShas.filter((sha): sha is string => typeof sha === "string") : [] };
+    });
+  }
+
+  async setRefSyncContinuation(tenantId: string, repositoryId: string, ref: string, continuation: RefSyncContinuation): Promise<void> {
+    const name = branchName(ref);
+    await this.tenantQuery(tenantId, async (client) => {
+      await client.query(`insert into sync_cursors (id,tenant_id,repository_id,resource_type,ref_name,cursor,schema_version) values ($1,$2,$3,'commit_ref',$4,$5,1) on conflict (tenant_id,repository_id,resource_type,ref_name) do update set cursor=excluded.cursor,schema_version=excluded.schema_version`, [createId(), tenantId, repositoryId, name, continuation]);
+    });
+  }
+
+  async clearRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<void> {
+    await this.tenantQuery(tenantId, async (client) => { await client.query("delete from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='commit_ref' and ref_name=$3", [tenantId, repositoryId, branchName(ref)]); });
+  }
+
+  async markBranchCommitsUnreachable(tenantId: string, repositoryId: string, ref: string): Promise<void> {
+    await this.tenantQuery(tenantId, async (client) => {
+      await client.query("update commit_refs cr set reachable=false from branches b where b.id=cr.branch_id and cr.tenant_id=$1 and b.tenant_id=$1 and b.repository_id=$2 and b.name=$3", [tenantId, repositoryId, branchName(ref)]);
+    });
+  }
+
+  async setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void> {
+    const name = branchName(ref);
+    await this.tenantQuery(tenantId, async (client) => {
+      await client.query("insert into branches (id,tenant_id,repository_id,name,last_seen_at,reachable) values ($1,$2,$3,$4,now(),true) on conflict (tenant_id,repository_id,name) do update set last_seen_at=now()", [createId(), tenantId, repositoryId, name]);
+      const branch = await client.query<Row>("select id from branches where tenant_id=$1 and repository_id=$2 and name=$3", [tenantId, repositoryId, name]);
+      const commit = await client.query<Row>("select id from commits where tenant_id=$1 and repository_id=$2 and sha=$3", [tenantId, repositoryId, sha]);
+      const branchId = branch.rows[0]?.id;
+      const commitId = commit.rows[0]?.id;
+      if (branchId && commitId) await client.query("insert into commit_refs (tenant_id,commit_id,branch_id,last_seen_at,reachable) values ($1,$2,$3,now(),$4) on conflict (tenant_id,commit_id,branch_id) do update set last_seen_at=now(),reachable=excluded.reachable", [tenantId, commitId, branchId, reachable]);
     });
   }
 
   async listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]> {
     return this.tenantQuery(tenantId, async (client) => {
-      const result = await client.query<Row>(`select e.id,e.repository_id,e.source_kind,e.source_external_id,e.event_type,e.verb,e.actor_github_account_id,e.actor_kind,e.contribution_role,e.context_kind,e.occurred_at,e.source_updated_at,e.title,e.summary_input,e.completeness_state,e.visibility,c.message from development_events e left join commits c on c.tenant_id=e.tenant_id and c.repository_id=e.repository_id and c.sha=e.source_external_id where e.tenant_id=$1 ${repositoryId ? "and e.repository_id=$2" : ""} order by e.occurred_at desc limit 100`, repositoryId ? [tenantId, repositoryId] : [tenantId]);
-      return result.rows.map((row) => ({ id: String(row.id), repositoryId: String(row.repository_id), sourceKind: row.source_kind as DevelopmentEvent["sourceKind"], sourceExternalId: String(row.source_external_id), eventType: String(row.event_type), verb: String(row.verb), ...(row.actor_github_account_id ? { actorGithubAccountId: Number(row.actor_github_account_id) } : {}), actorKind: row.actor_kind as DevelopmentEvent["actorKind"], contributionRole: row.contribution_role as DevelopmentEvent["contributionRole"], contextKind: row.context_kind as DevelopmentEvent["contextKind"], occurredAt: new Date(String(row.occurred_at)), ...(date(row.source_updated_at) ? { sourceUpdatedAt: date(row.source_updated_at) } : {}), ...(row.title ? { title: String(row.title) } : {}), ...(row.summary_input ? { summaryInput: String(row.summary_input) } : {}), completenessState: row.completeness_state as DevelopmentEvent["completenessState"], visibility: row.visibility as DevelopmentEvent["visibility"], ...(row.message ? { message: String(row.message) } : {}) }));
+      const result = await client.query<Row>(`select e.id,e.repository_id,e.source_kind,e.source_external_id,e.event_type,e.verb,ga.github_account_id as actor_github_id,e.actor_kind,e.contribution_role,e.context_kind,e.occurred_at,e.source_updated_at,e.title,e.summary_input,e.source_url,e.completeness_state,e.visibility,c.message from development_events e join repositories r on r.id=e.repository_id and r.tenant_id=e.tenant_id left join commits c on c.tenant_id=e.tenant_id and c.repository_id=e.repository_id and c.sha=e.source_external_id left join github_accounts ga on ga.id=e.actor_github_account_id where e.tenant_id=$1 ${repositoryId ? "and e.repository_id=$2" : ""} and (e.source_kind <> 'commit' or exists (select 1 from commit_refs cr join branches b on b.id=cr.branch_id where cr.tenant_id=e.tenant_id and cr.commit_id=c.id and b.repository_id=e.repository_id and b.name=r.default_branch and cr.reachable=true)) order by e.occurred_at desc limit 100`, repositoryId ? [tenantId, repositoryId] : [tenantId]);
+      return result.rows.map((row) => ({ id: String(row.id), repositoryId: String(row.repository_id), sourceKind: row.source_kind as DevelopmentEvent["sourceKind"], sourceExternalId: String(row.source_external_id), eventType: String(row.event_type), verb: String(row.verb), ...(row.actor_github_id ? { actorGithubAccountId: Number(row.actor_github_id) } : {}), actorKind: row.actor_kind as DevelopmentEvent["actorKind"], contributionRole: row.contribution_role as DevelopmentEvent["contributionRole"], contextKind: row.context_kind as DevelopmentEvent["contextKind"], occurredAt: new Date(String(row.occurred_at)), ...(date(row.source_updated_at) ? { sourceUpdatedAt: date(row.source_updated_at) } : {}), ...(row.title ? { title: String(row.title) } : {}), ...(row.summary_input ? { summaryInput: String(row.summary_input) } : {}), completenessState: row.completeness_state as DevelopmentEvent["completenessState"], visibility: row.visibility as DevelopmentEvent["visibility"], ...(row.message ? { message: String(row.message) } : {}), ...(row.source_url ? { htmlUrl: String(row.source_url) } : {}) }));
     });
   }
 

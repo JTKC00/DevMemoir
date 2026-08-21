@@ -20,7 +20,7 @@ pnpm db:migrate
 pnpm dev
 ```
 
-The compose database is `postgres://devmemoir:devmemoir@localhost:5432/devmemoir`. For another server, set `DATABASE_URL` and `DATABASE_DIRECT_URL` in `.env` without changing application code. `DATABASE_DIRECT_URL` is used for migrations and pg-boss.
+The compose database is `postgres://devmemoir:devmemoir@localhost:5432/devmemoir`. Local development may use `DATABASE_URL`/`DATABASE_DIRECT_URL` as the fallback. Production must provide explicit `DATABASE_API_URL`, `DATABASE_WORKER_URL`, `DATABASE_QUEUE_URL`, and `DATABASE_MIGRATIONS_URL` credentials for the roles created by the migration; the API, worker, pg-boss, and migration process do not silently share an owner URL.
 
 Generate local key material without printing it into source control:
 
@@ -48,7 +48,7 @@ Create a GitHub App for the owner account; do not commit its private key or any 
 * Set the setup URL to `${API_ORIGIN}/github/setup` and enable setup URL redirection.
 * Set the webhook URL to `${API_ORIGIN}/webhooks/github` and choose a random webhook secret.
 * Request only these permissions: Metadata **read**, Contents **read**, Pull requests **read**, Issues **read**. No write permissions are needed.
-* Subscribe to `push`, `ping`, `github_app_authorization`, `installation`, and `installation_repositories`. Other signed events are tolerated and unsupported actions become `ignored`.
+* Subscribe to `push`, `ping`, `github_app_authorization`, `installation`, and `installation_repositories`. In M1, non-push receipts are durably acknowledged as `ignored`; unsupported actions are never projected.
 * Put the numeric owner account ID in `OWNER_GITHUB_USER_ID`. Installation binding re-fetches the installation and requires account type `User` plus an exact numeric ID match.
 * Fill `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, optional `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY`, and current/previous webhook secrets in `.env`.
 
@@ -75,7 +75,7 @@ CI starts PostgreSQL, applies the migration, and runs this suite. Without a supp
 
 ## Runtime topology
 
-`apps/api` uses the pooled PostgreSQL URL and `apps/worker` uses the direct URL for pg-boss and tenant-local progress. `packages/jobs` exposes pg-boss through `JobPort`; logical delivery keys make duplicate GUID redelivery idempotent while business cursors remain in PostgreSQL. Webhook HMAC verification happens on exact raw bytes before JSON parsing, and current plus previous secrets are accepted during rotation overlap.
+`apps/api` uses `DATABASE_API_URL`, `apps/worker` uses `DATABASE_WORKER_URL`, pg-boss uses `DATABASE_QUEUE_URL`, and migrations use `DATABASE_MIGRATIONS_URL`. `packages/jobs` creates the three pg-boss queues with a stately logical-key policy; business cursors remain in PostgreSQL. Webhook HMAC verification happens on exact raw bytes before JSON parsing, and current plus previous secrets are accepted during rotation overlap.
 
 ## Known M1 limits / deferred scope
 

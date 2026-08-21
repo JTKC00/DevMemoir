@@ -2,19 +2,23 @@ import PgBoss from "pg-boss";
 import type { DeliveryState } from "@devmemoir/domain";
 
 export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill"];
 
 export type SyncJobPayload = {
   deliveryId?: string;
   deliveryGuid?: string;
   tenantId?: string;
-  repositoryId: string;
-  installationId: number;
-  owner: string;
-  repo: string;
-  ref: string;
-  before: string;
-  after: string;
-  forced: boolean;
+  repositoryId?: string;
+  repositoryGithubId?: number;
+  installationId?: number;
+  installationGithubId?: number;
+  owner?: string;
+  repo?: string;
+  ref?: string;
+  before?: string;
+  after?: string;
+  forced?: boolean;
+  nextPage?: number;
 };
 
 export type QueueJob<T = unknown> = {
@@ -29,6 +33,7 @@ export interface JobPort {
   stop(): Promise<void>;
   enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string>;
   work<T extends object>(kind: JobKind, handler: (job: QueueJob<T>) => Promise<void>): Promise<void>;
+  has(jobId: string, kind: JobKind): Promise<boolean>;
   retry(jobId: string): Promise<void>;
   cancel(jobId: string): Promise<void>;
 }
@@ -40,6 +45,7 @@ export class InMemoryJobPort implements JobPort {
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   async work<T extends object>(_kind: JobKind, _handler: (job: QueueJob<T>) => Promise<void>): Promise<void> {}
+  async has(jobId: string, kind: JobKind): Promise<boolean> { return this.jobs.get(jobId)?.kind === kind; }
 
   async enqueue<T>(kind: JobKind, logicalKey: string, payload: T): Promise<string> {
     const existing = [...this.jobs.values()].find((job) => job.logicalKey === logicalKey);
@@ -61,6 +67,7 @@ export class InMemoryJobPort implements JobPort {
 export class PgBossJobPort implements JobPort {
   private readonly boss: PgBoss;
   private readonly kindsByJobId = new Map<string, JobKind>();
+  private readonly jobIdsByLogicalKey = new Map<string, string>();
 
   constructor(connectionString: string) {
     this.boss = new PgBoss({ connectionString, max: 5 });
@@ -68,40 +75,73 @@ export class PgBossJobPort implements JobPort {
 
   async start(): Promise<void> {
     await this.boss.start();
+    for (const kind of JOB_KINDS) await this.boss.createQueue(kind, { name: kind, policy: "stately", retryLimit: 4, retryDelay: 5, retryBackoff: true, retentionDays: 7 });
   }
 
   async stop(): Promise<void> {
-    await this.boss.stop();
+    await this.boss.stop({ graceful: true, timeout: 30_000 });
   }
 
   async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string> {
+    const logicalMapKey = `${kind}:${logicalKey}`;
+    const knownId = this.jobIdsByLogicalKey.get(logicalMapKey);
+    if (knownId && await this.has(knownId, kind)) return knownId;
+    if (knownId) this.jobIdsByLogicalKey.delete(logicalMapKey);
     const id = await this.boss.send(kind, payload as object, {
       singletonKey: logicalKey,
-      retryLimit: 8,
+      retryLimit: 4,
+      retryDelay: 5,
+      retryBackoff: true,
       ...(options?.startAfter ? { startAfter: options.startAfter } : {}),
     });
-    if (!id) throw new Error(`Could not enqueue ${kind}`);
+    if (!id) {
+      const existingId = this.jobIdsByLogicalKey.get(logicalMapKey);
+      // A stately queue returns null when another process already owns the
+      // same logical key. The durable sync_jobs row and the key itself are
+      // enough for redelivery reconciliation; do not turn that idempotent
+      // race into a webhook 500.
+      return existingId ?? logicalKey;
+    }
     this.kindsByJobId.set(id, kind);
+    this.jobIdsByLogicalKey.set(logicalMapKey, id);
     return id;
   }
 
   async work<T extends object>(kind: JobKind, handler: (job: QueueJob<T>) => Promise<void>): Promise<void> {
-    await this.boss.work<T>(kind, async (jobs) => {
-      for (const job of jobs) await handler({ id: job.id, kind, logicalKey: "", payload: job.data });
+    await this.boss.work<T>(kind, { includeMetadata: true }, async (jobs) => {
+      for (const job of jobs) await handler({ id: job.id, kind, logicalKey: job.singletonKey ?? "", payload: job.data });
     });
   }
 
+  async has(jobId: string, kind: JobKind): Promise<boolean> {
+    const job = await this.boss.getJobById(kind, jobId, { includeArchive: false });
+    return Boolean(job && (job.state === "created" || job.state === "retry" || job.state === "active"));
+  }
+
   async retry(jobId: string): Promise<void> {
-    const kind = this.kindsByJobId.get(jobId);
+    const kind = await this.resolveKind(jobId);
     if (!kind) throw new Error(`Unknown pg-boss job ${jobId}`);
-    await this.boss.resume(kind, jobId);
+    await this.boss.retry(kind, jobId);
   }
 
   async cancel(jobId: string): Promise<void> {
-    const kind = this.kindsByJobId.get(jobId);
+    const kind = await this.resolveKind(jobId);
     if (!kind) throw new Error(`Unknown pg-boss job ${jobId}`);
     await this.boss.deleteJob(kind, jobId);
     this.kindsByJobId.delete(jobId);
+  }
+
+  private async resolveKind(jobId: string): Promise<JobKind | undefined> {
+    const remembered = this.kindsByJobId.get(jobId);
+    if (remembered) return remembered;
+    for (const kind of JOB_KINDS) {
+      const job = await this.boss.getJobById(kind, jobId, { includeArchive: true });
+      if (job) {
+        this.kindsByJobId.set(jobId, kind);
+        return kind;
+      }
+    }
+    return undefined;
   }
 }
 
@@ -109,8 +149,8 @@ export function deliveryLogicalKey(deliveryId: string): string {
   return `delivery:${deliveryId}`;
 }
 
-export function commitSyncLogicalKey(repositoryId: string, ref: string, after: string): string {
-  return `sync:${repositoryId}:${ref}:${after}`;
+export function commitSyncLogicalKey(repositoryId: string, ref: string, after: string, nextPage?: number): string {
+  return `sync:${repositoryId}:${ref}:${after}${nextPage ? `:page:${nextPage}` : ""}`;
 }
 
 export function isRetryableDeliveryState(state: DeliveryState): boolean {

@@ -7,9 +7,9 @@ import { buildApi } from "./app.js";
 
 const config = loadConfig();
 const github = new OctokitGithubClient({ appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_APP_PRIVATE_KEY, apiVersion: config.GITHUB_API_VERSION, webhookSecret: config.GITHUB_WEBHOOK_SECRET });
-const pool = createPool(config.DATABASE_URL, config.DATABASE_POOL_MAX);
+const pool = createPool(config.DATABASE_API_URL, config.DATABASE_POOL_MAX);
 const store = new PostgresM1Store(pool);
-const jobs = new PgBossJobPort(config.DATABASE_DIRECT_URL);
+const jobs = new PgBossJobPort(config.DATABASE_QUEUE_URL);
 await jobs.start();
 const app = await buildApi({ config, store, github, installationGithub: (installationId) => createInstallationGithubClient(github, installationId), jobs, logger: createLogger() });
 await app.listen({ host: config.HOST, port: config.PORT });
