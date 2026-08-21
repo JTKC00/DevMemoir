@@ -310,10 +310,21 @@ export class PostgresM1Store implements M1Store {
     return deliveryFromRow(result.rows[0]);
   }
 
+  async claimDeliveryForProcessing(id: string, tenantId?: string): Promise<DeliveryRecord | undefined> {
+    const run = async (client: PoolClient) => deliveryFromRow((await client.query<Row>("update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1 where id=$1 and state not in ('processed','ignored') returning *", [id])).rows[0]);
+    if (tenantId) return this.tenantQuery(tenantId, run);
+    const result = await this.pool.query<Row>("update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1 where id=$1 and state not in ('processed','ignored') returning *", [id]);
+    return deliveryFromRow(result.rows[0]);
+  }
+
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {
     const run = async (client: PoolClient) => {
-      const result = await client.query<Row>("insert into sync_jobs (id,tenant_id,kind,logical_key,payload,scheduled_at) values ($1,$2,$3,$4,$5,now()) on conflict (logical_key) do update set payload=excluded.payload returning id", [createId(), String(payload.tenantId), String(payload.kind ?? "webhook_delivery"), logicalKey, payload]);
-      return String(result.rows[0]?.id);
+      const inserted = await client.query<Row>("insert into sync_jobs (id,tenant_id,kind,logical_key,payload,scheduled_at) values ($1,$2,$3,$4,$5,now()) on conflict (logical_key) do nothing returning id", [createId(), String(payload.tenantId), String(payload.kind ?? "webhook_delivery"), logicalKey, payload]);
+      if (inserted.rows[0]?.id) return String(inserted.rows[0].id);
+      const existing = await client.query<Row>("select id from sync_jobs where logical_key=$1", [logicalKey]);
+      const existingId = existing.rows[0]?.id;
+      if (!existingId) throw new Error("Durable job disappeared after logical-key conflict");
+      return String(existingId);
     };
     if (!payload.tenantId) throw new Error("Tenant is required for durable jobs");
     return this.tenantQuery(String(payload.tenantId), run);

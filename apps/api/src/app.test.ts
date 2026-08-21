@@ -4,7 +4,7 @@ import type { AppConfig } from "@devmemoir/config";
 import { InMemoryM1Store } from "@devmemoir/db";
 import { createId, createOpaqueToken, encryptSecret, hashOpaqueToken } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
-import { InMemoryJobPort } from "@devmemoir/jobs";
+import { InMemoryJobPort, type JobKind, type JobPort } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
 import { buildApi } from "./app.js";
 
@@ -28,6 +28,18 @@ const github: GithubClient = {
   getCommit: async () => ({ repositoryId: "", sha: "a".repeat(40), message: "", parents: [] }),
   getRefHead: async () => "a".repeat(40),
 };
+
+class NullEnqueueJobPort implements JobPort {
+  private readonly delegate = new InMemoryJobPort();
+
+  async start(): Promise<void> { return this.delegate.start(); }
+  async stop(): Promise<void> { return this.delegate.stop(); }
+  async enqueue<T>(_kind: JobKind, _logicalKey: string, _payload: T): Promise<string | undefined> { return undefined; }
+  async work<T extends object>(kind: JobKind, handler: (job: { id: string; kind: JobKind; logicalKey: string; payload: T }) => Promise<void>): Promise<void> { return this.delegate.work(kind, handler); }
+  async has(jobId: string, kind: JobKind): Promise<boolean> { return this.delegate.has(jobId, kind); }
+  async retry(jobId: string): Promise<void> { return this.delegate.retry(jobId); }
+  async cancel(jobId: string): Promise<void> { return this.delegate.cancel(jobId); }
+}
 
 describe("M1 webhook receipt", () => {
   const store = new InMemoryM1Store();
@@ -69,9 +81,25 @@ describe("M1 webhook receipt", () => {
     const record = store.deliveries.get("guid-failed");
     expect(record).toBeDefined();
     await store.updateDelivery(record?.id ?? "", { state: "failed" });
-    await send("guid-failed", "push", { ref: "refs/heads/main", before: "a", after: "b", installation: { id: 22 }, repository: { id: 10 } });
+    const redelivery = await send("guid-failed", "push", { ref: "refs/heads/main", before: "a", after: "b", installation: { id: 22 }, repository: { id: 10 } });
     expect(jobs.jobs.size).toBe(1);
     expect(store.deliveries.get("guid-failed")?.state).toBe("received");
+    expect(redelivery.json<{ state: string }>().state).toBe("received");
+  });
+
+  it("does not persist a logical key as job_id when another process owns the singleton", async () => {
+    const competingJobs = new NullEnqueueJobPort();
+    const competingApp = await buildApi({ config, store, github, jobs: competingJobs, logger: createLogger(capture.sink) });
+    const body = { ref: "refs/heads/main", before: "a", after: "b", installation: { id: 22 }, repository: { id: 10 } };
+    const raw = Buffer.from(JSON.stringify(body), "utf8");
+    try {
+      const response = await competingApp.inject({ method: "POST", url: "/webhooks/github", headers: { "content-type": "application/json", "x-github-event": "push", "x-github-delivery": "guid-cross-process", "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}` }, payload: raw });
+      expect(response.statusCode).toBe(202);
+      expect(store.deliveries.get("guid-cross-process")?.jobId).toBeNull();
+      expect(store.jobs.size).toBe(1);
+    } finally {
+      await competingApp.close();
+    }
   });
 
   it("keeps the first receipt as canonical when a redelivery body disagrees", async () => {

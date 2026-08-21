@@ -31,7 +31,13 @@ export type QueueJob<T = unknown> = {
 export interface JobPort {
   start(): Promise<void>;
   stop(): Promise<void>;
-  enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string>;
+  /**
+   * Returns a real pg-boss job UUID when this process accepted the enqueue.
+   * `undefined` means another process already owns the durable singleton key;
+   * callers must use their business logical-key record for recovery and must
+   * never persist the logical key as a job ID.
+   */
+  enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string | undefined>;
   work<T extends object>(kind: JobKind, handler: (job: QueueJob<T>) => Promise<void>): Promise<void>;
   has(jobId: string, kind: JobKind): Promise<boolean>;
   retry(jobId: string): Promise<void>;
@@ -82,7 +88,7 @@ export class PgBossJobPort implements JobPort {
     await this.boss.stop({ graceful: true, timeout: 30_000 });
   }
 
-  async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string> {
+  async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string | undefined> {
     const logicalMapKey = `${kind}:${logicalKey}`;
     const knownId = this.jobIdsByLogicalKey.get(logicalMapKey);
     if (knownId && await this.has(knownId, kind)) return knownId;
@@ -95,12 +101,11 @@ export class PgBossJobPort implements JobPort {
       ...(options?.startAfter ? { startAfter: options.startAfter } : {}),
     });
     if (!id) {
-      const existingId = this.jobIdsByLogicalKey.get(logicalMapKey);
       // A stately queue returns null when another process already owns the
       // same logical key. The durable sync_jobs row and the key itself are
-      // enough for redelivery reconciliation; do not turn that idempotent
-      // race into a webhook 500.
-      return existingId ?? logicalKey;
+      // enough for redelivery reconciliation. Never turn the logical key
+      // into a value that looks like a pg-boss job UUID.
+      return undefined;
     }
     this.kindsByJobId.set(id, kind);
     this.jobIdsByLogicalKey.set(logicalMapKey, id);

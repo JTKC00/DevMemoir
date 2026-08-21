@@ -172,7 +172,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS repository_access_one_selected_per_tenant_idx 
 CREATE INDEX IF NOT EXISTS webhook_deliveries_state_idx ON webhook_deliveries (state, last_received_at);
 CREATE INDEX IF NOT EXISTS sync_jobs_tenant_state_idx ON sync_jobs (tenant_id, state);
 
--- Application roles are intentionally separate. Deployments may create these roles with a secret manager.
+-- Application roles are capability roles only. They intentionally remain
+-- NOLOGIN; deployments provision separate LOGIN principals and grant one of
+-- these capabilities to each principal.
 DO $$ BEGIN
   CREATE ROLE devmemoir_web NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -186,8 +188,22 @@ DO $$ BEGIN
   CREATE ROLE devmemoir_migrations NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN
-  CREATE ROLE devmemoir_queue NOLOGIN;
+CREATE ROLE devmemoir_queue NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$
+DECLARE
+  capability text;
+  can_login boolean;
+  is_super boolean;
+  bypass_rls boolean;
+BEGIN
+  FOREACH capability IN ARRAY ARRAY['devmemoir_web','devmemoir_api','devmemoir_worker','devmemoir_migrations','devmemoir_queue'] LOOP
+    SELECT rolcanlogin, rolsuper, rolbypassrls INTO can_login, is_super, bypass_rls FROM pg_roles WHERE rolname = capability;
+    IF NOT FOUND OR can_login OR is_super OR bypass_rls THEN
+      RAISE EXCEPTION 'Capability role % must remain NOLOGIN, non-superuser, and without BYPASSRLS', capability;
+    END IF;
+  END LOOP;
+END $$;
 CREATE SCHEMA IF NOT EXISTS pgboss AUTHORIZATION devmemoir_queue;
 GRANT USAGE, CREATE ON SCHEMA pgboss TO devmemoir_queue;
 ALTER TABLE github_installations ENABLE ROW LEVEL SECURITY;

@@ -16,9 +16,10 @@ export type WorkerDependencies = {
 
 export async function processDelivery(input: { deliveryId: string; payload: SyncJobPayload; rawPayload?: string }, deps: WorkerDependencies): Promise<void> {
   const now = deps.now ?? (() => new Date());
-  const delivery = await deps.store.getDelivery(input.deliveryId, input.payload.tenantId);
-  if (!delivery) throw new Error("Delivery not found");
-  await deps.store.updateDelivery(delivery.id, { state: "processing", processingAttempts: delivery.processingAttempts + 1 }, delivery.tenantId);
+  const existing = await deps.store.getDelivery(input.deliveryId, input.payload.tenantId);
+  if (!existing) throw new Error("Delivery not found");
+  const delivery = await deps.store.claimDeliveryForProcessing(existing.id, existing.tenantId);
+  if (!delivery) return;
   try {
     const tenantId = input.payload.tenantId ?? delivery.tenantId;
     const repository = tenantId

@@ -20,7 +20,28 @@ pnpm db:migrate
 pnpm dev
 ```
 
-The compose database is `postgres://devmemoir:devmemoir@localhost:5432/devmemoir`. Local development may use `DATABASE_URL`/`DATABASE_DIRECT_URL` as the fallback. Production must provide explicit `DATABASE_API_URL`, `DATABASE_WORKER_URL`, `DATABASE_QUEUE_URL`, and `DATABASE_MIGRATIONS_URL` credentials for the roles created by the migration; the API, worker, pg-boss, and migration process do not silently share an owner URL.
+The compose database is `postgres://devmemoir:devmemoir@localhost:5432/devmemoir`. Local development may use `DATABASE_URL`/`DATABASE_DIRECT_URL` as the fallback. Production must provide explicit `DATABASE_API_URL`, `DATABASE_WORKER_URL`, `DATABASE_QUEUE_URL`, and `DATABASE_MIGRATIONS_URL` URLs for LOGIN principals mapped to the capability roles created by the migration; the API, worker, pg-boss, and migration process do not silently share an owner URL.
+
+### Production database role provisioning
+
+The migration creates `devmemoir_api`, `devmemoir_worker`, `devmemoir_queue`, `devmemoir_migrations`, and `devmemoir_web` as `NOLOGIN` capability roles. Do not put those names directly in a connection URL. Create provider/environment-specific `LOGIN` principals, set their passwords through the provider secret manager, and grant each principal exactly one capability role:
+
+```sql
+-- Run as the database bootstrap/owner administrator. Set passwords out of band.
+CREATE ROLE devmemoir_api_login LOGIN;
+CREATE ROLE devmemoir_worker_login LOGIN;
+CREATE ROLE devmemoir_queue_login LOGIN;
+CREATE ROLE devmemoir_migrations_login LOGIN;
+
+GRANT devmemoir_api TO devmemoir_api_login;
+GRANT devmemoir_worker TO devmemoir_worker_login;
+GRANT devmemoir_queue TO devmemoir_queue_login;
+GRANT devmemoir_migrations TO devmemoir_migrations_login;
+```
+
+`DATABASE_API_URL` uses the API login, `DATABASE_WORKER_URL` uses the worker login, and `DATABASE_QUEUE_URL` uses the queue login over the direct PostgreSQL connection. `DATABASE_MIGRATIONS_URL` is a release-only migration/DDL principal: it must be the database owner or a provider-managed login with the required schema/table DDL ownership, and must never be reused by API, worker, queue, or Web. The first migration is bootstrapped with the provider database owner/admin; subsequent migrations use the dedicated migration principal. M1 Web calls the API and has no database URL; `devmemoir_web` is retained for direct read-only role/RLS tests.
+
+On Neon, create the LOGIN principals with the branch role management/API, retrieve each connection URI, and apply the PostgreSQL `GRANT` membership above; Neon documents that roles belong to branches and exposes branch role create/list/detail operations ([Neon role API](https://api-docs.neon.tech/reference/createprojectbranchrole)). On Railway or ordinary PostgreSQL, use the provider/admin SQL console or release bootstrap job. Never store a production password in this repository. A production migration process fails closed unless `DATABASE_MIGRATIONS_URL` is explicitly present; only local development/test may fall back to `DATABASE_DIRECT_URL`/`DATABASE_URL`.
 
 Generate local key material without printing it into source control:
 
@@ -63,7 +84,7 @@ pnpm test
 pnpm build
 ```
 
-The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects the M1 migration to have been applied and verifies that tenant A cannot read or write tenant B and that the web role cannot mutate GitHub-derived commits:
+The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects the M1 migration to have been applied and verifies capability-role membership through ephemeral LOGIN principals, that tenant A cannot read or write tenant B, that worker A cannot write tenant B, and that the web role cannot mutate GitHub-derived commits:
 
 ```bash
 $env:TEST_DATABASE_URL = $env:DATABASE_DIRECT_URL

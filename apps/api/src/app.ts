@@ -255,8 +255,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       return reply.code(202).send({ accepted: true, state });
     }
     const jobId = await deps.jobs.enqueue("webhook_delivery", logicalKey, jobPayload);
-    await deps.store.updateDelivery(delivery.record.id, { jobId, state: delivery.record.state === "failed" || delivery.record.state === "dead_letter" ? "received" : delivery.record.state }, delivery.record.tenantId);
-    return reply.code(202).send({ accepted: true, state: delivery.record.state });
+    const nextState = delivery.record.state === "failed" || delivery.record.state === "dead_letter" ? "received" : delivery.record.state;
+    await deps.store.updateDelivery(delivery.record.id, { jobId: jobId ?? null, state: nextState }, delivery.record.tenantId);
+    return reply.code(202).send({ accepted: true, state: nextState });
   });
 
   app.get<{ Querystring: { repositoryId?: string } }>("/api/activity", async (request, reply) => {
