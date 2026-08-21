@@ -1,0 +1,24 @@
+{
+  "name": "@devmemoir/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run --passWithNoTests",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@devmemoir/config": "workspace:*",
+    "@devmemoir/db": "workspace:*",
+    "@devmemoir/domain": "workspace:*",
+    "@devmemoir/github": "workspace:*",
+    "@devmemoir/jobs": "workspace:*",
+    "@devmemoir/observability": "workspace:*",
+    "pg-boss": "^10.1.5"
+  },
+  "devDependencies": { "vitest": "^3.0.5", "tsx": "^4.19.3" }
+}

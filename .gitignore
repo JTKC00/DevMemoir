@@ -1,24 +1,11 @@
-# Local environment and credentials
+node_modules/
+.pnpm-store/
+dist/
+.next/
+coverage/
 .env
 .env.*
 !.env.example
-
-# Node tooling (for the implementation phase)
-node_modules/
-.turbo/
-dist/
-coverage/
-.next/
-
-# Local database and runtime files
-*.sqlite
-*.sqlite3
-*.db
-tmp/
-logs/
-
-# OS/editor noise
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+*.log
+*.tsbuildinfo
+docker-data/

@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: devmemoir
+      POSTGRES_PASSWORD: devmemoir
+      POSTGRES_DB: devmemoir
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./docker-data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devmemoir -d devmemoir"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

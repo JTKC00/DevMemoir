@@ -1,0 +1,88 @@
+import { createHmac } from "node:crypto";
+import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import type { AppConfig } from "@devmemoir/config";
+import { InMemoryM1Store } from "@devmemoir/db";
+import type { GithubClient } from "@devmemoir/github";
+import { InMemoryJobPort } from "@devmemoir/jobs";
+import { createCanarySink, createLogger } from "@devmemoir/observability";
+import { buildApi } from "./app.js";
+
+const secret = "current-secret-123456";
+const config: AppConfig = {
+  NODE_ENV: "test", LOG_LEVEL: "error", API_ORIGIN: "http://localhost:4000", WEB_ORIGIN: "http://localhost:3000",
+  DATABASE_URL: "postgres://unused", DATABASE_DIRECT_URL: "postgres://unused", DATABASE_POOL_MAX: 2,
+  GITHUB_APP_ID: 1, GITHUB_APP_CLIENT_ID: "client", GITHUB_APP_CLIENT_SECRET: "secret", GITHUB_APP_PRIVATE_KEY: "private-key",
+  GITHUB_WEBHOOK_SECRET: secret, GITHUB_API_VERSION: "2022-11-28", OWNER_GITHUB_USER_ID: 7,
+  ENCRYPTION_KEY_BASE64: Buffer.alloc(32, 4).toString("base64"), SESSION_SECRET: "session-secret-that-is-at-least-32-bytes-long",
+  AUTH_TRANSACTION_TTL_SECONDS: 600, HANDOFF_TTL_SECONDS: 120, SESSION_TTL_SECONDS: 3600, CSRF_HEADER: "x-devmemoir-csrf", PORT: 4000, HOST: "127.0.0.1",
+};
+
+const github: GithubClient = {
+  getUser: async () => ({ id: 7, login: "owner", type: "User" }),
+  exchangeOAuthCode: async () => ({ accessToken: "token" }),
+  getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" } }),
+  listInstallationRepositories: async () => ({ repositories: [] }),
+  getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }),
+  listCommits: async () => ({ commits: [] }),
+  getCommit: async () => ({ repositoryId: "", sha: "a".repeat(40), message: "", parents: [] }),
+  getRefHead: async () => "a".repeat(40),
+};
+
+describe("M1 webhook receipt", () => {
+  const store = new InMemoryM1Store();
+  const jobs = new InMemoryJobPort();
+  const capture = createCanarySink();
+  let app: Awaited<ReturnType<typeof buildApi>>;
+
+  beforeEach(async () => {
+    store.deliveries.clear();
+    store.jobs.clear();
+    jobs.jobs.clear();
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    app = await buildApi({ config, store, github, jobs, logger: createLogger(capture.sink) });
+  });
+
+  afterEach(async () => { await app.close(); });
+
+  async function send(guid: string, eventName: string, body: Record<string, unknown>, signingSecret = secret) {
+    const raw = Buffer.from(JSON.stringify(body), "utf8");
+    return app.inject({ method: "POST", url: "/webhooks/github", headers: { "content-type": "application/json", "x-github-event": eventName, "x-github-delivery": guid, "x-hub-signature-256": `sha256=${createHmac("sha256", signingSecret).update(raw).digest("hex")}` }, payload: raw });
+  }
+
+  it("durably receives a minimal push signal and is idempotent by GUID", async () => {
+    const body = { ref: "refs/heads/main", before: "a".repeat(40), after: "b".repeat(40), forced: false, installation: { id: 22 }, repository: { id: 10 }, commits: [{ message: "PRIVATE_PUSH_COMMIT_CANARY" }] };
+    const first = await send("guid-1", "push", body);
+    expect(first.statusCode).toBe(202);
+    expect(store.deliveries.size).toBe(1);
+    expect(jobs.jobs.size).toBe(1);
+    expect(JSON.stringify([...jobs.jobs.values()])).not.toContain("PRIVATE_PUSH_COMMIT_CANARY");
+    const second = await send("guid-1", "push", body);
+    expect(second.statusCode).toBe(202);
+    expect(jobs.jobs.size).toBe(1);
+  });
+
+  it("reopens failed deliveries without inventing another job", async () => {
+    await send("guid-failed", "push", { ref: "refs/heads/main", before: "a", after: "b", installation: { id: 22 }, repository: { id: 10 } });
+    const record = store.deliveries.get("guid-failed");
+    expect(record).toBeDefined();
+    await store.updateDelivery(record?.id ?? "", { state: "failed" });
+    await send("guid-failed", "push", { ref: "refs/heads/main", before: "a", after: "b", installation: { id: 22 }, repository: { id: 10 } });
+    expect(jobs.jobs.size).toBe(1);
+    expect(store.deliveries.get("guid-failed")?.state).toBe("received");
+  });
+
+  it("handles signed ping and unsupported actions as acknowledged states", async () => {
+    expect((await send("guid-ping", "ping", { zen: "hello" })).statusCode).toBe(202);
+    expect((await send("guid-unknown", "issues", { action: "transferred" })).statusCode).toBe(202);
+    expect(store.deliveries.get("guid-unknown")?.state).toBe("ignored");
+  });
+
+  it("rejects invalid signatures and bodies over 2 MB before persistence", async () => {
+    const invalid = await send("guid-invalid", "push", { ref: "refs/heads/main", before: "a", after: "b" }, "wrong-secret-123456");
+    expect(invalid.statusCode).toBe(401);
+    expect(store.deliveries.size).toBe(0);
+    const tooLarge = await send("guid-large", "push", { ref: "refs/heads/main", before: "a", after: "b", filler: "x".repeat(2 * 1024 * 1024) });
+    expect(tooLarge.statusCode).toBe(413);
+    expect(store.deliveries.size).toBe(0);
+  });
+});

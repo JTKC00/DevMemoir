@@ -1,0 +1,28 @@
+{
+  "name": "@devmemoir/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run --passWithNoTests",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@devmemoir/config": "workspace:*",
+    "@devmemoir/db": "workspace:*",
+    "@devmemoir/domain": "workspace:*",
+    "@devmemoir/github": "workspace:*",
+    "@devmemoir/jobs": "workspace:*",
+    "@devmemoir/observability": "workspace:*",
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/cors": "^10.0.1",
+    "fastify": "^5.2.1",
+    "fastify-raw-body": "^5.0.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": { "vitest": "^3.0.5", "tsx": "^4.19.3" }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "devmemoir",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "dev": "pnpm --parallel --filter @devmemoir/web --filter @devmemoir/api --filter @devmemoir/worker dev",
+    "lint": "pnpm -r --if-present lint",
+    "test": "pnpm -r --if-present test",
+    "test:watch": "pnpm -r --if-present test:watch",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "db:generate": "pnpm --filter @devmemoir/db db:generate",
+    "db:migrate": "pnpm --filter @devmemoir/db db:migrate"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@typescript-eslint/parser": "8.24.0",
+    "eslint": "^9.20.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
