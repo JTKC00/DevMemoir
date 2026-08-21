@@ -41,7 +41,45 @@ GRANT devmemoir_migrations TO devmemoir_migrations_login;
 
 `DATABASE_API_URL` uses the API login, `DATABASE_WORKER_URL` uses the worker login, and `DATABASE_QUEUE_URL` uses the queue login over the direct PostgreSQL connection. `DATABASE_MIGRATIONS_URL` is a release-only migration/DDL principal: it must be the database owner or a provider-managed login with the required schema/table DDL ownership, and must never be reused by API, worker, queue, or Web. The first migration is bootstrapped with the provider database owner/admin; subsequent migrations use the dedicated migration principal. M1 Web calls the API and has no database URL; `devmemoir_web` is retained for direct read-only role/RLS tests.
 
-On Neon, create the LOGIN principals with the branch role management/API, retrieve each connection URI, and apply the PostgreSQL `GRANT` membership above; Neon documents that roles belong to branches and exposes branch role create/list/detail operations ([Neon role API](https://api-docs.neon.tech/reference/createprojectbranchrole)). On Railway or ordinary PostgreSQL, use the provider/admin SQL console or release bootstrap job. Never store a production password in this repository. A production migration process fails closed unless `DATABASE_MIGRATIONS_URL` is explicitly present; only local development/test may fall back to `DATABASE_DIRECT_URL`/`DATABASE_URL`.
+#### Neon-specific least-privilege provisioning
+
+For **runtime least-privilege roles on Neon**, do **not** create `devmemoir_api_login`, `devmemoir_worker_login`, or `devmemoir_queue_login` through the Neon Console, CLI, or API. Neon grants roles created by those control-plane paths membership in `neon_superuser`, and `neon_superuser` has `BYPASSRLS`. That would defeat DevMemoir's tenant-isolation model even if the role also inherits a restricted `devmemoir_*` capability role.
+
+Create runtime LOGIN principals with SQL instead, using `psql` or the Neon SQL Editor while connected as the bootstrap/owner administrator. SQL-created Neon roles do not automatically inherit `neon_superuser` membership. Supply passwords securely at provisioning time; never commit them to this repository.
+
+```sql
+-- Neon runtime principals: create with SQL, not Console/CLI/API role creation.
+CREATE ROLE devmemoir_api_login LOGIN PASSWORD '<set-securely>';
+CREATE ROLE devmemoir_worker_login LOGIN PASSWORD '<set-securely>';
+CREATE ROLE devmemoir_queue_login LOGIN PASSWORD '<set-securely>';
+
+GRANT devmemoir_api TO devmemoir_api_login;
+GRANT devmemoir_worker TO devmemoir_worker_login;
+GRANT devmemoir_queue TO devmemoir_queue_login;
+```
+
+After provisioning on Neon, verify that all runtime principals are ordinary LOGIN roles, do not have `BYPASSRLS`, and are not members of `neon_superuser`:
+
+```sql
+SELECT
+  rolname,
+  rolcanlogin,
+  rolsuper,
+  rolbypassrls,
+  pg_has_role(rolname, 'neon_superuser', 'MEMBER') AS neon_superuser_member
+FROM pg_roles
+WHERE rolname IN (
+  'devmemoir_api_login',
+  'devmemoir_worker_login',
+  'devmemoir_queue_login'
+);
+```
+
+The expected runtime result is `rolcanlogin = true`, `rolsuper = false`, `rolbypassrls = false`, and `neon_superuser_member = false` for every row. Treat any different result as a deployment blocker.
+
+The migration/bootstrap principal is intentionally separate: it may require elevated DDL ownership or provider-admin privileges, but those credentials are release-only and must never be reused by API, worker, queue, or Web. On Railway or ordinary PostgreSQL, create equivalent LOGIN principals through the provider/admin SQL console or release bootstrap job and grant only the matching capability role.
+
+Never store a production password in this repository. A production migration process fails closed unless `DATABASE_MIGRATIONS_URL` is explicitly present; only local development/test may fall back to `DATABASE_DIRECT_URL`/`DATABASE_URL`.
 
 Generate local key material without printing it into source control:
 
@@ -88,7 +126,7 @@ Run this checklist in a temporary HTTPS environment when owner-created GitHub Ap
 7. Set `OWNER_GITHUB_USER_ID` to the owner’s numeric GitHub account ID and verify it is not a login name.
 8. Load the App ID, client ID, private key, and current webhook secret into the environment; keep the private key out of source control.
 9. Verify the webhook secret used by GitHub matches the runtime secret and that any previous secret is only a rotation overlap value.
-10. Provision the database first, then set the explicit `DATABASE_API_URL`, `DATABASE_WORKER_URL`, `DATABASE_QUEUE_URL`, and release-only `DATABASE_MIGRATIONS_URL` login-principal URLs; Web uses the API and has no database URL.
+10. Provision the database first, then set the explicit `DATABASE_API_URL`, `DATABASE_WORKER_URL`, `DATABASE_QUEUE_URL`, and release-only `DATABASE_MIGRATIONS_URL` login-principal URLs. On Neon, create runtime API/worker/queue LOGIN principals through SQL and verify `rolbypassrls = false` plus no `neon_superuser` membership before starting the services. Web uses the API and has no database URL.
 11. Confirm the temporary HTTPS host routes both callback and webhook paths to the API and that the API, worker, queue, and migration processes are running with their separate roles.
 12. Open the Web login flow and complete GitHub authorization; verify the host-only session cookie and CSRF-protected browser handoff.
 13. Start GitHub App installation and verify the installation is rebound to the exact allowlisted owner account.
