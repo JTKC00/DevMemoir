@@ -32,17 +32,36 @@ export async function claimInstallation(formData: FormData): Promise<void> {
   redirect("/connect?connected=1");
 }
 
+export async function refreshInventory(): Promise<void> {
+  const response = await fetch(`${apiOrigin()}/connect/repositories/refresh`, { method: "POST", headers: await forwardedHeaders(), cache: "no-store" });
+  if (!response.ok) redirect("/connect?error=inventory_refresh_failed");
+  redirect("/connect?refreshed=1");
+}
+
 export async function connectRepository(formData: FormData): Promise<void> {
   const fullName = String(formData.get("fullName") ?? "");
+  const repositoryId = String(formData.get("repositoryId") ?? "");
   const [owner, repo] = fullName.split("/", 2);
-  if (!owner || !repo) redirect("/connect?error=repository_required");
+  if (!repositoryId && (!owner || !repo)) redirect("/connect?error=repository_required");
   const response = await fetch(`${apiOrigin()}/connect/repository`, {
     method: "POST",
     headers: { ...await forwardedHeaders(), "content-type": "application/json" },
-    body: JSON.stringify({ owner, repo }),
+    body: JSON.stringify(repositoryId ? { repositoryId } : { owner, repo }),
     cache: "no-store",
   });
   if (response.status === 409) redirect("/connect?error=one_repository_only");
   if (!response.ok) redirect("/connect?error=repository_connect_failed");
   redirect("/");
+}
+
+export async function unselectRepository(formData: FormData): Promise<void> {
+  const repositoryId = String(formData.get("repositoryId") ?? "");
+  const response = await fetch(`${apiOrigin()}/connect/repository/unselect`, {
+    method: "POST",
+    headers: { ...await forwardedHeaders(), "content-type": "application/json" },
+    body: JSON.stringify({ repositoryId }),
+    cache: "no-store",
+  });
+  if (!response.ok) redirect("/connect?error=repository_unselect_failed");
+  redirect("/connect?unselected=1");
 }

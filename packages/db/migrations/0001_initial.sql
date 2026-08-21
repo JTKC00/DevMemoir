@@ -172,6 +172,55 @@ CREATE UNIQUE INDEX IF NOT EXISTS repository_access_one_selected_per_tenant_idx 
 CREATE INDEX IF NOT EXISTS webhook_deliveries_state_idx ON webhook_deliveries (state, last_received_at);
 CREATE INDEX IF NOT EXISTS sync_jobs_tenant_state_idx ON sync_jobs (tenant_id, state);
 
+-- M2 installation inventory additions. These ALTERs are idempotent so the
+-- bootstrap migration also upgrades databases created by the M1 snapshot.
+ALTER TABLE github_installations ADD COLUMN IF NOT EXISTS last_inventory_at timestamptz;
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS disabled boolean NOT NULL DEFAULT false;
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS first_seen_at timestamptz;
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS last_authoritative_observed_at timestamptz;
+ALTER TABLE repository_access ALTER COLUMN selected_at DROP NOT NULL;
+ALTER TABLE repository_access ALTER COLUMN access_status SET DEFAULT 'accessible';
+ALTER TABLE repository_access ADD COLUMN IF NOT EXISTS selected boolean NOT NULL DEFAULT false;
+ALTER TABLE repository_access ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+ALTER TABLE repository_access ADD COLUMN IF NOT EXISTS last_authoritative_observed_at timestamptz;
+CREATE TABLE IF NOT EXISTS repository_name_history (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  repository_id uuid NOT NULL REFERENCES repositories(id),
+  owner_login varchar(255) NOT NULL,
+  name varchar(255) NOT NULL,
+  full_name varchar(511) NOT NULL,
+  valid_from timestamptz NOT NULL,
+  valid_to timestamptz
+);
+CREATE INDEX IF NOT EXISTS repository_name_history_lookup_idx ON repository_name_history (tenant_id, repository_id, valid_from);
+CREATE UNIQUE INDEX IF NOT EXISTS github_installations_tenant_id_unique ON github_installations (tenant_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS repositories_tenant_id_unique ON repositories (tenant_id, id);
+
+DO $$ BEGIN
+  ALTER TABLE repository_access ADD CONSTRAINT repository_access_tenant_repository_fk FOREIGN KEY (tenant_id, repository_id) REFERENCES repositories (tenant_id, id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE repository_access ADD CONSTRAINT repository_access_tenant_installation_fk FOREIGN KEY (tenant_id, installation_id) REFERENCES github_installations (tenant_id, id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE repository_name_history ADD CONSTRAINT repository_name_history_tenant_repository_fk FOREIGN KEY (tenant_id, repository_id) REFERENCES repositories (tenant_id, id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- M1 rows were explicitly selected. New authoritative inventory rows start
+-- unselected, preserving the distinction between App access and tracking.
+UPDATE repository_access SET selected=true, access_status='accessible' WHERE access_status='selected';
+UPDATE repository_access SET access_status='accessible' WHERE access_status='unselected' OR access_status IS NULL OR access_status='';
+DROP INDEX IF EXISTS repository_access_one_selected_per_tenant_idx;
+CREATE UNIQUE INDEX repository_access_one_selected_per_tenant_idx ON repository_access (tenant_id) WHERE selected = true;
+DO $$ BEGIN
+  ALTER TABLE github_installations ADD CONSTRAINT github_installations_status_check CHECK (status IN ('active','suspended','deleted','disconnected'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE repository_access ADD CONSTRAINT repository_access_status_check CHECK (access_status IN ('accessible','access_removed','installation_suspended','unavailable','disconnected'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 -- Application roles are capability roles only. They intentionally remain
 -- NOLOGIN; deployments provision separate LOGIN principals and grant one of
 -- these capabilities to each principal.
@@ -229,10 +278,12 @@ ALTER TABLE outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE outbox FORCE ROW LEVEL SECURITY;
 ALTER TABLE commit_refs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE commit_refs FORCE ROW LEVEL SECURITY;
+ALTER TABLE repository_name_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE repository_name_history FORCE ROW LEVEL SECURITY;
 
 -- The application sets app.tenant_id transaction-locally. Owners/migrations bypass through a separate role.
 DO $$ DECLARE table_name text; BEGIN
-  FOREACH table_name IN ARRAY ARRAY['github_installations','repositories','repository_access','branches','commits','development_events','commit_refs','webhook_deliveries','sync_jobs','sync_cursors','outbox'] LOOP
+  FOREACH table_name IN ARRAY ARRAY['github_installations','repositories','repository_access','repository_name_history','branches','commits','development_events','commit_refs','webhook_deliveries','sync_jobs','sync_cursors','outbox'] LOOP
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', table_name);
     EXECUTE format('CREATE POLICY tenant_isolation ON %I USING (tenant_id::text = current_setting(''app.tenant_id'', true)) WITH CHECK (tenant_id::text = current_setting(''app.tenant_id'', true))', table_name);
   END LOOP;
@@ -241,6 +292,7 @@ END $$;
 GRANT USAGE ON SCHEMA public TO devmemoir_web, devmemoir_api, devmemoir_worker;
 GRANT SELECT ON repositories, repository_access, branches, commits, development_events, commit_refs TO devmemoir_web;
 GRANT SELECT, INSERT, UPDATE ON repositories, repository_access, branches, commits, development_events, commit_refs, webhook_deliveries, sync_jobs, sync_cursors, outbox TO devmemoir_api, devmemoir_worker;
+GRANT SELECT, INSERT, UPDATE ON repository_name_history TO devmemoir_api, devmemoir_worker;
 GRANT SELECT, INSERT, UPDATE ON tenants, users, tenant_members, github_accounts, github_identities, auth_transactions, application_sessions, github_installations, installation_routes TO devmemoir_api;
 GRANT SELECT, INSERT, UPDATE ON github_accounts, github_installations, installation_routes TO devmemoir_worker;
 GRANT INSERT, SELECT ON unrouted_webhook_deliveries TO devmemoir_api;

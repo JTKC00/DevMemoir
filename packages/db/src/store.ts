@@ -1,9 +1,11 @@
 import {
   createId,
   deliveryRedeliveryAction,
+  repositoryAccessIsAvailable,
   type CommitFact,
   type DeliveryState,
   type DevelopmentEvent,
+  type RepositoryAccessStatus,
 } from "@devmemoir/domain";
 
 export type AuthTransactionRecord = {
@@ -41,6 +43,12 @@ export type InstallationRecord = {
   tenantId: string;
   githubInstallationId: number;
   accountGithubAccountId: number;
+  permissions?: Record<string, string>;
+  repositorySelection?: string;
+  status?: "active" | "suspended" | "deleted" | "disconnected";
+  suspendedAt?: Date;
+  deletedAt?: Date;
+  lastInventoryAt?: Date;
 };
 
 export type RepositoryRecord = {
@@ -52,11 +60,40 @@ export type RepositoryRecord = {
   name: string;
   fullName: string;
   private: boolean;
+  nodeId?: string;
   visibility?: string;
   defaultBranch: string;
   description?: string;
   htmlUrl?: string;
+  archived?: boolean;
+  disabled?: boolean;
+  selected?: boolean;
+  accessStatus?: RepositoryAccessStatus;
+  firstSeenAt?: Date;
+  lastSeenAt?: Date;
+  lastAuthoritativeObservedAt?: Date;
+  revokedAt?: Date;
+  githubCreatedAt?: Date;
+  githubUpdatedAt?: Date;
+  githubPushedAt?: Date;
 };
+
+export type InventoryReconcileResult = {
+  observed: number;
+  added: number;
+  updated: number;
+  removed: number;
+};
+
+export type InstallationLifecycleStatus = "active" | "suspended" | "deleted" | "disconnected";
+
+export class RepositorySelectionError extends Error {
+  constructor(message = "Only one repository can be selected in M1") {
+    super(message);
+    this.name = "RepositorySelectionError";
+    Object.defineProperty(this, "code", { value: "one_repository_only", enumerable: true });
+  }
+}
 
 export type DeliveryRecord = {
   id: string;
@@ -128,12 +165,19 @@ export interface M1Store {
   getUserById(userId: string): Promise<UserRecord | undefined>;
   getUserByGithubAccountId(githubAccountId: number): Promise<UserRecord | undefined>;
   saveInstallation(installation: InstallationRecord): Promise<void>;
+  updateInstallationSnapshot(input: { tenantId: string; githubInstallationId: number; permissions?: Record<string, string>; repositorySelection?: string }): Promise<void>;
   getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined>;
   listInstallations(tenantId: string): Promise<InstallationRecord[]>;
   saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord>;
   getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined>;
   getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
+  getRepositoryByFullName(tenantId: string, fullName: string): Promise<RepositoryRecord | undefined>;
   listRepositories(tenantId: string): Promise<RepositoryRecord[]>;
+  listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]>;
+  selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
+  unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
+  reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult>;
+  updateInstallationLifecycle(githubInstallationId: number, status: InstallationLifecycleStatus, now: Date): Promise<void>;
   insertDelivery(input: Omit<DeliveryRecord, "id" | "state" | "firstReceivedAt" | "lastReceivedAt" | "receiptCount" | "processingAttempts"> & { now: Date }): Promise<DeliveryInsertResult>;
   recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void>;
   updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void>;
@@ -162,6 +206,7 @@ export class InMemoryM1Store implements M1Store {
   readonly sessions = new Map<string, SessionRecord>();
   readonly installations = new Map<number, InstallationRecord>();
   readonly repositories = new Map<string, RepositoryRecord>();
+  readonly repositoryNameHistory: Array<{ tenantId: string; repositoryId: string; ownerLogin: string; name: string; fullName: string; validFrom: Date; validTo?: Date }> = [];
   readonly deliveries = new Map<string, DeliveryRecord>();
   readonly jobs = new Map<string, { id: string; logicalKey: string; payload: Record<string, unknown> }>();
   readonly branchHeads = new Map<string, string | null>();
@@ -212,13 +257,119 @@ export class InMemoryM1Store implements M1Store {
   async upsertUser(user: UserRecord): Promise<void> { this.users.set(user.userId, { ...user }); }
   async getUserById(userId: string): Promise<UserRecord | undefined> { return this.users.get(userId); }
   async getUserByGithubAccountId(githubAccountId: number): Promise<UserRecord | undefined> { return [...this.users.values()].find((user) => user.githubAccountId === githubAccountId); }
-  async saveInstallation(installation: InstallationRecord): Promise<void> { this.installations.set(installation.githubInstallationId, { ...installation }); }
+  async saveInstallation(installation: InstallationRecord): Promise<void> {
+    const previous = this.installations.get(installation.githubInstallationId);
+    const saved: InstallationRecord = {
+      ...previous,
+      ...installation,
+      status: "active",
+    };
+    delete saved.suspendedAt;
+    delete saved.deletedAt;
+    this.installations.set(installation.githubInstallationId, saved);
+  }
+  async updateInstallationSnapshot(input: { tenantId: string; githubInstallationId: number; permissions?: Record<string, string>; repositorySelection?: string }): Promise<void> {
+    const installation = this.installations.get(input.githubInstallationId);
+    if (!installation || installation.tenantId !== input.tenantId) throw new Error("Installation not found for snapshot update");
+    this.installations.set(input.githubInstallationId, { ...installation, ...(input.permissions ? { permissions: input.permissions } : {}), ...(input.repositorySelection ? { repositorySelection: input.repositorySelection } : {}) });
+  }
   async getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined> { return this.installations.get(githubInstallationId); }
   async listInstallations(tenantId: string): Promise<InstallationRecord[]> { return [...this.installations.values()].filter((installation) => installation.tenantId === tenantId).map((installation) => ({ ...installation })); }
-  async saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord> { this.repositories.set(`${repository.tenantId}:${repository.githubRepositoryId}`, { ...repository }); return { ...repository }; }
-  async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> { return this.repositories.get(`${tenantId}:${githubRepositoryId}`); }
-  async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> { return [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.id === repositoryId); }
-  async listRepositories(tenantId: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId).map((repository) => ({ ...repository })); }
+  async saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord> {
+    const key = `${repository.tenantId}:${repository.githubRepositoryId}`;
+    const previous = this.repositories.get(key);
+    const saved = { ...previous, ...repository, selected: true, accessStatus: "accessible" as const, firstSeenAt: previous?.firstSeenAt ?? repository.firstSeenAt ?? new Date() };
+    this.repositories.set(key, saved);
+    return { ...saved };
+  }
+  async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> { const value = this.repositories.get(`${tenantId}:${githubRepositoryId}`); return value ? { ...value } : undefined; }
+  async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> { const value = [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.id === repositoryId); return value ? { ...value } : undefined; }
+  async getRepositoryByFullName(tenantId: string, fullName: string): Promise<RepositoryRecord | undefined> { const value = [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.fullName === fullName); return value ? { ...value } : undefined; }
+  async listRepositories(tenantId: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && repository.selected === true && (!repository.accessStatus || repositoryAccessIsAvailable(repository.accessStatus))).map((repository) => ({ ...repository })); }
+  async listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && (!installationId || repository.installationId === installationId)).map((repository) => ({ ...repository })).sort((a, b) => a.fullName.localeCompare(b.fullName)); }
+  async selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
+    const repository = await this.getRepositoryById(tenantId, repositoryId);
+    if (!repository) return undefined;
+    const installation = [...this.installations.values()].find((value) => value.tenantId === tenantId && value.id === repository.installationId);
+    if (!installation || (installation.status && installation.status !== "active")) return undefined;
+    if (repository.accessStatus && !repositoryAccessIsAvailable(repository.accessStatus)) return undefined;
+    const other = [...this.repositories.values()].find((value) => value.tenantId === tenantId && value.id !== repositoryId && value.selected === true);
+    if (other) throw new RepositorySelectionError();
+    const { revokedAt: _revokedAt, ...withoutRevokedAt } = repository;
+    const updated: RepositoryRecord = { ...withoutRevokedAt, selected: true, accessStatus: "accessible" };
+    this.repositories.set(`${tenantId}:${repository.githubRepositoryId}`, updated);
+    return { ...updated };
+  }
+  async unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
+    const repository = await this.getRepositoryById(tenantId, repositoryId);
+    if (!repository) return undefined;
+    if (repository.accessStatus && !repositoryAccessIsAvailable(repository.accessStatus)) {
+      const updated = { ...repository, selected: false };
+      this.repositories.set(`${tenantId}:${repository.githubRepositoryId}`, updated);
+      return { ...updated };
+    }
+    const updated = { ...repository, selected: false, accessStatus: "accessible" as const };
+    this.repositories.set(`${tenantId}:${repository.githubRepositoryId}`, updated);
+    return { ...updated };
+  }
+  async reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult> {
+    const installation = this.installations.get(input.githubInstallationId);
+    if (!installation || installation.tenantId !== input.tenantId) throw new Error("Installation not found for inventory reconciliation");
+    if (installation.lastInventoryAt && installation.lastInventoryAt >= input.observedAt) return { observed: input.repositories.length, added: 0, updated: 0, removed: 0 };
+    const observed = new Map<number, RepositoryRecord>();
+    for (const candidate of input.repositories) observed.set(candidate.githubRepositoryId, candidate);
+    let added = 0;
+    let updated = 0;
+    for (const candidate of observed.values()) {
+      const key = `${input.tenantId}:${candidate.githubRepositoryId}`;
+      const previous = this.repositories.get(key);
+      const wasSelected = previous?.selected === true;
+      if (previous && (previous.ownerLogin !== candidate.ownerLogin || previous.name !== candidate.name || previous.fullName !== candidate.fullName)) {
+        const previousHistory = this.repositoryNameHistory.filter((entry) => entry.tenantId === input.tenantId && entry.repositoryId === previous.id).sort((left, right) => (right.validTo?.getTime() ?? 0) - (left.validTo?.getTime() ?? 0))[0];
+        this.repositoryNameHistory.push({ tenantId: input.tenantId, repositoryId: previous.id, ownerLogin: previous.ownerLogin, name: previous.name, fullName: previous.fullName, validFrom: previousHistory?.validTo ?? previous.firstSeenAt ?? input.observedAt, validTo: input.observedAt });
+      }
+      const { revokedAt: _revokedAt, ...withoutRevokedAt } = previous ?? {};
+      const saved: RepositoryRecord = {
+        ...withoutRevokedAt,
+        ...candidate,
+        id: previous?.id ?? candidate.id,
+        tenantId: input.tenantId,
+        installationId: installation.id,
+        selected: wasSelected,
+        accessStatus: "accessible",
+        firstSeenAt: previous?.firstSeenAt ?? candidate.firstSeenAt ?? input.observedAt,
+        lastSeenAt: input.observedAt,
+        lastAuthoritativeObservedAt: input.observedAt,
+      };
+      this.repositories.set(key, saved);
+      if (previous) updated += 1; else added += 1;
+    }
+    let removed = 0;
+    for (const [key, repository] of this.repositories.entries()) {
+      if (repository.tenantId !== input.tenantId || repository.installationId !== installation.id || repository.accessStatus === "access_removed" || repository.accessStatus === "disconnected") continue;
+      if (observed.has(repository.githubRepositoryId)) continue;
+      this.repositories.set(key, { ...repository, accessStatus: "access_removed", revokedAt: input.observedAt });
+      removed += 1;
+    }
+    this.installations.set(input.githubInstallationId, { ...installation, lastInventoryAt: input.observedAt });
+    return { observed: observed.size, added, updated, removed };
+  }
+  async updateInstallationLifecycle(githubInstallationId: number, status: InstallationLifecycleStatus, now: Date): Promise<void> {
+    const installation = this.installations.get(githubInstallationId);
+    if (!installation) return;
+    const updatedInstallation: InstallationRecord = { ...installation, status, ...(status === "suspended" ? { suspendedAt: now } : {}), ...(status === "deleted" || status === "disconnected" ? { deletedAt: now } : {}) };
+    if (status === "active") {
+      delete updatedInstallation.suspendedAt;
+      delete updatedInstallation.deletedAt;
+    }
+    this.installations.set(githubInstallationId, updatedInstallation);
+    for (const [key, repository] of this.repositories.entries()) {
+      if (repository.installationId !== installation.id) continue;
+      const accessStatus = status === "suspended" ? "installation_suspended" : status === "active" ? "unavailable" : "disconnected";
+      if (status === "active") this.repositories.set(key, { ...repository, accessStatus });
+      else this.repositories.set(key, { ...repository, accessStatus, revokedAt: now });
+    }
+  }
 
   async insertDelivery(input: Omit<DeliveryRecord, "id" | "state" | "firstReceivedAt" | "lastReceivedAt" | "receiptCount" | "processingAttempts"> & { now: Date }): Promise<DeliveryInsertResult> {
     const existing = this.deliveries.get(input.guid);

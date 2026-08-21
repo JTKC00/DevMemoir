@@ -56,6 +56,7 @@ const installationSchema = z.object({
   account: z.object({ id: z.number().int().positive(), login: z.string().optional(), type: z.string() }).strip(),
   repository_selection: z.string().optional(),
   permissions: z.record(z.string()).optional(),
+  suspended_at: z.string().nullable().optional(),
 }).strip();
 const repositorySchema = z.object({
   id: z.number().int().positive(),
@@ -67,6 +68,8 @@ const repositorySchema = z.object({
   visibility: z.string().optional(),
   default_branch: z.string(),
   archived: z.boolean().optional(),
+  disabled: z.boolean().optional(),
+  html_url: z.string().optional(),
   description: z.string().nullable().optional(),
   pushed_at: z.string().nullable().optional(),
   created_at: z.string().nullable().optional(),
@@ -86,6 +89,16 @@ export type InstallationRepositoryPage = {
   repositories: GithubRepository[];
   nextPage?: number;
 };
+
+export function nextPageFromLink(link: unknown): number | undefined {
+  const value = typeof link === "string" ? link : "";
+  for (const part of value.split(",")) {
+    if (!/rel="next"/.test(part)) continue;
+    const page = /[?&]page=(\d+)/.exec(part)?.[1];
+    if (page) return Number(page);
+  }
+  return undefined;
+}
 
 export interface GithubClient {
   getUser(accessToken: string): Promise<GithubUser>;
@@ -210,8 +223,8 @@ export class InstallationGithubClient implements GithubClient {
     const response = await this.base["requestInstallation"](this.installationId, "GET /installation/repositories", { page, per_page: perPage });
     const data = z.object({ repositories: z.array(repositorySchema).default([]) }).strip().parse(response.data);
     const link = String(response.headers?.link ?? "");
-    const nextPage = /[?&]page=(\d+)>; rel="next"/.exec(link)?.[1];
-    return { repositories: data.repositories, ...(nextPage ? { nextPage: Number(nextPage) } : {}) };
+    const nextPage = nextPageFromLink(link);
+    return { repositories: data.repositories, ...(nextPage ? { nextPage } : {}) };
   }
 
   async getRepository(owner: string, repo: string): Promise<GithubRepository> {
@@ -225,8 +238,8 @@ export class InstallationGithubClient implements GithubClient {
     const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}/commits", { owner: input.owner, repo: input.repo, ...(input.sha ? { sha: input.sha } : {}), page: input.page ?? 1, per_page: input.perPage ?? 100 });
     const commits = z.array(z.record(z.unknown())).parse(response.data).map((commit) => toCommit(commit));
     const link = String(response.headers?.link ?? "");
-    const nextPage = /[?&]page=(\d+)>; rel="next"/.exec(link)?.[1];
-    return { commits, ...(nextPage ? { nextPage: Number(nextPage) } : {}) };
+    const nextPage = nextPageFromLink(link);
+    return { commits, ...(nextPage ? { nextPage } : {}) };
   }
 
   async getCommit(input: { owner: string; repo: string; ref: string }): Promise<GithubCommit> {

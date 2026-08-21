@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { githubIdentities, commits, webhookDeliveries } from "./schema.js";
+import { githubIdentities, commits, repositoryNameHistory, webhookDeliveries } from "./schema.js";
 
-describe("M1 schema contract", () => {
+describe("M2 schema contract", () => {
   it("defines tenant and identity tables with delivery fields", () => {
     expect(githubIdentities).toBeDefined();
     expect(commits).toBeDefined();
     expect(webhookDeliveries).toBeDefined();
+    expect(repositoryNameHistory).toBeDefined();
   });
 
   it.skipIf(!process.env.TEST_DATABASE_URL)("runs against real PostgreSQL when TEST_DATABASE_URL is provided", async () => {

@@ -1,10 +1,11 @@
 import PgBoss from "pg-boss";
 import type { DeliveryState } from "@devmemoir/domain";
 
-export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill";
-export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill"];
+export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory"];
 
 export type SyncJobPayload = {
+  kind?: JobKind;
   deliveryId?: string;
   deliveryGuid?: string;
   tenantId?: string;
@@ -19,6 +20,9 @@ export type SyncJobPayload = {
   after?: string;
   forced?: boolean;
   nextPage?: number;
+  inventoryOperationId?: string;
+  eventName?: string;
+  action?: string;
 };
 
 export type QueueJob<T = unknown> = {
@@ -156,6 +160,10 @@ export function deliveryLogicalKey(deliveryId: string): string {
 
 export function commitSyncLogicalKey(repositoryId: string, ref: string, after: string, nextPage?: number): string {
   return `sync:${repositoryId}:${ref}:${after}${nextPage ? `:page:${nextPage}` : ""}`;
+}
+
+export function installationInventoryLogicalKey(installationGithubId: number, operationId: string): string {
+  return `inventory:${installationGithubId}:${operationId}`;
 }
 
 export function isRetryableDeliveryState(state: DeliveryState): boolean {

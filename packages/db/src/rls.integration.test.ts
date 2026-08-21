@@ -1,17 +1,23 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeIntegration = databaseUrl ? describe : describe.skip;
+const migrationsDir = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
 
-describeIntegration("M1 PostgreSQL RLS", () => {
+describeIntegration("M2 PostgreSQL RLS", () => {
   const tenantA = randomUUID();
   const tenantB = randomUUID();
   const repoA = randomUUID();
   const repoB = randomUUID();
+  const installationA = randomUUID();
+  const installationB = randomUUID();
+  const accountA = randomUUID();
+  const accountB = randomUUID();
   const admin = new Client({ connectionString: databaseUrl });
   const suffix = randomUUID().replaceAll("-", "").slice(0, 16);
   const rolePassword = `test-${randomUUID().replaceAll("-", "")}`;
@@ -33,7 +39,12 @@ describeIntegration("M1 PostgreSQL RLS", () => {
     await admin.connect();
     const table = await admin.query<{ exists: boolean }>("select to_regclass('public.repositories') is not null as exists");
     if (!table.rows[0]?.exists) {
-      const migration = await readFile(resolve(process.cwd(), "packages/db/migrations/0001_initial.sql"), "utf8");
+      const migration = await readFile(resolve(migrationsDir, "0001_initial.sql"), "utf8");
+      await admin.query(migration);
+    }
+    const inventoryTable = await admin.query<{ exists: boolean }>("select to_regclass('public.repository_name_history') is not null as exists");
+    if (!inventoryTable.rows[0]?.exists) {
+      const migration = await readFile(resolve(migrationsDir, "0002_m2_repository_inventory.sql"), "utf8");
       await admin.query(migration);
     }
     for (const [capability, roleName] of Object.entries(runtimeRoleNames)) {
@@ -43,11 +54,20 @@ describeIntegration("M1 PostgreSQL RLS", () => {
     }
     await admin.query("insert into tenants (id,slug,created_at) values ($1,$2,now()),($3,$4,now())", [tenantA, `rls-a-${tenantA.slice(0, 8)}`, tenantB, `rls-b-${tenantB.slice(0, 8)}`]);
     await admin.query("insert into repositories (id,tenant_id,github_repository_id,owner_login,name,full_name,private,default_branch,created_at,updated_at) values ($1,$2,101,'owner','a','owner/a',true,'main',now(),now()),($3,$4,102,'owner','b','owner/b',true,'main',now(),now())", [repoA, tenantA, repoB, tenantB]);
+    await admin.query("insert into github_accounts (id,github_account_id,account_type,actor_kind,login) values ($1,1001,'User','user','owner-a'),($2,1002,'User','user','owner-b')", [accountA, accountB]);
+    const accountRows = await admin.query<{ id: string; github_account_id: string }>("select id,github_account_id from github_accounts where github_account_id in (1001,1002) order by github_account_id");
+    await admin.query("insert into github_installations (id,tenant_id,github_installation_id,account_github_account_id,created_at,updated_at) values ($1,$2,201,$3,now(),now()),($4,$5,202,$6,now(),now())", [installationA, tenantA, accountRows.rows[0]?.id, installationB, tenantB, accountRows.rows[1]?.id]);
+    await admin.query("insert into repository_access (id,tenant_id,repository_id,installation_id,access_status,selected,selected_at) values ($1,$2,$3,$4,'accessible',true,now()),($5,$6,$7,$8,'accessible',true,now())", [randomUUID(), tenantA, repoA, installationA, randomUUID(), tenantB, repoB, installationB]);
+    await admin.query("insert into repository_name_history (id,tenant_id,repository_id,owner_login,name,full_name,valid_from) values ($1,$2,$3,'owner','a','owner/a',now()),($4,$5,$6,'owner','b','owner/b',now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
   });
 
   afterAll(async () => {
     await Promise.all(runtimeClients.map((client) => client.end().catch(() => undefined)));
+    await admin.query("delete from repository_name_history where repository_id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from repository_access where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from repositories where id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from github_installations where id in ($1,$2)", [installationA, installationB]);
+    await admin.query("delete from github_accounts where id in ($1,$2)", [accountA, accountB]);
     await admin.query("delete from tenants where id in ($1,$2)", [tenantA, tenantB]);
     for (const roleName of Object.values(runtimeRoleNames)) await admin.query(`drop role if exists "${roleName}"`);
     await admin.end();
@@ -77,6 +97,32 @@ describeIntegration("M1 PostgreSQL RLS", () => {
     await admin.query("set local role devmemoir_web");
     await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
     await expect(admin.query("insert into commits (id,tenant_id,repository_id,sha,message,first_seen_at,last_seen_at) values ($1,$2,$3,'canary','message',now(),now())", [randomUUID(), tenantA, repoA])).rejects.toThrow();
+    await admin.query("rollback");
+  });
+
+  it("keeps inventory name history tenant-scoped, including removed repository facts", async () => {
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_api");
+    await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
+    expect((await admin.query<{ repository_id: string }>("select repository_id from repository_name_history order by repository_id")).rows.map((row) => row.repository_id)).toEqual([repoA]);
+    expect((await admin.query("update repository_name_history set name='cross-tenant' where repository_id=$1", [repoB])).rowCount).toBe(0);
+    await expect(admin.query("insert into repository_name_history (id,tenant_id,repository_id,owner_login,name,full_name,valid_from) values ($1,$2,$3,'owner','cross','owner/cross',now())", [randomUUID(), tenantB, repoB])).rejects.toThrow();
+    await admin.query("rollback");
+  });
+
+  it("does not allow cross-tenant repository access selection or mutation", async () => {
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_api");
+    await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
+    expect((await admin.query<{ repository_id: string }>("select repository_id from repository_access order by repository_id")).rows.map((row) => row.repository_id)).toEqual([repoA]);
+    expect((await admin.query("update repository_access set selected=false where repository_id=$1", [repoB])).rowCount).toBe(0);
+    await expect(admin.query("insert into repository_access (id,tenant_id,repository_id,installation_id,access_status,selected,selected_at) values ($1,$2,$3,$4,'accessible',false,now())", [randomUUID(), tenantB, repoB, installationB])).rejects.toThrow();
+    await admin.query("rollback");
+
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_worker");
+    await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
+    expect((await admin.query("update repository_access set access_status='access_removed' where repository_id=$1", [repoB])).rowCount).toBe(0);
     await admin.query("rollback");
   });
 

@@ -1,4 +1,4 @@
-# DevMemoir M1
+# DevMemoir M2
 
 DevMemoir is a TypeScript/pnpm monorepo proving the first production-shaped vertical slice: one allowlisted owner authenticates, binds one GitHub App installation, selects one repository, imports the newest 100 default-branch commits, receives signed push signals, and views a private factual activity page.
 
@@ -98,6 +98,14 @@ pnpm --filter @devmemoir/web dev
 
 The host-only session cookie is always `__Host-devmemoir_session` with `Secure`, `HttpOnly`, `SameSite=Lax`, and `Path=/`; use HTTPS (or a local TLS reverse proxy) for a browser login. API/unit tests use Fastify injection and do not need GitHub credentials.
 
+## Repository inventory (M2)
+
+After an installation is bound, DevMemoir queues an authoritative `GET /installation/repositories` refresh and follows every GitHub pagination link. The webhook events `installation`, `installation_repositories`, and relevant `repository` events are durable signals that enqueue another refresh; their embedded repository arrays are never treated as the permanent inventory.
+
+The inventory uses the GitHub numeric repository ID as identity. Names, owner logins, visibility, default branch, archived/disabled flags, and timestamps are mutable metadata, and prior names are retained in name history. A repository can be **accessible** to the GitHub App while remaining **unselected** in DevMemoir. **Selected** means DevMemoir is actively tracking it; M2 preserves the existing M1 limit of one selected repository and does not start historical imports for every accessible repository.
+
+Only a completed pagination run may mark a previously visible repository `access_removed`. A page failure leaves the previous authoritative inventory intact. Installation suspension marks access unavailable and stops repository work; uninstall/deletion marks access disconnected while retaining repository identity and existing memoir facts. Reinstallation upserts the same installation/repository identities rather than creating duplicates.
+
 ## GitHub App checklist
 
 Create a GitHub App for the owner account; do not commit its private key or any token.
@@ -107,7 +115,7 @@ Create a GitHub App for the owner account; do not commit its private key or any 
 * Set the setup URL to `${API_ORIGIN}/github/setup` and enable setup URL redirection.
 * Set the webhook URL to `${API_ORIGIN}/webhooks/github` and choose a random webhook secret.
 * Request only these permissions: Metadata **read**, Contents **read**, Pull requests **read**, Issues **read**. No write permissions are needed.
-* Subscribe to `push`, `ping`, `github_app_authorization`, `installation`, and `installation_repositories`. In M1, non-push receipts are durably acknowledged as `ignored`; unsupported actions are never projected.
+* Subscribe to `push`, `ping`, `github_app_authorization`, `installation`, `installation_repositories`, and the relevant `repository` events. M2 installation/repository events are durable signals for an authoritative inventory refresh; unsupported actions are never projected.
 * Put the numeric owner account ID in `OWNER_GITHUB_USER_ID`. Installation binding re-fetches the installation and requires account type `User` plus an exact numeric ID match.
 * Fill `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, optional `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY`, and current/previous webhook secrets in `.env`.
 
@@ -130,11 +138,15 @@ Run this checklist in a temporary HTTPS environment when owner-created GitHub Ap
 11. Confirm the temporary HTTPS host routes both callback and webhook paths to the API and that the API, worker, queue, and migration processes are running with their separate roles.
 12. Open the Web login flow and complete GitHub authorization; verify the host-only session cookie and CSRF-protected browser handoff.
 13. Start GitHub App installation and verify the installation is rebound to the exact allowlisted owner account.
-14. Select exactly one private repository and verify it is the repository shown by the M1 UI.
-15. Verify the initial import reports the exact newest 100 commits reachable from the current default branch.
-16. Push a test commit, confirm GitHub delivers the signed webhook, and verify worker processing fetches the authoritative ref/head before writing facts.
-17. Redeliver the same GUID and replay a failed/dead-letter receipt; verify one canonical delivery/job, no duplicate business effect, and terminal `processed`/`ignored` receipts remain no-ops.
-18. Open the private activity page and inspect application/worker logs and database canaries for absence of raw payloads, private source content, tokens, secrets, and cross-tenant data.
+14. Confirm the initial inventory shows every accessible repository across all pages, with private/public and observed timestamps.
+15. Select exactly one private repository and verify it becomes actively tracked while other accessible repositories remain unselected.
+16. Verify the initial import reports the exact newest 100 commits reachable from the current default branch.
+17. Add/remove a repository in the GitHub App, deliver `installation_repositories`, and verify the UI converges after an authoritative refresh rather than trusting the webhook array.
+18. Rename or transfer a repository and verify the numeric repository identity is retained; revoke access and verify the historical row remains as removed.
+19. Suspend, unsuspend, and uninstall the App; verify active repository work stops immediately, unsuspend waits for inventory reconciliation, and memoir history remains.
+20. Push a test commit, confirm GitHub delivers the signed webhook, and verify worker processing fetches the authoritative ref/head before writing facts.
+21. Redeliver the same GUID and replay a failed/dead-letter receipt; verify one canonical delivery/job, no duplicate business effect, and terminal `processed`/`ignored` receipts remain no-ops.
+22. Open the private activity page and inspect application/worker logs and database canaries for absence of raw payloads, private source content, tokens, secrets, and cross-tenant data.
 
 ## Verification
 
@@ -145,7 +157,7 @@ pnpm test
 pnpm build
 ```
 
-The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects the M1 migration to have been applied and verifies capability-role membership through ephemeral LOGIN principals, that tenant A cannot read or write tenant B, that worker A cannot write tenant B, and that the web role cannot mutate GitHub-derived commits:
+The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects all migrations (`0001_initial.sql` and `0002_m2_repository_inventory.sql`) to have been applied and verifies capability-role membership through ephemeral LOGIN principals, that tenant A cannot read or write tenant B inventory, that worker A cannot write tenant B, and that the web role cannot mutate GitHub-derived commits:
 
 ```bash
 $env:TEST_DATABASE_URL = $env:DATABASE_DIRECT_URL
@@ -159,6 +171,6 @@ CI starts PostgreSQL, applies the migration, and runs this suite. Without a supp
 
 `apps/api` uses `DATABASE_API_URL`, `apps/worker` uses `DATABASE_WORKER_URL`, pg-boss uses `DATABASE_QUEUE_URL`, and migrations use `DATABASE_MIGRATIONS_URL`. `packages/jobs` creates the three pg-boss queues with a stately logical-key policy; business cursors remain in PostgreSQL. Webhook HMAC verification happens on exact raw bytes before JSON parsing, and current plus previous secrets are accepted during rotation overlap.
 
-## Known M1 limits / deferred scope
+## Known M2 limits / deferred scope
 
-M1 intentionally supports one allowlisted owner and one selected repository, imports only the newest 100 commits reachable from the current default branch, and treats push webhooks as synchronization signals. It does not implement organizations, general signup, billing, AI summaries/classification, profiles, scores, source cloning, file/diff storage, PR/issue content, comments, Actions, deployments, all-branch backfill, or analytics dashboards. Live GitHub App E2E still requires owner-created credentials and a reachable HTTPS callback.
+M2 intentionally supports one allowlisted owner and one selected repository, imports only the newest 100 commits reachable from the current default branch, and treats push webhooks as synchronization signals. It does not implement historical backfill for all accessible/selected repositories, organizations, general signup, billing, AI summaries/classification, profiles, scores, source cloning, file/diff storage, PR/issue content, comments, Actions, deployments, all-branch backfill, or analytics dashboards. Live GitHub App E2E still requires owner-created credentials and a reachable HTTPS callback.
