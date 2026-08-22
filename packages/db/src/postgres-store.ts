@@ -361,7 +361,7 @@ export class PostgresM1Store implements M1Store {
       let added = 0;
       let updated = 0;
       for (const repository of observed.values()) {
-        const existingResult = await client.query<Row>("select r.id,r.owner_login,r.name,r.full_name,r.first_seen_at,(select max(nh.valid_to) from repository_name_history nh where nh.tenant_id=r.tenant_id and nh.repository_id=r.id) as last_name_changed_at,ra.access_status,ra.selected from repositories r left join repository_access ra on ra.repository_id=r.id and ra.installation_id=$3 and ra.tenant_id=r.tenant_id where r.tenant_id=$1 and r.github_repository_id=$2 for update", [input.tenantId, repository.githubRepositoryId, installationId]);
+        const existingResult = await client.query<Row>("select r.id,r.owner_login,r.name,r.full_name,r.first_seen_at,(select max(nh.valid_to) from repository_name_history nh where nh.tenant_id=r.tenant_id and nh.repository_id=r.id) as last_name_changed_at,ra.access_status,ra.selected from repositories r left join repository_access ra on ra.repository_id=r.id and ra.installation_id=$3 and ra.tenant_id=r.tenant_id where r.tenant_id=$1 and r.github_repository_id=$2 for update of r", [input.tenantId, repository.githubRepositoryId, installationId]);
         const existing = existingResult.rows[0];
         const repositoryId = String(existing?.id ?? repository.id);
         const wasSelected = existing?.selected === true;
