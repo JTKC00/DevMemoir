@@ -37,8 +37,10 @@ async function processInstallationSignal(input: { deliveryId: string; payload: S
       await deps.store.updateInstallationLifecycle(installationGithubId, "suspended", now());
     } else if (input.payload.action === "deleted") {
       await deps.store.updateInstallationLifecycle(installationGithubId, "deleted", now());
-    } else if (input.payload.action === "created" || input.payload.action === "unsuspend" || input.payload.action === "new_permissions_accepted") {
+    } else if (input.payload.action === "created" || input.payload.action === "unsuspend") {
       await deps.store.updateInstallationLifecycle(installationGithubId, "active", now());
+      await enqueueInventorySignal({ tenantId, installationGithubId, operationId: input.deliveryId }, deps);
+    } else if (input.payload.action === "new_permissions_accepted") {
       await enqueueInventorySignal({ tenantId, installationGithubId, operationId: input.deliveryId }, deps);
     }
   } else if (eventName === "installation_repositories" || eventName === "repository") {

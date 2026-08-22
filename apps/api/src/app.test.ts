@@ -146,9 +146,14 @@ describe("M1 webhook receipt", () => {
   });
 
   it("routes installation permission changes to authoritative refresh", async () => {
-    const response = await send("guid-permissions", "installation", { action: "new_permissions_accepted", installation: { id: 22 } });
+    const response = await send("guid-permissions", "installation", { action: "new_permissions_accepted", installation: { id: 22 }, repositories: [{ id: 999, name: "permission-payload-must-not-be-trusted" }] });
     expect(response.statusCode).toBe(202);
-    expect(jobs.jobs.size).toBe(1);
+    expect(store.deliveries.get("guid-permissions")).toMatchObject({ eventName: "installation", action: "new_permissions_accepted", state: "received" });
+    const queued = [...jobs.jobs.values()];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.kind).toBe("webhook_delivery");
+    expect(queued[0]?.payload).toMatchObject({ eventName: "installation", action: "new_permissions_accepted" });
+    expect(JSON.stringify(queued[0]?.payload)).not.toContain("permission-payload-must-not-be-trusted");
   });
 
   it("rejects invalid signatures and bodies over 2 MB before persistence", async () => {

@@ -3,9 +3,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
 import { createPool, PostgresM1Store } from "@devmemoir/db";
 import type { GithubClient, GithubRepository } from "@devmemoir/github";
-import { installationInventoryLogicalKey, PgBossJobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
+import { InMemoryJobPort, installationInventoryLogicalKey, PgBossJobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
-import { processQueueJob, type QueueDependencies } from "./jobs.js";
+import { processInstallationInventory, processQueueJob, type QueueDependencies } from "./jobs.js";
+import { processDelivery } from "./processor.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required for M2 pg-boss inventory restart integration tests");
@@ -55,6 +56,7 @@ async function createScope(): Promise<Scope> {
 
 async function cleanup(scope: Scope): Promise<void> {
   await scope.admin.query("delete from sync_jobs where tenant_id=$1", [scope.tenantId]);
+  await scope.admin.query("delete from webhook_deliveries where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repository_name_history where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repository_access where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repositories where tenant_id=$1", [scope.tenantId]);
@@ -130,4 +132,25 @@ describeIntegration("M2 installation inventory worker restart", () => {
       await producer.stop().catch(() => undefined);
     }
   }, 90_000);
+
+  it("preserves PostgreSQL selection through a permission-update refresh", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const jobs = new InMemoryJobPort();
+    const dependencies: QueueDependencies = { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger() };
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, dependencies);
+    const repository = await scope.store.getRepositoryByGithubId(scope.tenantId, 9001);
+    await expect(scope.store.selectRepository(scope.tenantId, repository?.id ?? "")).resolves.toMatchObject({ selected: true });
+    const delivery = await scope.store.insertDelivery({ tenantId: scope.tenantId, guid: `permissions-${randomUUID()}`, eventName: "installation", action: "new_permissions_accepted", installationGithubId: scope.githubInstallationId, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
+    const payload: SyncJobPayload = { tenantId: scope.tenantId, deliveryId: delivery.record.id, eventName: "installation", action: "new_permissions_accepted", installationGithubId: scope.githubInstallationId };
+
+    await processDelivery({ deliveryId: delivery.record.id, payload }, dependencies);
+
+    await expect(scope.store.getRepositoryByGithubId(scope.tenantId, 9001)).resolves.toMatchObject({ accessStatus: "accessible", selected: true });
+    expect([...jobs.jobs.values()]).toHaveLength(1);
+    await processInstallationInventory([...jobs.jobs.values()][0]?.payload as SyncJobPayload, dependencies);
+
+    await expect(scope.store.getInstallation(scope.githubInstallationId)).resolves.toMatchObject({ status: "active", permissions: { Metadata: "read" }, repositorySelection: "selected" });
+    await expect(scope.store.getRepositoryByGithubId(scope.tenantId, 9001)).resolves.toMatchObject({ accessStatus: "accessible", selected: true });
+  });
 });

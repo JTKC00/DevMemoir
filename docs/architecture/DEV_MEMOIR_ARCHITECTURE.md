@@ -674,7 +674,7 @@ Before removing the owner allowlist: revalidate forced RLS and direct-SQL isolat
 - Page upsert plus cursor/high-water update is atomic; restart and 24-hour supplemental overlap do not replace ref-head traversal.
 - Installation repository inventory follows every `Link` page even when `installation.created` contains a truncated repository list.
 - `/setup` and callback reject a non-allowlisted GitHub user, state replay/expiry, PKCE mismatch, open redirect, installation-account mismatch, and unauthenticated no-state claims.
-- `ping` and `github_app_authorization` return 2xx with intended side effects; uninstall/permission changes cancel or gate jobs/token minting.
+- `ping` and `github_app_authorization` return 2xx with intended side effects; uninstall/revocation gates jobs and token minting, while `new_permissions_accepted` preserves current selection and queues authoritative installation/repository reconciliation.
 - Tenant A cannot read/write Tenant B through repository methods **or direct SQL under each application role**; migration owner/queue exceptions are narrowly verified.
 - Web database role cannot write GitHub-derived tables; API/worker roles can only perform their scoped operations.
 - Raw payload expiry deletes successes at 7 days and dead letters by 30 days without deleting normalized facts.

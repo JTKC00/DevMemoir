@@ -64,6 +64,40 @@ describe("worker delivery contract", () => {
     expect([...jobs.jobs.values()][0]?.payload).not.toHaveProperty("repositories");
   });
 
+  it("preserves a selected repository when new permissions are accepted and access remains authoritative", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
+    await store.saveRepository({ id: "repository-1", tenantId: "tenant-1", installationId: "installation-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: true, defaultBranch: "main" });
+    const github: GithubClient = {
+      getUser: async () => ({ id: 7, login: "owner", type: "User" }),
+      exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+      getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" }, permissions: { metadata: "read", contents: "read" }, repository_selection: "selected" }),
+      listInstallationRepositories: async () => ({ repositories: [{ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }] }),
+      getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }),
+      listCommits: async () => ({ commits: [] }),
+      getCommit: async () => ({ repositoryId: "", sha: "a".repeat(40), message: "", parents: [] }),
+      getRefHead: async () => "a".repeat(40),
+    };
+    const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: "permissions-accepted", eventName: "installation", action: "new_permissions_accepted", installationGithubId: 22, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
+    const payload = { tenantId: "tenant-1", deliveryId: delivery.record.id, eventName: "installation", action: "new_permissions_accepted", installationGithubId: 22 } as const;
+
+    await processDelivery({ deliveryId: delivery.record.id, payload }, { config, store, jobs, githubForInstallation: () => github, logger: createLogger() });
+    await processDelivery({ deliveryId: delivery.record.id, payload }, { config, store, jobs, githubForInstallation: () => github, logger: createLogger() });
+
+    expect(store.installations.get(22)?.status).toBe("active");
+    expect((await store.listRepositoryInventory("tenant-1"))[0]).toMatchObject({ accessStatus: "accessible", selected: true });
+    expect([...jobs.jobs.values()]).toHaveLength(1);
+    expect(store.deliveries.get("permissions-accepted")).toMatchObject({ state: "processed", processingAttempts: 1 });
+
+    const inventoryJob = [...jobs.jobs.values()][0];
+    await processInstallationInventory(inventoryJob?.payload ?? {}, { config, store, jobs, githubForInstallation: () => github, logger: createLogger() });
+
+    expect(store.installations.get(22)).toMatchObject({ status: "active", permissions: { metadata: "read", contents: "read" }, repositorySelection: "selected" });
+    expect((await store.listRepositoryInventory("tenant-1"))[0]).toMatchObject({ accessStatus: "accessible", selected: true });
+  });
+
   it("suspends and deletes installations without minting or reading repositories", async () => {
     for (const [action, expectedStatus, expectedAccess] of [["suspend", "suspended", "installation_suspended"], ["deleted", "deleted", "disconnected"]] as const) {
       const store = new InMemoryM1Store();
@@ -78,7 +112,7 @@ describe("worker delivery contract", () => {
     }
   });
 
-  it("keeps repositories unavailable until an unsuspend inventory refresh completes", async () => {
+  it("keeps repositories unavailable and unselected until an unsuspend inventory refresh completes", async () => {
     const store = new InMemoryM1Store();
     const jobs = new InMemoryJobPort();
     await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
@@ -88,8 +122,25 @@ describe("worker delivery contract", () => {
     await processDelivery({ deliveryId: suspended.record.id, payload: { tenantId: "tenant-1", deliveryId: suspended.record.id, eventName: "installation", action: "suspend", installationGithubId: 22 } }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
     const unsuspended = await store.insertDelivery({ tenantId: "tenant-1", guid: "unsuspend-active", eventName: "installation", action: "unsuspend", installationGithubId: 22, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
     await processDelivery({ deliveryId: unsuspended.record.id, payload: { tenantId: "tenant-1", deliveryId: unsuspended.record.id, eventName: "installation", action: "unsuspend", installationGithubId: 22 } }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
-    expect((await store.listRepositoryInventory("tenant-1"))[0]?.accessStatus).toBe("unavailable");
+    expect(store.installations.get(22)?.status).toBe("active");
+    expect((await store.listRepositoryInventory("tenant-1"))[0]).toMatchObject({ accessStatus: "unavailable", selected: false });
     expect([...jobs.jobs.values()].map((job) => job.kind)).toEqual(["installation_inventory"]);
+
+    const github: GithubClient = {
+      getUser: async () => ({ id: 7, login: "owner", type: "User" }),
+      exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+      getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" } }),
+      listInstallationRepositories: async () => ({ repositories: [{ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }] }),
+      getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }),
+      listCommits: async () => ({ commits: [] }),
+      getCommit: async () => ({ repositoryId: "", sha: "a".repeat(40), message: "", parents: [] }),
+      getRefHead: async () => "a".repeat(40),
+    };
+    const inventoryJob = [...jobs.jobs.values()][0];
+    await processInstallationInventory(inventoryJob?.payload ?? {}, { config, store, jobs, githubForInstallation: () => github, logger: createLogger() });
+
+    expect((await store.listRepositoryInventory("tenant-1"))[0]).toMatchObject({ accessStatus: "accessible", selected: false });
+    expect(store.deliveries.get("unsuspend-active")?.state).toBe("processed");
   });
 
   it("terminalizes a repository signal after suspension and keeps duplicate delivery a no-op", async () => {
