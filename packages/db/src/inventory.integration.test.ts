@@ -45,7 +45,7 @@ async function cleanup(scope: Scope): Promise<void> {
   await scope.admin.query("delete from repositories where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from github_installations where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from installation_routes where tenant_id=$1", [scope.tenantId]);
-  const users = await scope.admin.query<{ id: string; account_id: string }>("select u.id,gi.github_account_id as account_id from users u join github_identities i on i.user_id=u.id join github_accounts gi on gi.id=i.github_account_id where u.primary_tenant_id=$1", [scope.tenantId]);
+  const users = await scope.admin.query<{ id: string; account_id: string }>("select u.id,gi.id as account_id from users u join github_identities i on i.user_id=u.id join github_accounts gi on gi.id=i.github_account_id where u.primary_tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from github_identities where user_id = any($1::uuid[])", [users.rows.map((row) => row.id)]);
   await scope.admin.query("delete from tenant_members where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from users where primary_tenant_id=$1", [scope.tenantId]);
