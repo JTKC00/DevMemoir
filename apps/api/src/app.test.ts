@@ -135,6 +135,22 @@ describe("M1 webhook receipt", () => {
     expect((queued[0]?.payload as { eventName?: string }).eventName).toBe("installation_repositories");
   });
 
+  it("routes current repository lifecycle actions to authoritative refresh", async () => {
+    const actions = ["created", "edited", "renamed", "transferred", "archived", "unarchived", "deleted", "privatized", "publicized"];
+    for (const [index, action] of actions.entries()) {
+      const response = await send(`guid-repository-${index}`, "repository", { action, installation: { id: 22 }, repository: { id: 10, name: "repo", full_name: "owner/repo" } });
+      expect(response.statusCode).toBe(202);
+    }
+    expect(store.deliveries.size).toBe(actions.length);
+    expect(jobs.jobs.size).toBe(actions.length);
+  });
+
+  it("routes installation permission changes to authoritative refresh", async () => {
+    const response = await send("guid-permissions", "installation", { action: "new_permissions_accepted", installation: { id: 22 } });
+    expect(response.statusCode).toBe(202);
+    expect(jobs.jobs.size).toBe(1);
+  });
+
   it("rejects invalid signatures and bodies over 2 MB before persistence", async () => {
     const invalid = await send("guid-invalid", "push", { ref: "refs/heads/main", before: "a", after: "b" }, "wrong-secret-123456");
     expect(invalid.statusCode).toBe(401);

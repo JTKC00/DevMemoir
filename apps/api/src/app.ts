@@ -26,9 +26,9 @@ export type ApiDependencies = {
 type RequestWithSession = FastifyRequest & { session?: SessionRecord };
 
 const KNOWN_ACTIONS: Record<string, Set<string>> = {
-  installation: new Set(["created", "deleted", "suspend", "unsuspend" ]),
+  installation: new Set(["created", "deleted", "suspend", "unsuspend", "new_permissions_accepted"]),
   installation_repositories: new Set(["added", "removed"]),
-  repository: new Set(["created", "edited", "archived", "renamed", "transferred"]),
+  repository: new Set(["created", "edited", "archived", "unarchived", "renamed", "transferred", "deleted", "privatized", "publicized"]),
   pull_request: new Set(["opened", "closed", "reopened", "edited", "synchronize"]),
   issues: new Set(["opened", "closed", "reopened", "edited"]),
   release: new Set(["published", "edited", "deleted"]),
@@ -171,7 +171,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   app.get("/connect/repositories", async (request, reply) => {
     const session = await requireSession(request as RequestWithSession, reply);
     if (!session) return;
-    const installation = (await deps.store.listInstallations(session.tenantId))[0];
+    const installation = await deps.store.getActiveInstallationForTenant(session.tenantId);
     if (!installation) return { connected: false, repositories: [] };
     const repositories = await deps.store.listRepositoryInventory(session.tenantId, installation.id);
     return {
@@ -200,7 +200,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   app.post("/connect/repositories/refresh", async (request, reply) => {
     const session = await requireCsrf(request as RequestWithSession, reply);
     if (!session) return;
-    const installation = (await deps.store.listInstallations(session.tenantId))[0];
+    const installation = await deps.store.getActiveInstallationForTenant(session.tenantId);
     if (!installation || (installation.status && installation.status !== "active")) return reply.code(409).send({ error: "installation_unavailable" });
     const operationId = createId();
     await enqueueInventoryRefresh(session.tenantId, installation.githubInstallationId, operationId);
@@ -215,9 +215,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     if (!request.body?.repositoryId && (!owner || !repo)) return reply.code(400).send({ error: "owner_and_repo_required" });
     const repository = request.body?.repositoryId ? await deps.store.getRepositoryById(session.tenantId, request.body.repositoryId) : await deps.store.getRepositoryByFullName(session.tenantId, `${owner}/${repo}`);
     if (!repository) return reply.code(404).send({ error: "repository_not_in_authoritative_inventory" });
-    const installation = (await deps.store.listInstallations(session.tenantId)).find((value) => value.id === repository.installationId);
+    const installation = await deps.store.getActiveInstallationForTenant(session.tenantId);
     if (!installation) return reply.code(409).send({ error: "installation_required" });
-    if (installation.status && installation.status !== "active") return reply.code(409).send({ error: "installation_unavailable" });
+    if (repository.installationId !== installation.id) return reply.code(409).send({ error: "repository_inventory_stale" });
     let connectedRepository: import("@devmemoir/db").RepositoryRecord | undefined;
     try {
       connectedRepository = await deps.store.selectRepository(session.tenantId, repository.id);

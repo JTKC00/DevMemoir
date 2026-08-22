@@ -49,7 +49,7 @@ describe("authoritative installation repository inventory", () => {
     await store.saveRepository({ id: "old-repo", tenantId, installationId: "installation-inventory", githubRepositoryId: 1, ownerLogin: "owner", name: "old", fullName: "owner/old", private: true, defaultBranch: "main" });
     const result = await refreshInstallationInventory({ tenantId, installationGithubId: installationId, now: observedAt }, githubPages({ 1: { repositories: [] } }), store);
     expect(result).toMatchObject({ observed: 0, removed: 1 });
-    expect((await store.listRepositoryInventory(tenantId))[0]?.accessStatus).toBe("access_removed");
+    expect((await store.listRepositoryInventory(tenantId))[0]).toMatchObject({ accessStatus: "access_removed", selected: false });
   });
 
   it("follows exactly one page and keeps one repository accessible but unselected", async () => {

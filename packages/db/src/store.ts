@@ -95,6 +95,14 @@ export class RepositorySelectionError extends Error {
   }
 }
 
+export class InstallationResolutionError extends Error {
+  constructor(message = "Multiple active installations found for tenant") {
+    super(message);
+    this.name = "InstallationResolutionError";
+    Object.defineProperty(this, "code", { value: "multiple_active_installations", enumerable: true });
+  }
+}
+
 export type DeliveryRecord = {
   id: string;
   tenantId?: string;
@@ -168,6 +176,7 @@ export interface M1Store {
   updateInstallationSnapshot(input: { tenantId: string; githubInstallationId: number; permissions?: Record<string, string>; repositorySelection?: string }): Promise<void>;
   getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined>;
   listInstallations(tenantId: string): Promise<InstallationRecord[]>;
+  getActiveInstallationForTenant(tenantId: string): Promise<InstallationRecord | undefined>;
   saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord>;
   getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined>;
   getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
@@ -275,6 +284,11 @@ export class InMemoryM1Store implements M1Store {
   }
   async getInstallation(githubInstallationId: number): Promise<InstallationRecord | undefined> { return this.installations.get(githubInstallationId); }
   async listInstallations(tenantId: string): Promise<InstallationRecord[]> { return [...this.installations.values()].filter((installation) => installation.tenantId === tenantId).map((installation) => ({ ...installation })); }
+  async getActiveInstallationForTenant(tenantId: string): Promise<InstallationRecord | undefined> {
+    const active = [...this.installations.values()].filter((installation) => installation.tenantId === tenantId && (!installation.status || installation.status === "active"));
+    if (active.length > 1) throw new InstallationResolutionError();
+    return active[0] ? { ...active[0] } : undefined;
+  }
   async saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord> {
     const key = `${repository.tenantId}:${repository.githubRepositoryId}`;
     const previous = this.repositories.get(key);
@@ -282,18 +296,34 @@ export class InMemoryM1Store implements M1Store {
     this.repositories.set(key, saved);
     return { ...saved };
   }
-  async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> { const value = this.repositories.get(`${tenantId}:${githubRepositoryId}`); return value ? { ...value } : undefined; }
-  async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> { const value = [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.id === repositoryId); return value ? { ...value } : undefined; }
-  async getRepositoryByFullName(tenantId: string, fullName: string): Promise<RepositoryRecord | undefined> { const value = [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.fullName === fullName); return value ? { ...value } : undefined; }
-  async listRepositories(tenantId: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && repository.selected === true && (!repository.accessStatus || repositoryAccessIsAvailable(repository.accessStatus))).map((repository) => ({ ...repository })); }
+  async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> {
+    const installation = await this.getActiveInstallationForTenant(tenantId);
+    const value = this.repositories.get(`${tenantId}:${githubRepositoryId}`);
+    return value && installation?.id === value.installationId ? { ...value } : undefined;
+  }
+  async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
+    const installation = await this.getActiveInstallationForTenant(tenantId);
+    const value = [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.id === repositoryId && repository.installationId === installation?.id);
+    return value ? { ...value } : undefined;
+  }
+  async getRepositoryByFullName(tenantId: string, fullName: string): Promise<RepositoryRecord | undefined> {
+    const installation = await this.getActiveInstallationForTenant(tenantId);
+    const value = [...this.repositories.values()].find((repository) => repository.tenantId === tenantId && repository.fullName === fullName && repository.installationId === installation?.id);
+    return value ? { ...value } : undefined;
+  }
+  async listRepositories(tenantId: string): Promise<RepositoryRecord[]> {
+    const installation = await this.getActiveInstallationForTenant(tenantId);
+    if (!installation) return [];
+    return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && repository.installationId === installation.id && repository.selected === true && (!repository.accessStatus || repositoryAccessIsAvailable(repository.accessStatus))).map((repository) => ({ ...repository }));
+  }
   async listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && (!installationId || repository.installationId === installationId)).map((repository) => ({ ...repository })).sort((a, b) => a.fullName.localeCompare(b.fullName)); }
   async selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
     const repository = await this.getRepositoryById(tenantId, repositoryId);
     if (!repository) return undefined;
-    const installation = [...this.installations.values()].find((value) => value.tenantId === tenantId && value.id === repository.installationId);
-    if (!installation || (installation.status && installation.status !== "active")) return undefined;
+    const installation = await this.getActiveInstallationForTenant(tenantId);
+    if (!installation || installation.id !== repository.installationId) return undefined;
     if (repository.accessStatus && !repositoryAccessIsAvailable(repository.accessStatus)) return undefined;
-    const other = [...this.repositories.values()].find((value) => value.tenantId === tenantId && value.id !== repositoryId && value.selected === true);
+    const other = [...this.repositories.values()].find((value) => value.tenantId === tenantId && value.installationId === installation.id && value.id !== repositoryId && value.selected === true);
     if (other) throw new RepositorySelectionError();
     const { revokedAt: _revokedAt, ...withoutRevokedAt } = repository;
     const updated: RepositoryRecord = { ...withoutRevokedAt, selected: true, accessStatus: "accessible" };
@@ -348,7 +378,7 @@ export class InMemoryM1Store implements M1Store {
     for (const [key, repository] of this.repositories.entries()) {
       if (repository.tenantId !== input.tenantId || repository.installationId !== installation.id || repository.accessStatus === "access_removed" || repository.accessStatus === "disconnected") continue;
       if (observed.has(repository.githubRepositoryId)) continue;
-      this.repositories.set(key, { ...repository, accessStatus: "access_removed", revokedAt: input.observedAt });
+      this.repositories.set(key, { ...repository, accessStatus: "access_removed", selected: false, revokedAt: input.observedAt });
       removed += 1;
     }
     this.installations.set(input.githubInstallationId, { ...installation, lastInventoryAt: input.observedAt });
@@ -366,8 +396,8 @@ export class InMemoryM1Store implements M1Store {
     for (const [key, repository] of this.repositories.entries()) {
       if (repository.installationId !== installation.id) continue;
       const accessStatus = status === "suspended" ? "installation_suspended" : status === "active" ? "unavailable" : "disconnected";
-      if (status === "active") this.repositories.set(key, { ...repository, accessStatus });
-      else this.repositories.set(key, { ...repository, accessStatus, revokedAt: now });
+      if (status === "active") this.repositories.set(key, { ...repository, accessStatus, selected: false });
+      else this.repositories.set(key, { ...repository, accessStatus, selected: false, revokedAt: now });
     }
   }
 

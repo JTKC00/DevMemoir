@@ -37,13 +37,16 @@ async function processInstallationSignal(input: { deliveryId: string; payload: S
       await deps.store.updateInstallationLifecycle(installationGithubId, "suspended", now());
     } else if (input.payload.action === "deleted") {
       await deps.store.updateInstallationLifecycle(installationGithubId, "deleted", now());
-    } else if (input.payload.action === "created" || input.payload.action === "unsuspend") {
+    } else if (input.payload.action === "created" || input.payload.action === "unsuspend" || input.payload.action === "new_permissions_accepted") {
       await deps.store.updateInstallationLifecycle(installationGithubId, "active", now());
       await enqueueInventorySignal({ tenantId, installationGithubId, operationId: input.deliveryId }, deps);
     }
   } else if (eventName === "installation_repositories" || eventName === "repository") {
     const installation = await deps.store.getInstallation(installationGithubId);
-    if (installation?.status === "suspended" || installation?.status === "deleted" || installation?.status === "disconnected") return;
+    if (installation?.status === "suspended" || installation?.status === "deleted" || installation?.status === "disconnected") {
+      await deps.store.updateDelivery(input.deliveryId, { state: "ignored", processedAt: now() }, tenantId);
+      return;
+    }
     await enqueueInventorySignal({ tenantId, installationGithubId, operationId: input.deliveryId }, deps);
   }
   await deps.store.updateDelivery(input.deliveryId, { state: "processed", processedAt: now() }, tenantId);

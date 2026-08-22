@@ -50,12 +50,13 @@ export default async function ConnectPage({ searchParams }: { searchParams: Prom
       {options.repositories.length === 0 ? <p className="muted">No accessible repositories are recorded yet.</p> : <div className="repository-list">
         {options.repositories.map((repository) => {
           const accessible = repository.accessStatus === "accessible";
+          const activelyTracking = accessible && repository.selected;
           return <article className="repository-row" key={repository.id}>
             <div><strong>{repository.fullName}</strong> <span className="muted">{repository.private ? "private" : "public"}</span></div>
             <div className="muted">GitHub access: {accessible ? "accessible" : repository.accessStatus.replaceAll("_", " ")}</div>
-            <div className="muted">DevMemoir: {repository.selected ? "actively tracking" : "not selected"}{repository.lastAuthoritativeObservedAt ? ` · observed ${new Date(repository.lastAuthoritativeObservedAt).toLocaleString()}` : ""}</div>
+            <div className="muted">DevMemoir: {activelyTracking ? "actively tracking" : accessible ? "not selected" : "not tracking (access unavailable)"}{repository.lastAuthoritativeObservedAt ? ` · observed ${new Date(repository.lastAuthoritativeObservedAt).toLocaleString()}` : ""}</div>
             {repository.archived || repository.disabled ? <div className="muted">{repository.archived ? "archived" : ""}{repository.archived && repository.disabled ? " · " : ""}{repository.disabled ? "disabled" : ""}</div> : null}
-            {repository.selected ? <form action={unselectRepository}><input type="hidden" name="repositoryId" value={repository.id} /><button type="submit">Stop tracking</button></form> : null}
+            {activelyTracking ? <form action={unselectRepository}><input type="hidden" name="repositoryId" value={repository.id} /><button type="submit">Stop tracking</button></form> : null}
           </article>;
         })}
       </div>}

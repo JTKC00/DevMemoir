@@ -1,6 +1,6 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { createId, deliveryRedeliveryAction, repositoryAccessIsAvailable, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
-import { RepositorySelectionError } from "./store.js";
+import { InstallationResolutionError, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
   AuthTransactionRecord,
@@ -276,6 +276,14 @@ export class PostgresM1Store implements M1Store {
     });
   }
 
+  async getActiveInstallationForTenant(tenantId: string): Promise<InstallationRecord | undefined> {
+    return this.tenantQuery(tenantId, async (client) => {
+      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.tenant_id=$1 and gi.status='active' limit 2", [tenantId]);
+      if (result.rows.length > 1) throw new InstallationResolutionError();
+      return installationFromRow(result.rows[0]);
+    });
+  }
+
   async saveRepository(repository: RepositoryRecord): Promise<RepositoryRecord> {
     const savedId = await this.tenantQuery(repository.tenantId, async (client) => {
       const result = await client.query<Row>(`insert into repositories (id,tenant_id,github_repository_id,owner_login,name,full_name,private,visibility,default_branch,description,archived_at,disabled,first_seen_at,last_seen_at,last_authoritative_observed_at,created_at,updated_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,coalesce($13,now()),$14,$15,now(),now()) on conflict (tenant_id,github_repository_id) do update set owner_login=excluded.owner_login,name=excluded.name,full_name=excluded.full_name,private=excluded.private,visibility=excluded.visibility,default_branch=excluded.default_branch,description=excluded.description,archived_at=excluded.archived_at,disabled=excluded.disabled,updated_at=now() returning id`, [repository.id, repository.tenantId, repository.githubRepositoryId, repository.ownerLogin, repository.name, repository.fullName, repository.private, repository.visibility ?? null, repository.defaultBranch, repository.description ?? null, repository.archived ? new Date() : null, repository.disabled ?? false, repository.firstSeenAt ?? null, repository.lastSeenAt ?? null, repository.lastAuthoritativeObservedAt ?? null]);
@@ -287,20 +295,22 @@ export class PostgresM1Store implements M1Store {
   }
 
   async getRepositoryByGithubId(tenantId: string, githubRepositoryId: number): Promise<RepositoryRecord | undefined> {
-    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select installation_id,access_status,selected,revoked_at from repository_access where repository_id=r.id and tenant_id=r.tenant_id order by selected desc, selected_at desc nulls last limit 1) ra on true where r.tenant_id=$1 and r.github_repository_id=$2", [tenantId, githubRepositoryId])).rows[0]));
+    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select ra.installation_id,ra.access_status,ra.selected,ra.revoked_at from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.repository_id=r.id and ra.tenant_id=r.tenant_id and gi.status='active' order by ra.selected desc, ra.selected_at desc nulls last limit 1) ra on true where r.tenant_id=$1 and r.github_repository_id=$2", [tenantId, githubRepositoryId])).rows[0]));
   }
 
   async getRepositoryById(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
-    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select installation_id,access_status,selected,revoked_at from repository_access where repository_id=r.id and tenant_id=r.tenant_id order by selected desc, selected_at desc nulls last limit 1) ra on true where r.tenant_id=$1 and r.id=$2", [tenantId, repositoryId])).rows[0]));
+    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select ra.installation_id,ra.access_status,ra.selected,ra.revoked_at from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.repository_id=r.id and ra.tenant_id=r.tenant_id and gi.status='active' order by ra.selected desc, ra.selected_at desc nulls last limit 1) ra on true where r.tenant_id=$1 and r.id=$2", [tenantId, repositoryId])).rows[0]));
   }
 
   async getRepositoryByFullName(tenantId: string, fullName: string): Promise<RepositoryRecord | undefined> {
-    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select installation_id,access_status,selected,revoked_at from repository_access where repository_id=r.id and tenant_id=r.tenant_id order by selected desc, selected_at desc nulls last limit 1) ra on true where r.tenant_id=$1 and r.full_name=$2", [tenantId, fullName])).rows[0]));
+    return this.tenantQuery(tenantId, async (client) => repositoryFromRow((await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select ra.installation_id,ra.access_status,ra.selected,ra.revoked_at from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.repository_id=r.id and ra.tenant_id=r.tenant_id and gi.status='active' order by ra.selected desc, ra.selected_at desc nulls last limit 1) ra on true where r.tenant_id=$1 and r.full_name=$2", [tenantId, fullName])).rows[0]));
   }
 
   async listRepositories(tenantId: string): Promise<RepositoryRecord[]> {
+    const activeInstallation = await this.getActiveInstallationForTenant(tenantId);
+    if (!activeInstallation) return [];
     return this.tenantQuery(tenantId, async (client) => {
-      const result = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select installation_id,access_status,selected,revoked_at from repository_access where repository_id=r.id and tenant_id=r.tenant_id and selected=true and access_status='accessible' order by selected_at desc limit 1) ra on true where r.tenant_id=$1 order by r.created_at asc", [tenantId]);
+      const result = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select ra.installation_id,ra.access_status,ra.selected,ra.revoked_at from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.repository_id=r.id and ra.tenant_id=r.tenant_id and gi.status='active' and ra.selected=true and ra.access_status='accessible' order by ra.selected_at desc limit 1) ra on true where r.tenant_id=$1 order by r.created_at asc", [tenantId]);
       return result.rows.map((row) => repositoryFromRow(row)).filter((row): row is RepositoryRecord => Boolean(row));
     });
   }
@@ -317,7 +327,8 @@ export class PostgresM1Store implements M1Store {
       const current = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join repository_access ra on ra.repository_id=r.id and ra.tenant_id=r.tenant_id join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where r.tenant_id=$1 and r.id=$2 and gi.status='active' for update", [tenantId, repositoryId]);
       const row = current.rows[0];
       if (!row || !row.access_status || !repositoryAccessIsAvailable(row.access_status as RepositoryAccessStatus)) return undefined;
-      const conflict = await client.query<Row>("select 1 from repository_access where tenant_id=$1 and selected=true and repository_id<>$2 limit 1", [tenantId, repositoryId]);
+      await client.query("update repository_access ra set selected=false where ra.tenant_id=$1 and ra.selected=true and exists (select 1 from github_installations gi where gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id and gi.status<>'active')", [tenantId]);
+      const conflict = await client.query<Row>("select 1 from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.tenant_id=$1 and ra.selected=true and gi.status='active' and ra.repository_id<>$2 limit 1", [tenantId, repositoryId]);
       if (conflict.rows.length > 0) throw new RepositorySelectionError();
       await client.query("update repository_access set access_status='accessible',selected=true,selected_at=coalesce(selected_at,now()),revoked_at=null where tenant_id=$1 and repository_id=$2 and installation_id=$3", [tenantId, repositoryId, row.installation_id]);
       return repositoryFromRow({ ...row, access_status: "accessible", selected: true, revoked_at: null });
@@ -326,7 +337,7 @@ export class PostgresM1Store implements M1Store {
 
   async unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
     return this.tenantQuery(tenantId, async (client) => {
-      const current = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join repository_access ra on ra.repository_id=r.id and ra.tenant_id=r.tenant_id where r.tenant_id=$1 and r.id=$2 for update", [tenantId, repositoryId]);
+      const current = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join repository_access ra on ra.repository_id=r.id and ra.tenant_id=r.tenant_id join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where r.tenant_id=$1 and r.id=$2 and gi.status='active' for update", [tenantId, repositoryId]);
       const row = current.rows[0];
       if (!row) return undefined;
       if (row.access_status && !repositoryAccessIsAvailable(row.access_status as RepositoryAccessStatus)) {
@@ -362,7 +373,7 @@ export class PostgresM1Store implements M1Store {
         if (existing) updated += 1; else added += 1;
       }
       const ids = [...observed.keys()];
-      const absent = await client.query<Row>("update repository_access ra set access_status='access_removed',revoked_at=$3 where ra.tenant_id=$1 and ra.installation_id=$2 and ra.access_status in ('accessible','installation_suspended','unavailable') and not (ra.repository_id in (select r.id from repositories r where r.tenant_id=$1 and r.github_repository_id=any($4::bigint[]))) returning ra.id", [input.tenantId, installationId, input.observedAt, ids]);
+      const absent = await client.query<Row>("update repository_access ra set access_status='access_removed',selected=false,revoked_at=$3 where ra.tenant_id=$1 and ra.installation_id=$2 and ra.access_status in ('accessible','installation_suspended','unavailable') and not (ra.repository_id in (select r.id from repositories r where r.tenant_id=$1 and r.github_repository_id=any($4::bigint[]))) returning ra.id", [input.tenantId, installationId, input.observedAt, ids]);
       await client.query("update github_installations set last_inventory_at=$3,updated_at=now() where tenant_id=$1 and id=$2", [input.tenantId, installationId, input.observedAt]);
       return { observed: observed.size, added, updated, removed: absent.rowCount ?? 0 };
     });
@@ -376,8 +387,8 @@ export class PostgresM1Store implements M1Store {
       const statusSql = status === "suspended" ? "suspended" : status === "active" ? "active" : status;
       await client.query("update github_installations set status=$2,suspended_at=case when $2='suspended' then $3 else null end,deleted_at=case when $2 in ('deleted','disconnected') then $3 else null end,updated_at=now() where tenant_id=$1 and github_installation_id=$4", [tenantId, statusSql, now, githubInstallationId]);
       const accessStatus = status === "suspended" ? "installation_suspended" : status === "active" ? "unavailable" : "disconnected";
-      if (status === "active") await client.query("update repository_access set access_status='unavailable' where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$2)", [tenantId, githubInstallationId]);
-      else await client.query("update repository_access set access_status=$2,revoked_at=$3 where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$4)", [tenantId, accessStatus, now, githubInstallationId]);
+      if (status === "active") await client.query("update repository_access set access_status='unavailable',selected=false where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$2)", [tenantId, githubInstallationId]);
+      else await client.query("update repository_access set access_status=$2,selected=false,revoked_at=$3 where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$4)", [tenantId, accessStatus, now, githubInstallationId]);
     });
   }
 
