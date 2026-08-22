@@ -39,6 +39,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Assert PostgreSQL integration configuration
+        run: test -n "$TEST_DATABASE_URL"
       - run: pnpm db:migrate
       - run: pnpm typecheck
       - run: pnpm lint

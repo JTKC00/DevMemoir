@@ -17,14 +17,14 @@ export type QueueDependencies = {
 export async function processBackfill(payload: SyncJobPayload, deps: QueueDependencies): Promise<void> {
   if (!payload.tenantId) throw new Error("Backfill job is missing tenant context");
   if (!payload.repositoryId || !payload.installationId) throw new Error("Backfill job is missing repository or installation context");
-  const repository = await deps.store.getRepositoryById(payload.tenantId, payload.repositoryId);
-  if (!repository) throw new Error("Repository not found for backfill");
-  if (repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) {
+  const installation = await deps.store.getInstallation(payload.installationId);
+  if (!installation || (installation.status && installation.status !== "active")) {
     if (payload.deliveryId) await deps.store.updateDelivery(payload.deliveryId, { state: "ignored", processedAt: new Date() }, payload.tenantId);
     return;
   }
-  const installation = await deps.store.getInstallation(payload.installationId);
-  if (installation && installation.status && installation.status !== "active") {
+  const repository = await deps.store.getRepositoryById(payload.tenantId, payload.repositoryId);
+  if (!repository) throw new Error("Repository not found for backfill");
+  if (repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) {
     if (payload.deliveryId) await deps.store.updateDelivery(payload.deliveryId, { state: "ignored", processedAt: new Date() }, payload.tenantId);
     return;
   }

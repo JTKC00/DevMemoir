@@ -74,7 +74,7 @@ describe("worker delivery contract", () => {
       const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: `lifecycle-${action}`, eventName: "installation", action, installationGithubId: 22, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
       await processDelivery({ deliveryId: delivery.record.id, payload: { tenantId: "tenant-1", deliveryId: delivery.record.id, eventName: "installation", action, installationGithubId: 22 } }, { config, store, jobs, githubForInstallation: () => { throw new Error("must not mint installation client"); }, logger: createLogger() });
       expect(store.installations.get(22)?.status).toBe(expectedStatus);
-      expect((await store.listRepositoryInventory("tenant-1"))[0]?.accessStatus).toBe(expectedAccess);
+      expect((await store.listRepositoryInventory("tenant-1"))[0]).toMatchObject({ accessStatus: expectedAccess, selected: false });
     }
   });
 
@@ -90,6 +90,34 @@ describe("worker delivery contract", () => {
     await processDelivery({ deliveryId: unsuspended.record.id, payload: { tenantId: "tenant-1", deliveryId: unsuspended.record.id, eventName: "installation", action: "unsuspend", installationGithubId: 22 } }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
     expect((await store.listRepositoryInventory("tenant-1"))[0]?.accessStatus).toBe("unavailable");
     expect([...jobs.jobs.values()].map((job) => job.kind)).toEqual(["installation_inventory"]);
+  });
+
+  it("terminalizes a repository signal after suspension and keeps duplicate delivery a no-op", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
+    await store.saveRepository({ id: "repository-1", tenantId: "tenant-1", installationId: "installation-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: true, defaultBranch: "main" });
+    await store.updateInstallationLifecycle(22, "suspended", new Date());
+    const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: "stale-after-suspend", eventName: "repository", action: "edited", installationGithubId: 22, repositoryGithubId: 10, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
+    const payload = { tenantId: "tenant-1", deliveryId: delivery.record.id, eventName: "repository", action: "edited", installationGithubId: 22, repositoryGithubId: 10 } as const;
+    await processDelivery({ deliveryId: delivery.record.id, payload }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
+    expect(store.deliveries.get("stale-after-suspend")).toMatchObject({ state: "ignored", processingAttempts: 1, processedAt: expect.any(Date) });
+    await processDelivery({ deliveryId: delivery.record.id, payload }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
+    expect(store.deliveries.get("stale-after-suspend")?.state).toBe("ignored");
+    expect(store.deliveries.get("stale-after-suspend")?.processingAttempts).toBe(1);
+  });
+
+  it("terminalizes an installation repository signal after deletion", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
+    await store.updateInstallationLifecycle(22, "deleted", new Date());
+    const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: "stale-after-delete", eventName: "installation_repositories", action: "removed", installationGithubId: 22, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
+    await processDelivery({ deliveryId: delivery.record.id, payload: { tenantId: "tenant-1", deliveryId: delivery.record.id, eventName: "installation_repositories", action: "removed", installationGithubId: 22 } }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
+    expect(store.deliveries.get("stale-after-delete")).toMatchObject({ state: "ignored", processingAttempts: 1, processedAt: expect.any(Date) });
+    expect(jobs.jobs.size).toBe(0);
   });
 
   it("logs inventory counts without private repository metadata", async () => {
