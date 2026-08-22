@@ -384,8 +384,13 @@ export class PostgresM1Store implements M1Store {
     const tenantId = route.rows[0]?.tenant_id;
     if (!tenantId) return;
     await this.tenantQuery(String(tenantId), async (client) => {
-      const statusSql = status === "suspended" ? "suspended" : status === "active" ? "active" : status;
-      await client.query("update github_installations set status=$2::varchar,suspended_at=case when $2::varchar='suspended' then $3 else null end,deleted_at=case when $2::varchar in ('deleted','disconnected') then $3 else null end,updated_at=now() where tenant_id=$1 and github_installation_id=$4", [tenantId, statusSql, now, githubInstallationId]);
+      if (status === "suspended") {
+        await client.query("update github_installations set status='suspended',suspended_at=$2::timestamptz,deleted_at=null,updated_at=now() where tenant_id=$1 and github_installation_id=$3", [tenantId, now, githubInstallationId]);
+      } else if (status === "active") {
+        await client.query("update github_installations set status='active',suspended_at=null,deleted_at=null,updated_at=now() where tenant_id=$1 and github_installation_id=$2", [tenantId, githubInstallationId]);
+      } else {
+        await client.query("update github_installations set status=$2::varchar,suspended_at=null,deleted_at=$3::timestamptz,updated_at=now() where tenant_id=$1 and github_installation_id=$4", [tenantId, status, now, githubInstallationId]);
+      }
       const accessStatus = status === "suspended" ? "installation_suspended" : status === "active" ? "unavailable" : "disconnected";
       if (status === "active") await client.query("update repository_access set access_status='unavailable',selected=false where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$2)", [tenantId, githubInstallationId]);
       else await client.query("update repository_access set access_status=$2,selected=false,revoked_at=$3 where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$4)", [tenantId, accessStatus, now, githubInstallationId]);
