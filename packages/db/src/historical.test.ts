@@ -40,6 +40,15 @@ describe("M3 historical persistence", () => {
     expect(await store.getHistoricalSourceCounts("tenant-a", repository.id)).toMatchObject({ commits: 1 });
   });
 
+  it("never shortens a later durable installation pause", async () => {
+    const { store } = await selectedStore();
+    const later = new Date("2026-01-01T01:00:00Z");
+    const earlier = new Date("2026-01-01T00:30:00Z");
+    await store.pauseInstallationApi({ tenantId: "tenant-a", installationId: "installation-a", pausedUntil: later, reason: "github_primary_rate_limit" });
+    await store.pauseInstallationApi({ tenantId: "tenant-a", installationId: "installation-a", pausedUntil: earlier, reason: "github_retry_after" });
+    expect(store.installations.get(101)).toMatchObject({ apiPausedUntil: later, apiPauseReason: "github_primary_rate_limit" });
+  });
+
   it("does not regress mutable metadata from an older source timestamp", async () => {
     const { store, repository } = await selectedStore();
     const commits = await initialize(store, "tenant-a", repository.id, "installation-a");

@@ -815,7 +815,7 @@ export class InMemoryM1Store implements M1Store {
 
   async pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void> {
     const installation = [...this.installations.values()].find((value) => value.id === input.installationId && value.tenantId === input.tenantId);
-    if (installation) Object.assign(installation, { apiPausedUntil: input.pausedUntil, apiPauseReason: input.reason });
+    if (installation && (!installation.apiPausedUntil || installation.apiPausedUntil <= input.pausedUntil)) Object.assign(installation, { apiPausedUntil: input.pausedUntil, apiPauseReason: input.reason });
   }
 
   async resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void> {

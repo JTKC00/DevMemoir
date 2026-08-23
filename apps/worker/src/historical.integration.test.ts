@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPool, PostgresM1Store } from "@devmemoir/db";
-import type { GithubClient, GithubCommit } from "@devmemoir/github";
+import { GithubRateLimitPauseError, InstallationRequestLanes, type GithubClient, type GithubCommit, type GithubRequestResponse } from "@devmemoir/github";
 import { historicalBackfillLogicalKey, PgBossJobPort, type SyncJobPayload } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
 import { processHistoricalBackfill } from "./historical.js";
@@ -185,7 +185,6 @@ describeIntegration("M3 PostgreSQL + pg-boss historical restart boundaries", () 
     const firstPool = createPool(databaseUrl as string, 3);
     const firstStore = new PostgresM1Store(firstPool);
     const firstBoss = new PgBossJobPort(databaseUrl as string);
-    scope.pools.push(firstPool);
     scope.bosses.push(firstBoss);
     await firstBoss.start();
     let committed!: () => void;
@@ -217,5 +216,152 @@ describeIntegration("M3 PostgreSQL + pg-boss historical restart boundaries", () 
     expect(branchStarts).toBeGreaterThan(0);
     expect(await replacementStore.getHistoricalSourceCounts(scope.tenantId, scope.repositoryId)).toMatchObject({ commits: 101 });
     expect((await replacementStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "completed"))?.status).toBe("completed");
+  }, 90_000);
+
+  it("keeps an explicit rate-limit pause durable across a replacement worker", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    let nowMs = Date.parse("2026-08-23T00:00:00Z");
+    const resumeAt = new Date(nowMs + 30_000);
+    let mode: "rate" | "ok" = "rate";
+    let requestCount = 0;
+    const client: GithubClient = {
+      getUser: async () => ({ id: scope.accountGithubId, login: "owner", type: "User" }),
+      exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+      getInstallation: async () => ({ id: scope.installationGithubId, account: { id: scope.accountGithubId, login: "owner", type: "User" } }),
+      listInstallationRepositories: async () => ({ repositories: [] }),
+      getRepository: async () => ({ id: scope.accountGithubId + 1, name: "private-repository", full_name: "private-owner/private-repository", private: true, default_branch: "main" }),
+      getRefHead: async () => {
+        requestCount += 1;
+        if (mode === "rate") throw new GithubRateLimitPauseError("secondary_rate_limit", 429, resumeAt);
+        return "head";
+      },
+      listCommits: async () => { requestCount += 1; return { commits: [commit("explicit-pause-sha")] }; },
+      getCommit: async () => commit("head"),
+      listBranches: async () => ({ branches: [] }),
+      listTags: async () => ({ tags: [] }),
+      listPullRequests: async () => ({ pullRequests: [] }),
+      listIssues: async () => ({ issues: [] }),
+      listReleases: async () => ({ releases: [] }),
+    };
+    const payload: SyncJobPayload = { kind: "repository_backfill", tenantId: scope.tenantId, repositoryId: scope.repositoryId, installationId: scope.installationGithubId };
+    const firstPool = createPool(databaseUrl as string, 3);
+    const firstStore = new PostgresM1Store(firstPool);
+    const firstBoss = new PgBossJobPort(databaseUrl as string);
+    scope.bosses.push(firstBoss);
+    await firstBoss.start();
+    const firstDeps = { store: firstStore, jobs: firstBoss, githubForInstallation: () => client, logger: createLogger(() => undefined), ownerGithubAccountId: scope.accountGithubId, now: () => new Date(nowMs) };
+
+    await processHistoricalBackfill(payload, firstDeps);
+    expect(requestCount).toBe(1);
+    await expect(firstStore.getInstallation(scope.installationGithubId)).resolves.toMatchObject({ apiPausedUntil: resumeAt, apiPauseReason: "github_secondary_rate_limit" });
+    await expect(firstStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "default_branch_commits", "main")).resolves.toMatchObject({ status: "paused", cursor: { nextPage: 1 } });
+    await processHistoricalBackfill(payload, firstDeps);
+    expect(requestCount).toBe(1);
+    await firstBoss.stop();
+    await firstPool.end();
+
+    const replacementPool = createPool(databaseUrl as string, 3);
+    const replacementStore = new PostgresM1Store(replacementPool);
+    const replacementBoss = new PgBossJobPort(databaseUrl as string);
+    scope.pools.push(replacementPool);
+    scope.bosses.push(replacementBoss);
+    await replacementBoss.start();
+    const replacementDeps = { store: replacementStore, jobs: replacementBoss, githubForInstallation: () => client, logger: createLogger(() => undefined), ownerGithubAccountId: scope.accountGithubId, now: () => new Date(nowMs) };
+
+    await processHistoricalBackfill(payload, replacementDeps);
+    expect(requestCount).toBe(1);
+    expect((await replacementStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "default_branch_commits", "main"))?.cursor.nextPage).toBe(1);
+    const wakeRows = await scope.admin.query<{ count: string }>("select count(*)::text as count from sync_jobs where tenant_id=$1 and logical_key like $2", [scope.tenantId, `backfill:${scope.repositoryId}:default_branch_commits:%:wake:%`]);
+    expect(wakeRows.rows[0]?.count).toBe("1");
+
+    nowMs = resumeAt.getTime();
+    mode = "ok";
+    await processHistoricalBackfill(payload, replacementDeps);
+    expect(requestCount).toBe(4);
+    expect(await replacementStore.getHistoricalSourceCounts(scope.tenantId, scope.repositoryId)).toMatchObject({ commits: 1 });
+    expect((await replacementStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "branches"))?.status).toBe("in_progress");
+    expect((await replacementStore.getInstallation(scope.installationGithubId))?.apiPausedUntil).toBeUndefined();
+  }, 90_000);
+
+  it("persists a successful remaining-zero response across fresh store, lane, and pg-boss adapters", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    let nowMs = Date.parse("2026-08-23T00:00:00Z");
+    const resetAt = new Date(nowMs + 30_000);
+    let requestCount = 0;
+    const makeGithub = (lane: InstallationRequestLanes): GithubClient => {
+      const response = async <T>(data: T, headers: Record<string, string> = {}): Promise<GithubRequestResponse<T>> => {
+        requestCount += 1;
+        return { status: 200, headers, data };
+      };
+      return {
+        getUser: async () => ({ id: scope.accountGithubId, login: "owner", type: "User" }),
+        exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+        getInstallation: async () => ({ id: scope.installationGithubId, account: { id: scope.accountGithubId, login: "owner", type: "User" } }),
+        listInstallationRepositories: async () => ({ repositories: [] }),
+        getRepository: async () => ({ id: scope.accountGithubId + 1, name: "private-repository", full_name: "private-owner/private-repository", private: true, default_branch: "main" }),
+        getRefHead: async () => {
+          const raw = await lane.run(scope.installationGithubId, () => response({ object: { sha: "head" } }, { "X-RateLimit-Remaining": "1" }));
+          return (raw.data as { object: { sha: string } }).object.sha;
+        },
+        listCommits: async ({ page = 1 }) => {
+          const headers = page === 1 && nowMs < resetAt.getTime()
+            ? { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String(resetAt.getTime() / 1000) }
+            : { "X-RateLimit-Remaining": "1" };
+          const raw = await lane.run(scope.installationGithubId, () => response({ commits: [{ ...commit("durable-sha"), repositoryId: "" }], ...(page === 1 && nowMs < resetAt.getTime() ? { nextPage: 2 } : {}) }, headers));
+          return raw.data as { commits: GithubCommit[]; nextPage?: number };
+        },
+        getCommit: async () => commit("head"),
+        listBranches: async () => ({ branches: [] }),
+        listTags: async () => ({ tags: [] }),
+        listPullRequests: async () => ({ pullRequests: [] }),
+        listIssues: async () => ({ issues: [] }),
+        listReleases: async () => ({ releases: [] }),
+      };
+    };
+
+    const firstPool = createPool(databaseUrl as string, 3);
+    const firstStore = new PostgresM1Store(firstPool);
+    const firstBoss = new PgBossJobPort(databaseUrl as string);
+    scope.bosses.push(firstBoss);
+    await firstBoss.start();
+    const firstLane = new InstallationRequestLanes(1, () => nowMs, async (installationId, state) => {
+      const installation = await firstStore.getInstallation(installationId);
+      if (installation) await firstStore.pauseInstallationApi({ tenantId: installation.tenantId, installationId: installation.id, pausedUntil: state.resumeAt, reason: `github_${state.code}` });
+    });
+    const firstGithub = makeGithub(firstLane);
+    const payload: SyncJobPayload = { kind: "repository_backfill", tenantId: scope.tenantId, repositoryId: scope.repositoryId, installationId: scope.installationGithubId };
+    const firstDeps = { store: firstStore, jobs: firstBoss, githubForInstallation: () => firstGithub, logger: createLogger(() => undefined), ownerGithubAccountId: scope.accountGithubId, now: () => new Date(nowMs) };
+
+    await firstBoss.enqueue("repository_backfill", historicalBackfillLogicalKey(scope.repositoryId, "coordinator"), payload);
+    await processHistoricalBackfill(payload, firstDeps);
+    expect(requestCount).toBe(2);
+    await expect(firstStore.getInstallation(scope.installationGithubId)).resolves.toMatchObject({ apiPausedUntil: resetAt, apiPauseReason: "github_primary_rate_limit" });
+    expect((await firstStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "default_branch_commits", "main"))?.cursor.nextPage).toBe(1);
+    await firstBoss.stop();
+    await firstPool.end();
+
+    const replacementPool = createPool(databaseUrl as string, 3);
+    const replacementStore = new PostgresM1Store(replacementPool);
+    const replacementBoss = new PgBossJobPort(databaseUrl as string);
+    scope.pools.push(replacementPool);
+    scope.bosses.push(replacementBoss);
+    await replacementBoss.start();
+    const replacementLane = new InstallationRequestLanes(1, () => nowMs);
+    const replacementGithub = makeGithub(replacementLane);
+    const replacementDeps = { store: replacementStore, jobs: replacementBoss, githubForInstallation: () => replacementGithub, logger: createLogger(() => undefined), ownerGithubAccountId: scope.accountGithubId, now: () => new Date(nowMs) };
+
+    await processHistoricalBackfill(payload, replacementDeps);
+    expect(requestCount).toBe(2);
+    expect((await replacementStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "default_branch_commits", "main"))?.cursor.nextPage).toBe(1);
+    expect(await replacementStore.getHistoricalSourceCounts(scope.tenantId, scope.repositoryId)).toMatchObject({ commits: 0 });
+
+    nowMs = resetAt.getTime();
+    await processHistoricalBackfill(payload, replacementDeps);
+    expect((await replacementStore.getHistoricalSourceCounts(scope.tenantId, scope.repositoryId)).commits).toBe(1);
+    expect((await replacementStore.getHistoricalProgress(scope.tenantId, scope.repositoryId, "branches"))?.status).toBe("in_progress");
+    expect((await replacementStore.getInstallation(scope.installationGithubId))?.apiPausedUntil).toBeUndefined();
+    expect(requestCount).toBe(5);
   }, 90_000);
 });

@@ -1,8 +1,10 @@
 import {
   HISTORICAL_STAGES,
   type HistoricalCursor,
+  type HistoricalPageCommitResult,
   type HistoricalProgress,
   type HistoricalSourceStage,
+  type InstallationRecord,
   type M1Store,
   type RepositoryRecord,
 } from "@devmemoir/db";
@@ -19,6 +21,7 @@ import {
   type SyncJobPayload,
 } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
+import { ensureInstallationApiAvailable, guardInstallationGithub } from "./durable-github.js";
 
 export const HISTORICAL_PAGE_SIZE = 100;
 export const RECENT_REFRESH_WINDOW_MS = 24 * 60 * 60 * 1_000;
@@ -33,6 +36,7 @@ export type HistoricalDependencies = {
 };
 
 type ActivePosition = HistoricalProgress & { stage: HistoricalSourceStage };
+type HistoricalScope = { tenantId: string; installationId: number; installation: InstallationRecord; repository: RepositoryRecord };
 
 function isSourceStage(stage: HistoricalProgress["stage"]): stage is HistoricalSourceStage {
   return stage !== "completed";
@@ -102,22 +106,51 @@ async function enqueuePosition(
 async function enqueueCurrent(
   input: { tenantId: string; repositoryId: string; installationId: number },
   deps: HistoricalDependencies,
+  startAfter?: Date,
+  wakeIdentity?: string,
 ): Promise<void> {
   const progress = activePosition(await deps.store.listHistoricalProgress(input.tenantId, input.repositoryId));
   if (!progress) return;
-  await enqueuePosition(input, progress, deps, progress.status === "paused" ? progress.pausedUntil : undefined);
+  await enqueuePosition(input, progress, deps, startAfter ?? (progress.status === "paused" ? progress.pausedUntil : undefined), wakeIdentity);
+}
+
+async function enqueueHistoricalWake(
+  payload: SyncJobPayload,
+  scope: HistoricalScope,
+  deps: HistoricalDependencies,
+  resumeAt: Date,
+): Promise<void> {
+  const input = { tenantId: scope.tenantId, repositoryId: scope.repository.id, installationId: scope.installationId };
+  const progress = activePosition(await deps.store.listHistoricalProgress(scope.tenantId, scope.repository.id));
+  if (progress) {
+    await enqueuePosition(input, progress, deps, resumeAt, String(resumeAt.getTime()));
+    return;
+  }
+
+  // A paused coordinator may not have created cursors yet. Keep the durable
+  // cursor absent and schedule one timestamped wake for the same coordinator.
+  const logicalKey = `${historicalBackfillLogicalKey(scope.repository.id, "coordinator")}:wake:${resumeAt.getTime()}`;
+  const wakePayload: SyncJobPayload = {
+    ...payload,
+    kind: "repository_backfill",
+    tenantId: scope.tenantId,
+    repositoryId: scope.repository.id,
+    installationId: scope.installationId,
+  };
+  await deps.store.ensureJob(logicalKey, wakePayload as Record<string, unknown>);
+  await deps.jobs.enqueue("repository_backfill", logicalKey, wakePayload, { startAfter: resumeAt });
 }
 
 async function gate(
   payload: SyncJobPayload,
   deps: HistoricalDependencies,
-): Promise<{ tenantId: string; installationId: number; repository: RepositoryRecord } | undefined> {
+): Promise<HistoricalScope | undefined> {
   if (!payload.tenantId || !payload.repositoryId || !payload.installationId) throw new Error("Historical job is missing opaque scope");
   const installation = await deps.store.getInstallation(payload.installationId);
   if (!installation || installation.tenantId !== payload.tenantId || (installation.status && installation.status !== "active")) return undefined;
   const repository = await deps.store.getRepositoryById(payload.tenantId, payload.repositoryId);
   if (!repository || repository.installationId !== installation.id || repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) return undefined;
-  return { tenantId: payload.tenantId, installationId: payload.installationId, repository };
+  return { tenantId: payload.tenantId, installationId: payload.installationId, installation, repository };
 }
 
 function sanitizedAccessCode(error: GithubAccessError): string {
@@ -180,7 +213,7 @@ async function pauseForRateLimit(
 async function commitDefaultBranchPage(
   input: { tenantId: string; installationId: number; repository: RepositoryRecord; progress: ActivePosition; github: GithubClient; observedAt: Date },
   deps: HistoricalDependencies,
-): Promise<void> {
+): Promise<HistoricalPageCommitResult> {
   const ref = `refs/heads/${input.repository.defaultBranch}`;
   const currentHead = await input.github.getRefHead({ owner: input.repository.ownerLogin, repo: input.repository.name, ref });
   if (!currentHead) throw new GithubAccessError("not_found", 404);
@@ -194,7 +227,7 @@ async function commitDefaultBranchPage(
       anchorHeadSha: currentHead,
       now: input.observedAt,
     });
-    if (!reset) return;
+    if (!reset) return { applied: false, reason: "gated", progress: input.progress };
     progress = reset as ActivePosition;
   }
   const page = progress.cursor.nextPage;
@@ -204,10 +237,10 @@ async function commitDefaultBranchPage(
     const publishHead = await input.github.getRefHead({ owner: input.repository.ownerLogin, repo: input.repository.name, ref });
     if (publishHead !== currentHead) {
       if (publishHead) await deps.store.resetCommitTraversal({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, refName: input.repository.defaultBranch, anchorHeadSha: publishHead, now: input.observedAt });
-      return;
+      return { applied: false, reason: "checkpoint_mismatch", progress };
     }
   }
-  await deps.store.commitHistoricalPage({
+  return deps.store.commitHistoricalPage({
     tenantId: input.tenantId,
     repositoryId: input.repository.id,
     installationId: input.repository.installationId,
@@ -229,22 +262,21 @@ async function commitDefaultBranchPage(
 async function commitInventoryPage(
   input: { tenantId: string; repository: RepositoryRecord; progress: ActivePosition; github: GithubClient; observedAt: Date },
   deps: HistoricalDependencies,
-): Promise<void> {
+): Promise<HistoricalPageCommitResult> {
   const common = { owner: input.repository.ownerLogin, repo: input.repository.name, page: input.progress.cursor.nextPage, perPage: HISTORICAL_PAGE_SIZE };
   const expectedCursor = input.progress.cursor;
   if (input.progress.stage === "branches") {
     const response = await input.github.listBranches(common);
-    await deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "branches", expectedCursor, nextCursor: { nextPage: response.nextPage ?? common.page, mode: "structural" }, observedAt: input.observedAt, finalPage: response.nextPage === undefined, facts: response.branches.map((fact) => ({ name: fact.name, headSha: fact.headSha, protected: fact.protected ?? false })) });
-    return;
+    return deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "branches", expectedCursor, nextCursor: { nextPage: response.nextPage ?? common.page, mode: "structural" }, observedAt: input.observedAt, finalPage: response.nextPage === undefined, facts: response.branches.map((fact) => ({ name: fact.name, headSha: fact.headSha, protected: fact.protected ?? false })) });
   }
   const response = await input.github.listTags(common);
-  await deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "tags", expectedCursor, nextCursor: { nextPage: response.nextPage ?? common.page, mode: "structural" }, observedAt: input.observedAt, finalPage: response.nextPage === undefined, facts: response.tags.map((fact) => ({ name: fact.name, targetSha: fact.targetSha })) });
+  return deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "tags", expectedCursor, nextCursor: { nextPage: response.nextPage ?? common.page, mode: "structural" }, observedAt: input.observedAt, finalPage: response.nextPage === undefined, facts: response.tags.map((fact) => ({ name: fact.name, targetSha: fact.targetSha })) });
 }
 
 async function commitMutablePage(
   input: { tenantId: string; repository: RepositoryRecord; progress: ActivePosition; github: GithubClient; observedAt: Date },
   deps: HistoricalDependencies,
-): Promise<void> {
+): Promise<HistoricalPageCommitResult> {
   const mode = cursorMode(input.progress);
   const overlap = mode === "overlap";
   const page = overlap ? 1 : input.progress.cursor.nextPage;
@@ -256,16 +288,14 @@ async function commitMutablePage(
   const finalPage = (nextPage?: number): boolean => !overlap && nextPage === undefined;
   if (input.progress.stage === "pull_requests") {
     const response = await input.github.listPullRequests({ ...common, ...(overlap ? { sort: "updated" as const, direction: "desc" as const } : {}) });
-    await deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "pull_requests", expectedCursor: input.progress.cursor, nextCursor: nextCursor(response.nextPage), observedAt: input.observedAt, highWaterAt: input.observedAt, finalPage: finalPage(response.nextPage), facts: response.pullRequests.map((fact) => ({ githubId: fact.id, number: fact.number, title: fact.title, state: fact.state, draft: fact.draft ?? false, ...(fact.author ? { author: fact.author } : {}), ...(fact.mergedBy ? { merger: fact.mergedBy } : {}), baseRef: fact.baseRef, baseSha: fact.baseSha, headRef: fact.headRef, headSha: fact.headSha, ...(fact.htmlUrl ? { sourceUrl: fact.htmlUrl } : {}), createdAt: fact.createdAt, updatedAt: fact.updatedAt, ...(fact.closedAt ? { closedAt: fact.closedAt } : {}), ...(fact.mergedAt ? { mergedAt: fact.mergedAt } : {}) })) });
-    return;
+    return deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "pull_requests", expectedCursor: input.progress.cursor, nextCursor: nextCursor(response.nextPage), observedAt: input.observedAt, highWaterAt: input.observedAt, finalPage: finalPage(response.nextPage), facts: response.pullRequests.map((fact) => ({ githubId: fact.id, number: fact.number, title: fact.title, state: fact.state, draft: fact.draft ?? false, ...(fact.author ? { author: fact.author } : {}), ...(fact.mergedBy ? { merger: fact.mergedBy } : {}), baseRef: fact.baseRef, baseSha: fact.baseSha, headRef: fact.headRef, headSha: fact.headSha, ...(fact.htmlUrl ? { sourceUrl: fact.htmlUrl } : {}), createdAt: fact.createdAt, updatedAt: fact.updatedAt, ...(fact.closedAt ? { closedAt: fact.closedAt } : {}), ...(fact.mergedAt ? { mergedAt: fact.mergedAt } : {}) })) });
   }
   if (input.progress.stage === "issues") {
     const response = await input.github.listIssues({ ...common, ...(overlap ? { since: windowStart, sort: "updated" as const, direction: "desc" as const } : {}) });
-    await deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "issues", expectedCursor: input.progress.cursor, nextCursor: nextCursor(response.nextPage), observedAt: input.observedAt, highWaterAt: input.observedAt, finalPage: finalPage(response.nextPage), facts: response.issues.map((fact) => ({ githubId: fact.id, number: fact.number, title: fact.title, state: fact.state, ...(fact.stateReason ? { stateReason: fact.stateReason } : {}), ...(fact.author ? { author: fact.author } : {}), ...(fact.htmlUrl ? { sourceUrl: fact.htmlUrl } : {}), createdAt: fact.createdAt, updatedAt: fact.updatedAt, ...(fact.closedAt ? { closedAt: fact.closedAt } : {}) })) });
-    return;
+    return deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "issues", expectedCursor: input.progress.cursor, nextCursor: nextCursor(response.nextPage), observedAt: input.observedAt, highWaterAt: input.observedAt, finalPage: finalPage(response.nextPage), facts: response.issues.map((fact) => ({ githubId: fact.id, number: fact.number, title: fact.title, state: fact.state, ...(fact.stateReason ? { stateReason: fact.stateReason } : {}), ...(fact.author ? { author: fact.author } : {}), ...(fact.htmlUrl ? { sourceUrl: fact.htmlUrl } : {}), createdAt: fact.createdAt, updatedAt: fact.updatedAt, ...(fact.closedAt ? { closedAt: fact.closedAt } : {}) })) });
   }
   const response = await input.github.listReleases(common);
-  await deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "releases", expectedCursor: input.progress.cursor, nextCursor: nextCursor(response.nextPage), observedAt: input.observedAt, highWaterAt: input.observedAt, finalPage: finalPage(response.nextPage), facts: response.releases.map((fact) => ({ githubId: fact.id, tagName: fact.tagName, ...(fact.name ? { name: fact.name } : {}), draft: fact.draft, prerelease: fact.prerelease, ...(fact.author ? { author: fact.author } : {}), ...(fact.htmlUrl ? { sourceUrl: fact.htmlUrl } : {}), createdAt: fact.createdAt, updatedAt: fact.publishedAt ?? fact.createdAt, ...(fact.publishedAt ? { publishedAt: fact.publishedAt } : {}) })) });
+  return deps.store.commitHistoricalPage({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, stage: "releases", expectedCursor: input.progress.cursor, nextCursor: nextCursor(response.nextPage), observedAt: input.observedAt, highWaterAt: input.observedAt, finalPage: finalPage(response.nextPage), facts: response.releases.map((fact) => ({ githubId: fact.id, tagName: fact.tagName, ...(fact.name ? { name: fact.name } : {}), draft: fact.draft, prerelease: fact.prerelease, ...(fact.author ? { author: fact.author } : {}), ...(fact.htmlUrl ? { sourceUrl: fact.htmlUrl } : {}), createdAt: fact.createdAt, updatedAt: fact.publishedAt ?? fact.createdAt, ...(fact.publishedAt ? { publishedAt: fact.publishedAt } : {}) })) });
 }
 
 /** Processes exactly one durable source page and schedules only the next durable position. */
@@ -273,6 +303,20 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
   const scoped = await gate(payload, deps);
   if (!scoped) return;
   const observedAt = (deps.now ?? (() => new Date()))();
+
+  // Check the installation pause before reading/creating a cursor and before
+  // obtaining a client. A replacement worker therefore emits only one
+  // timestamped wake and makes zero outbound calls during the pause window.
+  try {
+    await ensureInstallationApiAvailable({ tenantId: scoped.tenantId, installationGithubId: scoped.installationId, store: deps.store, now: observedAt });
+  } catch (error) {
+    if (error instanceof GithubRateLimitPauseError) {
+      await enqueueHistoricalWake(payload, scoped, deps, error.resumeAt);
+      return;
+    }
+    throw error;
+  }
+
   let rows = await deps.store.listHistoricalProgress(scoped.tenantId, scoped.repository.id);
   if (rows.length === 0) {
     await deps.store.startHistoricalBackfill({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, installationId: scoped.repository.installationId, defaultBranch: scoped.repository.defaultBranch, now: observedAt });
@@ -281,16 +325,21 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
   let progress = activePosition(rows);
   if (!progress) return;
   if (progress.status === "paused") {
-    if (!progress.pausedUntil || progress.pausedUntil > observedAt) return;
+    if (progress.pausedUntil && progress.pausedUntil > observedAt) {
+      await enqueueHistoricalWake(payload, scoped, deps, progress.pausedUntil);
+      return;
+    }
+    if (!progress.pausedUntil) return;
     await deps.store.resumeInstallationApi({ tenantId: scoped.tenantId, installationId: scoped.repository.installationId, now: observedAt });
     progress = (await deps.store.resumeHistoricalStage({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, stage: progress.stage, ...(refFor(progress.stage, scoped.repository) ? { refName: scoped.repository.defaultBranch } : {}), now: observedAt })) as ActivePosition | undefined;
     if (!progress || progress.status === "paused") return;
   }
-  const github = deps.githubForInstallation(scoped.installationId);
+  const github = guardInstallationGithub({ tenantId: scoped.tenantId, installationGithubId: scoped.installationId, store: deps.store, github: deps.githubForInstallation(scoped.installationId), now: deps.now ?? (() => new Date()) });
+  let commitResult: HistoricalPageCommitResult;
   try {
-    if (progress.stage === "default_branch_commits") await commitDefaultBranchPage({ tenantId: scoped.tenantId, installationId: scoped.installationId, repository: scoped.repository, progress, github, observedAt }, deps);
-    else if (progress.stage === "branches" || progress.stage === "tags") await commitInventoryPage({ tenantId: scoped.tenantId, repository: scoped.repository, progress, github, observedAt }, deps);
-    else await commitMutablePage({ tenantId: scoped.tenantId, repository: scoped.repository, progress, github, observedAt }, deps);
+    if (progress.stage === "default_branch_commits") commitResult = await commitDefaultBranchPage({ tenantId: scoped.tenantId, installationId: scoped.installationId, repository: scoped.repository, progress, github, observedAt }, deps);
+    else if (progress.stage === "branches" || progress.stage === "tags") commitResult = await commitInventoryPage({ tenantId: scoped.tenantId, repository: scoped.repository, progress, github, observedAt }, deps);
+    else commitResult = await commitMutablePage({ tenantId: scoped.tenantId, repository: scoped.repository, progress, github, observedAt }, deps);
   } catch (error) {
     if (error instanceof GithubRateLimitPauseError) {
       await pauseForRateLimit({ tenantId: scoped.tenantId, installationId: scoped.installationId, repository: scoped.repository, progress }, error, deps);
@@ -302,6 +351,26 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
     }
     throw error;
   }
+
+  if (!commitResult.applied) {
+    if (commitResult.reason === "checkpoint_mismatch") {
+      // A stale physical delivery has already done its outbound work. Read
+      // the current cursor and recover from it; no facts are rewritten here.
+      await enqueueCurrent({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, installationId: scoped.installationId }, deps);
+      return;
+    }
+
+    const currentInstallation = await deps.store.getInstallation(scoped.installationId);
+    if (currentInstallation?.tenantId === scoped.tenantId && currentInstallation.apiPausedUntil && currentInstallation.apiPausedUntil > observedAt) {
+      await enqueueHistoricalWake(payload, { ...scoped, installation: currentInstallation }, deps, currentInstallation.apiPausedUntil);
+      return;
+    }
+    if (commitResult.progress.status === "paused" && commitResult.progress.pausedUntil && commitResult.progress.pausedUntil > observedAt) {
+      await enqueueHistoricalWake(payload, scoped, deps, commitResult.progress.pausedUntil);
+    }
+    return;
+  }
+
   await enqueueCurrent({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, installationId: scoped.installationId }, deps);
   const counts = await deps.store.getHistoricalSourceCounts(scoped.tenantId, scoped.repository.id);
   deps.logger.info({ repository_id: scoped.repository.id, installation_id: String(scoped.installationId), event_type: progress.stage, state: "checkpointed", result: `${counts.commits}/${counts.branches}/${counts.tags}/${counts.pullRequests}/${counts.issues}/${counts.releases}` });

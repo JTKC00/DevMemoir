@@ -4,7 +4,7 @@ import type { AppConfig } from "@devmemoir/config";
 import { GithubRateLimitPauseError, type GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
-import { processInstallationInventory } from "./jobs.js";
+import { processBackfill, processInstallationInventory } from "./jobs.js";
 import { processDelivery } from "./processor.js";
 import { emptyHistoricalGithubMethods } from "./test-github.js";
 
@@ -224,5 +224,81 @@ describe("worker delivery contract", () => {
     const wakeKey = installationInventoryLogicalKey(22, `${operationId}:wake:${resumeAt.getTime()}`);
     expect([...jobs.jobs.values()].some((job) => job.logicalKey === wakeKey)).toBe(true);
     expect(store.installations.get(22)).toMatchObject({ apiPausedUntil: resumeAt, apiPauseReason: "github_primary_rate_limit" });
+  });
+
+  it("does not call GitHub from a replacement inventory worker before durable expiry", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    const resumeAt = new Date("2026-08-23T01:00:00Z");
+    let now = new Date("2026-08-23T00:00:00Z");
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
+    let requests = 0;
+    let firstRequest = true;
+    const github: GithubClient = {
+      ...emptyHistoricalGithubMethods,
+      getUser: async () => ({ id: 7, login: "owner", type: "User" }),
+      exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+      getInstallation: async () => {
+        requests += 1;
+        if (firstRequest) {
+          firstRequest = false;
+          throw new GithubRateLimitPauseError("primary_rate_limit", 403, resumeAt);
+        }
+        return { id: 22, account: { id: 7, login: "owner", type: "User" } };
+      },
+      listInstallationRepositories: async () => { requests += 1; return { repositories: [] }; },
+      getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main" }),
+      listCommits: async () => ({ commits: [] }),
+      getCommit: async () => ({ repositoryId: "", sha: "head", message: "", parents: [] }),
+      getRefHead: async () => "head",
+    };
+    const dependencies = { config, store, jobs, githubForInstallation: () => github, logger: createLogger(), now: () => now };
+    const payload = { kind: "installation_inventory" as const, tenantId: "tenant-1", installationGithubId: 22, inventoryOperationId: "restart-inventory" };
+
+    await processInstallationInventory(payload, dependencies);
+    expect(requests).toBe(1);
+
+    // A fresh dependency object models the replacement worker. The durable
+    // installation row, not the lane instance, blocks the next request.
+    await processInstallationInventory(payload, { ...dependencies, jobs: new InMemoryJobPort() });
+    expect(requests).toBe(1);
+
+    now = resumeAt;
+    await processInstallationInventory(payload, { ...dependencies, jobs: new InMemoryJobPort() });
+    expect(requests).toBe(3);
+  });
+
+  it("gates webhook commit/ref sync before an outbound request while the installation is paused", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    const resumeAt = new Date("2026-08-23T01:00:00Z");
+    let now = new Date("2026-08-23T00:00:00Z");
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
+    await store.saveRepository({ id: "repository-1", tenantId: "tenant-1", installationId: "installation-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: true, defaultBranch: "main" });
+    await store.pauseInstallationApi({ tenantId: "tenant-1", installationId: "installation-1", pausedUntil: resumeAt, reason: "github_primary_rate_limit" });
+    let requests = 0;
+    const github: GithubClient = {
+      ...emptyHistoricalGithubMethods,
+      getUser: async () => ({ id: 7, login: "owner", type: "User" }),
+      exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+      getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" } }),
+      listInstallationRepositories: async () => ({ repositories: [] }),
+      getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main" }),
+      getRefHead: async () => { requests += 1; return "head"; },
+      listCommits: async () => { requests += 1; return { commits: [] }; },
+      getCommit: async () => ({ repositoryId: "", sha: "head", message: "", parents: [] }),
+    };
+    const dependencies = { config, store, jobs, githubForInstallation: () => github, logger: createLogger(), now: () => now };
+    const payload = { kind: "sync_commits" as const, tenantId: "tenant-1", repositoryId: "repository-1", installationId: 22, ref: "refs/heads/main" };
+
+    await processBackfill(payload, dependencies);
+    expect(requests).toBe(0);
+    expect([...jobs.jobs.values()].some((job) => job.kind === "sync_commits" && job.logicalKey.endsWith(`:wake:${resumeAt.getTime()}`))).toBe(true);
+
+    now = resumeAt;
+    await processBackfill(payload, { ...dependencies, jobs: new InMemoryJobPort() });
+    expect(requests).toBeGreaterThan(0);
   });
 });

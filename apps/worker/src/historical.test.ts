@@ -221,6 +221,33 @@ describe("restartable historical backfill", () => {
     expect((await store.getHistoricalProgress(tenantId, repositoryId, "default_branch_commits", "main"))?.anchorHeadSha).toBe("Y");
   });
 
+  it("converges after a normal fast-forward without losing earlier commits", async () => {
+    let head = "C";
+    const pages: Array<{ sha: string; page: number }> = [];
+    const client = github({
+      getRefHead: async () => head,
+      listCommits: async ({ sha, page = 1 }) => {
+        pages.push({ sha: sha ?? "", page });
+        if (sha === "C") return { commits: [commit("C"), commit("B")], nextPage: 2 };
+        if (sha === "D") return { commits: [commit("D"), commit("C"), commit("B")] };
+        return { commits: [] };
+      },
+    });
+    const { store, deps } = await scope(client);
+
+    await processHistoricalBackfill(payload, deps);
+    head = "D";
+    await processHistoricalBackfill(payload, deps);
+
+    expect(pages).toEqual([{ sha: "C", page: 1 }, { sha: "D", page: 1 }]);
+    expect(await store.getHistoricalSourceCounts(tenantId, repositoryId)).toMatchObject({ commits: 3 });
+    expect(await store.getBranchHead(tenantId, repositoryId, "main")).toBe("D");
+    expect(store.commitReachability.get(`${tenantId}:${repositoryId}:main:B`)).toBe(true);
+    expect(store.commitReachability.get(`${tenantId}:${repositoryId}:main:C`)).toBe(true);
+    expect(store.commitReachability.get(`${tenantId}:${repositoryId}:main:D`)).toBe(true);
+    expect((await store.getHistoricalProgress(tenantId, repositoryId, "branches"))?.status).toBe("in_progress");
+  });
+
   it("checkpoints a recent refresh separately while structural pages discover older facts without regression", async () => {
     const updated = new Date("2026-08-22T23:00:00Z");
     const stale = new Date("2026-08-20T00:00:00Z");

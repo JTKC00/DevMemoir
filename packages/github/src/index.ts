@@ -330,7 +330,7 @@ function classifyRequestError(error: unknown, now: number): Error {
   return new Error("GitHub installation request failed");
 }
 
-type LaneTask = { request: () => Promise<GithubRequestResponse>; resolve: (response: GithubRequestResponse) => void; reject: (error: unknown) => void };
+type LaneTask = { installationId: number; request: () => Promise<GithubRequestResponse>; resolve: (response: GithubRequestResponse) => void; reject: (error: unknown) => void; persistRateLimit: boolean };
 type LaneState = {
   active: number;
   pausedUntil: number | undefined;
@@ -339,19 +339,31 @@ type LaneState = {
   queue: LaneTask[];
 };
 
-/** Non-sleeping installation-keyed scheduler. Callers persist pause errors and retry later. */
+export type GithubRateLimitState = {
+  code: GithubRateLimitCode;
+  status: number;
+  resumeAt: Date;
+};
+
+export type GithubRateLimitObserver = (installationId: number, state: GithubRateLimitState) => Promise<void> | void;
+
+/** Non-sleeping installation-keyed scheduler. Callers persist pause state and retry later. */
 export class InstallationRequestLanes {
   private readonly lanes = new Map<number, LaneState>();
 
-  constructor(private readonly concurrency: 1 | 2 = 1, private readonly now: () => number = Date.now) {
+  constructor(
+    private readonly concurrency: 1 | 2 = 1,
+    private readonly now: () => number = Date.now,
+    private readonly onRateLimitState?: GithubRateLimitObserver,
+  ) {
     if (concurrency !== 1 && concurrency !== 2) throw new RangeError("GitHub installation request concurrency must be 1 or 2");
   }
 
-  run(installationId: number, request: () => Promise<GithubRequestResponse>): Promise<GithubRequestResponse> {
+  run(installationId: number, request: () => Promise<GithubRequestResponse>, options: { persistRateLimit?: boolean } = {}): Promise<GithubRequestResponse> {
     const lane = this.lanes.get(installationId) ?? { active: 0, pausedUntil: undefined, pauseCode: undefined, pauseStatus: undefined, queue: [] };
     this.lanes.set(installationId, lane);
     return new Promise((resolve, reject) => {
-      lane.queue.push({ request, resolve, reject });
+      lane.queue.push({ installationId, request, resolve, reject, persistRateLimit: options.persistRateLimit !== false });
       this.pump(lane);
     });
   }
@@ -371,12 +383,16 @@ export class InstallationRequestLanes {
         lane.pauseStatus = undefined;
       }
       lane.active += 1;
-      void Promise.resolve().then(task.request).then((response) => {
+      void Promise.resolve().then(task.request).then(async (response) => {
         const successPause = pauseFromMetadata({ status: response.status, headers: response.headers }, this.now());
         if (successPause) {
           lane.pausedUntil = successPause.resumeAt.getTime();
           lane.pauseCode = successPause.code;
           lane.pauseStatus = successPause.status;
+          // Persist only sanitized metadata and wait for the observer before
+          // exposing the successful response to the worker. This closes the
+          // response-to-durable-state crash window without storing raw data.
+          if (task.persistRateLimit) await this.onRateLimitState?.(task.installationId, { code: successPause.code, status: successPause.status, resumeAt: successPause.resumeAt });
         }
         task.resolve(response);
       }).catch((rawError: unknown) => {
@@ -401,9 +417,9 @@ export class OctokitGithubClient implements GithubClient {
   private readonly installationClients = new Map<number, Promise<Requester>>();
   private readonly installationRequestLanes: InstallationRequestLanes;
 
-  constructor(input: { appId: number; privateKey: string; apiVersion?: string; webhookSecret?: string; installationRequestConcurrency?: 1 | 2 }) {
+  constructor(input: { appId: number; privateKey: string; apiVersion?: string; webhookSecret?: string; installationRequestConcurrency?: 1 | 2; onRateLimitState?: GithubRateLimitObserver }) {
     this.apiVersion = input.apiVersion ?? API_VERSION;
-    this.installationRequestLanes = new InstallationRequestLanes(input.installationRequestConcurrency ?? 1);
+    this.installationRequestLanes = new InstallationRequestLanes(input.installationRequestConcurrency ?? 1, Date.now, input.onRateLimitState);
     this.app = new App({ appId: input.appId, privateKey: input.privateKey, ...(input.webhookSecret ? { webhooks: { secret: input.webhookSecret } } : {}) });
   }
 
@@ -442,7 +458,7 @@ export class OctokitGithubClient implements GithubClient {
     const response = await this.installationRequestLanes.run(installationId, () => this.app.octokit.request("GET /app/installations/{installation_id}", {
       installation_id: installationId,
       headers: { "X-GitHub-Api-Version": this.apiVersion },
-    }));
+    }), { persistRateLimit: false });
     return installationSchema.parse(response.data);
   }
 
@@ -462,7 +478,7 @@ export class OctokitGithubClient implements GithubClient {
     return this.installationRequestLanes.run(installationId, async () => {
       const client = await this.installationClient(installationId);
       return client.request(route, params);
-    });
+    }, { persistRateLimit: true });
   }
 }
 

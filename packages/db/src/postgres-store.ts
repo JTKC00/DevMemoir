@@ -310,21 +310,21 @@ export class PostgresM1Store implements M1Store {
     const tenantId = route.rows[0]?.tenant_id;
     if (!tenantId) return undefined;
     return this.tenantQuery(String(tenantId), async (client) => {
-      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.github_installation_id=$1", [githubInstallationId]);
+      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,gi.api_paused_until,gi.api_pause_reason,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.github_installation_id=$1", [githubInstallationId]);
       return installationFromRow(result.rows[0]);
     });
   }
 
   async listInstallations(tenantId: string): Promise<InstallationRecord[]> {
     return this.tenantQuery(tenantId, async (client) => {
-      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.tenant_id=$1", [tenantId]);
+      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,gi.api_paused_until,gi.api_pause_reason,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.tenant_id=$1", [tenantId]);
       return result.rows.map((row) => installationFromRow(row)).filter((row): row is InstallationRecord => Boolean(row));
     });
   }
 
   async getActiveInstallationForTenant(tenantId: string): Promise<InstallationRecord | undefined> {
     return this.tenantQuery(tenantId, async (client) => {
-      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.tenant_id=$1 and gi.status='active' limit 2", [tenantId]);
+      const result = await client.query<Row>("select gi.id,gi.tenant_id,gi.github_installation_id,gi.status,gi.permissions,gi.repository_selection,gi.suspended_at,gi.deleted_at,gi.last_inventory_at,gi.api_paused_until,gi.api_pause_reason,ga.github_account_id as account_github_account_id from github_installations gi join github_accounts ga on ga.id=gi.account_github_account_id where gi.tenant_id=$1 and gi.status='active' limit 2", [tenantId]);
       if (result.rows.length > 1) throw new InstallationResolutionError();
       return installationFromRow(result.rows[0]);
     });
@@ -825,7 +825,12 @@ export class PostgresM1Store implements M1Store {
   }
 
   async pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void> {
-    await this.tenantQuery(input.tenantId, async (client) => { await client.query("update github_installations set api_paused_until=$3,api_pause_reason=$4 where tenant_id=$1 and id=$2", [input.tenantId, input.installationId, input.pausedUntil, input.reason]); });
+    await this.tenantQuery(input.tenantId, async (client) => {
+      await client.query(
+        "update github_installations set api_paused_until=greatest(coalesce(api_paused_until,$3),$3),api_pause_reason=case when api_paused_until is null or api_paused_until <= $3 then $4 else api_pause_reason end where tenant_id=$1 and id=$2",
+        [input.tenantId, input.installationId, input.pausedUntil, input.reason],
+      );
+    });
   }
 
   async resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void> {

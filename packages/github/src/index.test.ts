@@ -225,6 +225,16 @@ describe("installation request rate-limit lanes", () => {
     expect(calls).toBe(1);
   });
 
+  it("awaits a sanitized durable observer for successful remaining=0 responses", async () => {
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    const observed: Array<{ installationId: number; code: string; resumeAt: Date }> = [];
+    const lanes = new InstallationRequestLanes(1, () => now, (installationId, state) => {
+      observed.push({ installationId, code: state.code, resumeAt: state.resumeAt });
+    });
+    await expect(lanes.run(77, async () => ({ status: 200, headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String((now + 30_000) / 1000) }, data: "last allowed" }))).resolves.toMatchObject({ data: "last allowed" });
+    expect(observed).toEqual([{ installationId: 77, code: "primary_rate_limit", resumeAt: new Date(now + 30_000) }]);
+  });
+
   it.each([
     [401, "unauthorized"],
     [403, "forbidden"],
