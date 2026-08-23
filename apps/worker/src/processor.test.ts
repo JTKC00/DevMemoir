@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryM1Store } from "@devmemoir/db";
 import type { AppConfig } from "@devmemoir/config";
-import type { GithubClient } from "@devmemoir/github";
-import { InMemoryJobPort } from "@devmemoir/jobs";
+import { GithubRateLimitPauseError, type GithubClient } from "@devmemoir/github";
+import { InMemoryJobPort, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
 import { processInstallationInventory } from "./jobs.js";
 import { processDelivery } from "./processor.js";
+import { emptyHistoricalGithubMethods } from "./test-github.js";
 
 const config: AppConfig = {
   NODE_ENV: "test", LOG_LEVEL: "error", API_ORIGIN: "http://localhost:4000", WEB_ORIGIN: "http://localhost:3000",
@@ -24,6 +25,7 @@ describe("worker delivery contract", () => {
     const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: "delivery-1", eventName: "push", installationGithubId: 22, repositoryGithubId: 10, ref: "refs/heads/main", before: "before", after: "payload-head", forced: false, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
     let requestedHead = "";
     const github: GithubClient = {
+      ...emptyHistoricalGithubMethods,
       getUser: async () => ({ id: 7, login: "owner", type: "User" }),
       exchangeOAuthCode: async () => ({ accessToken: "token" }),
       getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" } }),
@@ -71,6 +73,7 @@ describe("worker delivery contract", () => {
     await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
     await store.saveRepository({ id: "repository-1", tenantId: "tenant-1", installationId: "installation-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: true, defaultBranch: "main" });
     const github: GithubClient = {
+      ...emptyHistoricalGithubMethods,
       getUser: async () => ({ id: 7, login: "owner", type: "User" }),
       exchangeOAuthCode: async () => ({ accessToken: "unused" }),
       getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" }, permissions: { metadata: "read", contents: "read" }, repository_selection: "selected" }),
@@ -127,6 +130,7 @@ describe("worker delivery contract", () => {
     expect([...jobs.jobs.values()].map((job) => job.kind)).toEqual(["installation_inventory"]);
 
     const github: GithubClient = {
+      ...emptyHistoricalGithubMethods,
       getUser: async () => ({ id: 7, login: "owner", type: "User" }),
       exchangeOAuthCode: async () => ({ accessToken: "unused" }),
       getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" } }),
@@ -177,6 +181,7 @@ describe("worker delivery contract", () => {
     await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
     await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
     const github: GithubClient = {
+      ...emptyHistoricalGithubMethods,
       getUser: async () => ({ id: 7, login: "owner", type: "User" }),
       exchangeOAuthCode: async () => ({ accessToken: "unused" }),
       getInstallation: async () => ({ id: 22, account: { id: 7, login: "owner", type: "User" } }),
@@ -190,5 +195,34 @@ describe("worker delivery contract", () => {
     await processInstallationInventory({ tenantId: "tenant-1", installationGithubId: 22 }, { config, store, jobs, githubForInstallation: () => github, logger: createLogger(capture.sink) });
     expect(capture.text()).not.toContain("private-repository-name");
     expect(capture.text()).toContain('"installation_id":"22"');
+  });
+
+  it("schedules an inventory rate-limit wake under a key distinct from the active stately job", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    const resumeAt = new Date("2026-08-23T01:00:00Z");
+    await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
+    await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
+    const operationId = "access-recheck";
+    const activeKey = installationInventoryLogicalKey(22, operationId);
+    const payload = { kind: "installation_inventory" as const, tenantId: "tenant-1", installationGithubId: 22, inventoryOperationId: operationId };
+    await jobs.enqueue("installation_inventory", activeKey, payload);
+    const github = {
+      ...emptyHistoricalGithubMethods,
+      getUser: async () => ({ id: 7, login: "owner", type: "User" as const }),
+      exchangeOAuthCode: async () => ({ accessToken: "unused" }),
+      getInstallation: async () => { throw new GithubRateLimitPauseError("primary_rate_limit", 403, resumeAt); },
+      listInstallationRepositories: async () => ({ repositories: [] }),
+      getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }),
+      listCommits: async () => ({ commits: [] }),
+      getCommit: async () => ({ repositoryId: "", sha: "head", message: "", parents: [] }),
+      getRefHead: async () => "head",
+    } satisfies GithubClient;
+
+    await processInstallationInventory(payload, { config, store, jobs, githubForInstallation: () => github, logger: createLogger() });
+
+    const wakeKey = installationInventoryLogicalKey(22, `${operationId}:wake:${resumeAt.getTime()}`);
+    expect([...jobs.jobs.values()].some((job) => job.logicalKey === wakeKey)).toBe(true);
+    expect(store.installations.get(22)).toMatchObject({ apiPausedUntil: resumeAt, apiPauseReason: "github_primary_rate_limit" });
   });
 });

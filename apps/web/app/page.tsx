@@ -3,6 +3,13 @@ import { headers } from "next/headers";
 type ActivityResponse = {
   completeness: string;
   repository?: { id: string; fullName: string; private: boolean };
+  historical?: {
+    status: string;
+    stage: string;
+    lastSuccessAt?: string;
+    counts: { commits: number; branches: number; tags: number; pullRequests: number; issues: number; releases: number };
+    completeness: { observed: string; reachableAtSync: string; knownUnknown: string; outOfScope: string };
+  };
   events: Array<{ id: string; occurredAt: string; verb: string; contributionRole: string; contextKind: string; actorKind: string; message?: string; sourceUrl?: string }>;
 };
 
@@ -21,7 +28,7 @@ export default async function HomePage() {
   return <main>
     <header><h1>DevMemoir</h1>{!activity ? <a className="button" href={`${apiOrigin}/auth/github/start?returnPath=/`}>Continue with GitHub</a> : activity.repository ? <a className="button" href="/connect">Manage connection</a> : <a className="button" href="/connect">Connect GitHub</a>}</header>
     {!activity ? <section className="card"><p>Connect a GitHub App installation to see observed work in a repository you selected.</p><p className="muted">This is not a complete GitHub history.</p></section> : <>
-      <section className="card">{activity.repository ? <><strong>{activity.repository.fullName}</strong><p className="muted">{activity.completeness}</p></> : <><strong>No repository connected</strong><p className="muted">Connect one repository to begin the Milestone 1 import.</p></>}</section>
+      <section className="card">{activity.repository ? <><strong>{activity.repository.fullName}</strong><p className="muted">{activity.completeness}</p>{activity.historical ? <><p><strong>Historical import:</strong> {activity.historical.status.replaceAll("_", " ")} · {activity.historical.stage.replaceAll("_", " ")}</p><p className="muted">{activity.historical.completeness.observed} {activity.historical.completeness.knownUnknown}</p><p className="muted">{activity.historical.completeness.outOfScope}</p></> : null}</> : <><strong>No repository connected</strong><p className="muted">Connect one repository to begin the supported historical import.</p></>}</section>
       <section className="card">{activity.events.length === 0 ? <p className="muted">No activity has been imported yet.</p> : activity.events.map((event) => <article className="event" key={event.id}>
         <div><strong>{event.verb}</strong> <span className="muted">({event.contributionRole}, {event.contextKind})</span></div>
         <time className="muted" dateTime={event.occurredAt}>{new Date(event.occurredAt).toLocaleString()}</time>

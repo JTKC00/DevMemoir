@@ -1,6 +1,15 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { claimInstallation, connectRepository, refreshInventory, startInstallation, unselectRepository } from "./actions";
+import { claimInstallation, connectRepository, refreshInventory, resumeBackfill, startInstallation, unselectRepository } from "./actions";
+
+type HistoricalStatus = {
+  status: string;
+  stage: string;
+  lastSuccessAt?: string;
+  pausedUntil?: string;
+  counts: { commits: number; branches: number; tags: number; pullRequests: number; issues: number; releases: number };
+  completeness: { observed: string; reachableAtSync: string; knownUnknown: string; outOfScope: string };
+};
 
 type ConnectRepository = {
   id: string;
@@ -12,6 +21,7 @@ type ConnectRepository = {
   lastAuthoritativeObservedAt?: string;
   archived?: boolean;
   disabled?: boolean;
+  historical: HistoricalStatus;
 };
 type ConnectOptions = { connected: boolean; installationStatus?: string; lastInventoryAt?: string; repositories: ConnectRepository[] };
 
@@ -55,7 +65,11 @@ export default async function ConnectPage({ searchParams }: { searchParams: Prom
             <div><strong>{repository.fullName}</strong> <span className="muted">{repository.private ? "private" : "public"}</span></div>
             <div className="muted">GitHub access: {accessible ? "accessible" : repository.accessStatus.replaceAll("_", " ")}</div>
             <div className="muted">DevMemoir: {activelyTracking ? "actively tracking" : accessible ? "not selected" : "not tracking (access unavailable)"}{repository.lastAuthoritativeObservedAt ? ` · observed ${new Date(repository.lastAuthoritativeObservedAt).toLocaleString()}` : ""}</div>
+            {activelyTracking ? <div className="muted">Historical import: {repository.historical.status.replaceAll("_", " ")} · {repository.historical.stage.replaceAll("_", " ")}{repository.historical.lastSuccessAt ? ` · last success ${new Date(repository.historical.lastSuccessAt).toLocaleString()}` : ""}{repository.historical.pausedUntil ? ` · resumes after ${new Date(repository.historical.pausedUntil).toLocaleString()}` : ""}</div> : null}
+            {activelyTracking ? <div className="muted">Observed facts: {repository.historical.counts.commits} commits · {repository.historical.counts.branches} branches · {repository.historical.counts.tags} tags · {repository.historical.counts.pullRequests} pull requests · {repository.historical.counts.issues} issues · {repository.historical.counts.releases} releases</div> : null}
+            {activelyTracking ? <p className="muted">{repository.historical.completeness.knownUnknown} {repository.historical.completeness.outOfScope}</p> : null}
             {repository.archived || repository.disabled ? <div className="muted">{repository.archived ? "archived" : ""}{repository.archived && repository.disabled ? " · " : ""}{repository.disabled ? "disabled" : ""}</div> : null}
+            {activelyTracking && repository.historical.status !== "completed" ? <form action={resumeBackfill}><input type="hidden" name="repositoryId" value={repository.id} /><button type="submit">Start or resume historical import</button></form> : null}
             {activelyTracking ? <form action={unselectRepository}><input type="hidden" name="repositoryId" value={repository.id} /><button type="submit">Stop tracking</button></form> : null}
           </article>;
         })}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryJobPort, commitSyncLogicalKey, deliveryLogicalKey } from "./index.js";
+import { InMemoryJobPort, commitSyncLogicalKey, deliveryLogicalKey, historicalBackfillLogicalKey } from "./index.js";
 
 describe("JobPort logical keys", () => {
   it("deduplicates the same logical delivery", async () => {
@@ -8,6 +8,7 @@ describe("JobPort logical keys", () => {
     const second = await jobs.enqueue("webhook_delivery", deliveryLogicalKey("d-1"), { deliveryId: "d-1" });
     expect(second).toBe(first);
     expect(jobs.jobs.size).toBe(1);
-    expect(commitSyncLogicalKey("repo", "refs/heads/main", "sha")).toBe("sync:repo:refs/heads/main:sha");
+    expect(commitSyncLogicalKey("repo", "refs/heads/private-project", "sha")).toBe("sync:repo:sha");
+    expect(historicalBackfillLogicalKey("repo", "pull_requests", 2)).toBe("backfill:repo:pull_requests:page:2");
   });
 });

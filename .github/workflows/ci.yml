@@ -1,4 +1,4 @@
-name: M2 CI
+name: M3 CI
 
 on:
   push:
@@ -26,6 +26,7 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
+      CI: true
       DATABASE_URL: postgres://devmemoir:devmemoir@localhost:5432/devmemoir
       DATABASE_DIRECT_URL: postgres://devmemoir:devmemoir@localhost:5432/devmemoir
       TEST_DATABASE_URL: postgres://devmemoir:devmemoir@localhost:5432/devmemoir
@@ -41,8 +42,17 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Assert PostgreSQL integration configuration
         run: test -n "$TEST_DATABASE_URL"
-      - run: pnpm db:migrate
-      - run: pnpm typecheck
-      - run: pnpm lint
-      - run: pnpm test
-      - run: pnpm build
+      - name: Apply empty/upgrade-safe migrations
+        run: pnpm db:migrate
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Unit and M3 backfill tests
+        run: pnpm test
+      - name: PostgreSQL integration and RLS tests
+        run: pnpm --filter @devmemoir/db test
+      - name: pg-boss restart integration tests
+        run: pnpm --filter @devmemoir/jobs test && pnpm --filter @devmemoir/worker test
+      - name: Build
+        run: pnpm build

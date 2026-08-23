@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --passWithNoTests --no-file-parallelism",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts"
   },

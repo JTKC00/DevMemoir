@@ -25,6 +25,11 @@ const github: GithubClient = {
   listInstallationRepositories: async () => ({ repositories: [] }),
   getRepository: async () => ({ id: 10, name: "repo", full_name: "owner/repo", private: true, default_branch: "main", owner: { login: "owner" } }),
   listCommits: async () => ({ commits: [] }),
+  listBranches: async () => ({ branches: [] }),
+  listTags: async () => ({ tags: [] }),
+  listPullRequests: async () => ({ pullRequests: [] }),
+  listIssues: async () => ({ issues: [] }),
+  listReleases: async () => ({ releases: [] }),
   getCommit: async () => ({ repositoryId: "", sha: "a".repeat(40), message: "", parents: [] }),
   getRefHead: async () => "a".repeat(40),
 };

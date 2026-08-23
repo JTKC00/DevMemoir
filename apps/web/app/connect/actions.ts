@@ -65,3 +65,15 @@ export async function unselectRepository(formData: FormData): Promise<void> {
   if (!response.ok) redirect("/connect?error=repository_unselect_failed");
   redirect("/connect?unselected=1");
 }
+
+export async function resumeBackfill(formData: FormData): Promise<void> {
+  const repositoryId = String(formData.get("repositoryId") ?? "");
+  const response = await fetch(`${apiOrigin()}/connect/repository/backfill`, {
+    method: "POST",
+    headers: { ...await forwardedHeaders(), "content-type": "application/json" },
+    body: JSON.stringify({ repositoryId }),
+    cache: "no-store",
+  });
+  if (!response.ok) redirect("/connect?error=backfill_resume_failed");
+  redirect("/connect?backfill=queued");
+}

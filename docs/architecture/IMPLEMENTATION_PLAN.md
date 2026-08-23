@@ -120,6 +120,11 @@ M2 authoritative repository inventory/access, direct worker queue, source schema
 - Apply source timestamps and idempotent upserts; checkpoint only after the full page transaction commits.
 - Track observed, reachable-at-sync, known-unknown, and out-of-scope states for UI copy.
 - Limit installation concurrency to 1–2 GitHub requests and honor primary/secondary limits.
+- Reuse `sync_cursors` for the ordered durable state machine; keep `completed` rows and compare an expected structural cursor before applying each page.
+- Fetch and commit at most one authoritative page per physical historical job. Source facts, reachability/inventory observations, and the next checkpoint share one tenant-local transaction.
+- Treat the owner-selected repository as the only canonical M3 backfill. Unselection/access loss pauses work without deleting normalized facts; re-selection resumes the existing stage.
+
+The implemented page, cursor, pause, retention, and completeness semantics are specified in [M3_BACKFILL_CONTRACT.md](./M3_BACKFILL_CONTRACT.md). PR, issue, release, branch, and tag projection remains M4.
 
 ### Acceptance criteria
 

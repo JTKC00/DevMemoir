@@ -1,10 +1,11 @@
-import type { M1Store } from "@devmemoir/db";
-import type { GithubClient } from "@devmemoir/github";
-import { commitSyncLogicalKey, type JobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
+import type { HistoricalSourceStage, M1Store } from "@devmemoir/db";
+import { GithubAccessError, GithubRateLimitPauseError, type GithubClient } from "@devmemoir/github";
+import { commitSyncLogicalKey, installationInventoryLogicalKey, type JobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { processDelivery } from "./processor.js";
 import { synchronizeRefHead } from "./sync.js";
 import { refreshInstallationInventory } from "./inventory.js";
+import { processHistoricalBackfill, resumeHistoricalAfterInventory } from "./historical.js";
 
 export type QueueDependencies = {
   store: M1Store;
@@ -39,7 +40,17 @@ export async function processBackfill(payload: SyncJobPayload, deps: QueueDepend
   const after = authoritativeHead ?? "0".repeat(40);
   const result = await synchronizeRefHead({ tenantId: payload.tenantId, repository, installationId: payload.installationId, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID, ref, before: payload.before ?? "0".repeat(40), after, forced: payload.forced ?? false }, github, deps.store);
   if (result.status === "partial" && result.nextPage) {
-    const continuationPayload: SyncJobPayload = { ...payload, tenantId: payload.tenantId, repositoryId: repository.id, installationId: payload.installationId, owner: repository.ownerLogin, repo: repository.name, ref, before: payload.before ?? "0".repeat(40), after, forced: payload.forced ?? false, nextPage: result.nextPage };
+    const continuationPayload: SyncJobPayload = {
+      kind: "sync_commits",
+      tenantId: payload.tenantId,
+      repositoryId: repository.id,
+      installationId: payload.installationId,
+      ...(payload.deliveryId ? { deliveryId: payload.deliveryId } : {}),
+      before: payload.before ?? "0".repeat(40),
+      after,
+      forced: payload.forced ?? false,
+      nextPage: result.nextPage,
+    };
     const logicalKey = commitSyncLogicalKey(repository.id, ref, after, result.nextPage);
     await deps.store.ensureJob(logicalKey, { kind: "sync_commits", ...continuationPayload });
     await deps.jobs.enqueue("sync_commits", logicalKey, continuationPayload);
@@ -53,8 +64,32 @@ export async function processInstallationInventory(payload: SyncJobPayload, deps
   if (!payload.tenantId || !payload.installationGithubId) throw new Error("Inventory job is missing tenant or installation context");
   const installation = await deps.store.getInstallation(payload.installationGithubId);
   if (!installation || (installation.status && installation.status !== "active")) return;
-  const result = await refreshInstallationInventory({ tenantId: payload.tenantId, installationGithubId: payload.installationGithubId }, deps.githubForInstallation(payload.installationGithubId), deps.store);
-  deps.logger.info({ installation_id: String(payload.installationGithubId), result: `${result.observed}/${result.added}/${result.updated}/${result.removed}` });
+  try {
+    const result = await refreshInstallationInventory({ tenantId: payload.tenantId, installationGithubId: payload.installationGithubId }, deps.githubForInstallation(payload.installationGithubId), deps.store);
+    await resumeHistoricalAfterInventory(payload, { ...deps, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
+    deps.logger.info({ installation_id: String(payload.installationGithubId), result: `${result.observed}/${result.added}/${result.updated}/${result.removed}` });
+  } catch (error) {
+    if (error instanceof GithubRateLimitPauseError) {
+      await deps.store.pauseInstallationApi({ tenantId: payload.tenantId, installationId: installation.id, pausedUntil: error.resumeAt, reason: `github_${error.code}` });
+      if (payload.repositoryId) {
+        const active = (await deps.store.listHistoricalProgress(payload.tenantId, payload.repositoryId)).find((row) => row.stage !== "completed" && row.status === "in_progress");
+        if (active) await deps.store.pauseHistoricalStage({ tenantId: payload.tenantId, repositoryId: payload.repositoryId, stage: active.stage as HistoricalSourceStage, ...(active.refName ? { refName: active.refName } : {}), pausedUntil: error.resumeAt, errorCode: `github_${error.code}` });
+      }
+      const operationId = payload.inventoryOperationId ?? `rate-resume:${payload.repositoryId ?? "installation"}`;
+      const wakeOperationId = `${operationId}:wake:${error.resumeAt.getTime()}`;
+      const logicalKey = installationInventoryLogicalKey(payload.installationGithubId, wakeOperationId);
+      const retryPayload: SyncJobPayload = { ...payload, kind: "installation_inventory", inventoryOperationId: wakeOperationId };
+      await deps.store.ensureJob(logicalKey, retryPayload as Record<string, unknown>);
+      await deps.jobs.enqueue("installation_inventory", logicalKey, retryPayload, { startAfter: error.resumeAt });
+      deps.logger.warn({ installation_id: String(payload.installationGithubId), state: "paused", error_code: `github_${error.code}` });
+      return;
+    }
+    if (error instanceof GithubAccessError) {
+      deps.logger.warn({ installation_id: String(payload.installationGithubId), state: "paused", error_code: `github_${error.code}` });
+      return;
+    }
+    throw error;
+  }
 }
 
 export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): Promise<void> {
@@ -66,6 +101,10 @@ export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): 
   }
   if (kind.kind === "installation_inventory") {
     await processInstallationInventory(kind.payload as SyncJobPayload, deps);
+    return;
+  }
+  if (kind.kind === "repository_backfill") {
+    await processHistoricalBackfill(kind.payload as SyncJobPayload, { ...deps, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);

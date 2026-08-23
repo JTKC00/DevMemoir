@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { InMemoryM1Store } from "@devmemoir/db";
 import type { GithubClient, GithubCommit } from "@devmemoir/github";
 import { synchronizeRefHead } from "./sync.js";
+import { emptyHistoricalGithubMethods } from "./test-github.js";
 
 const repository = { id: "repo-1", tenantId: "tenant-1", installationId: "inst-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: true, defaultBranch: "main" };
 const github: GithubClient = {
+  ...emptyHistoricalGithubMethods,
   getUser: async () => ({ id: 1, login: "owner", type: "User" }),
   exchangeOAuthCode: async () => ({ accessToken: "token" }),
   getInstallation: async () => ({ id: 99, account: { id: 1, login: "owner", type: "User" } }),

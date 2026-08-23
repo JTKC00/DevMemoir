@@ -369,6 +369,8 @@ The REST list-commits endpoint supports `sha`, `since`, `until`, and pagination 
 
 ### Initial backfill
 
+The concrete M3 cursor, atomic page, rate-pause, and completeness contract is recorded in [M3_BACKFILL_CONTRACT.md](./M3_BACKFILL_CONTRACT.md). That contract narrows the optional stage list below to the selected repository's default-branch-first M3 implementation; all-active-branch traversal remains deferred.
+
 1. `installation.created` or setup completion creates/updates the installation and repository access rows.
 2. Enqueue one `installation_inventory` job, then one `repository_backfill` coordinator per repository.
 3. The coordinator creates independent resumable stages:

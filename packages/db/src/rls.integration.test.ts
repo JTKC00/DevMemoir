@@ -6,6 +6,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required in CI");
 const describeIntegration = databaseUrl ? describe : describe.skip;
 const migrationsDir = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
 
@@ -47,6 +48,7 @@ describeIntegration("M2 PostgreSQL RLS", () => {
       const migration = await readFile(resolve(migrationsDir, "0002_m2_repository_inventory.sql"), "utf8");
       await admin.query(migration);
     }
+    await admin.query(await readFile(resolve(migrationsDir, "0003_m3_historical_backfill.sql"), "utf8"));
     for (const [capability, roleName] of Object.entries(runtimeRoleNames)) {
       const capabilityRole = capability === "api" ? "devmemoir_api" : capability === "worker" ? "devmemoir_worker" : "devmemoir_web";
       await admin.query(`create role "${roleName}" login password '${rolePassword}'`);
@@ -59,10 +61,20 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await admin.query("insert into github_installations (id,tenant_id,github_installation_id,account_github_account_id,created_at,updated_at) values ($1,$2,201,$3,now(),now()),($4,$5,202,$6,now(),now())", [installationA, tenantA, accountRows.rows[0]?.id, installationB, tenantB, accountRows.rows[1]?.id]);
     await admin.query("insert into repository_access (id,tenant_id,repository_id,installation_id,access_status,selected,selected_at) values ($1,$2,$3,$4,'accessible',true,now()),($5,$6,$7,$8,'accessible',true,now())", [randomUUID(), tenantA, repoA, installationA, randomUUID(), tenantB, repoB, installationB]);
     await admin.query("insert into repository_name_history (id,tenant_id,repository_id,owner_login,name,full_name,valid_from) values ($1,$2,$3,'owner','a','owner/a',now()),($4,$5,$6,'owner','b','owner/b',now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
+    await admin.query("insert into tags (id,tenant_id,repository_id,name,target_sha,first_seen_at,last_seen_at,last_authoritative_observed_at,observation_generation) values ($1,$2,$3,'private-a','a',now(),now(),now(),now()),($4,$5,$6,'private-b','b',now(),now(),now(),now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
+    await admin.query("insert into pull_requests (id,tenant_id,repository_id,github_pull_request_id,number,title,state,github_created_at,github_updated_at,first_seen_at,last_seen_at) values ($1,$2,$3,3001,1,'private-pr-a','open',now(),now(),now(),now()),($4,$5,$6,3002,1,'private-pr-b','open',now(),now(),now(),now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
+    await admin.query("insert into issues (id,tenant_id,repository_id,github_issue_id,number,title,state,github_created_at,github_updated_at,first_seen_at,last_seen_at) values ($1,$2,$3,4001,2,'private-issue-a','open',now(),now(),now(),now()),($4,$5,$6,4002,2,'private-issue-b','open',now(),now(),now(),now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
+    await admin.query("insert into releases (id,tenant_id,repository_id,github_release_id,tag_name,name,github_created_at,github_updated_at,first_seen_at,last_seen_at) values ($1,$2,$3,5001,'v1','private-release-a',now(),now(),now(),now()),($4,$5,$6,5002,'v1','private-release-b',now(),now(),now(),now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
+    await admin.query("insert into sync_cursors (id,tenant_id,repository_id,resource_type,ref_name,cursor) values ($1,$2,$3,'pull_requests','', '{\"nextPage\":1}'),($4,$5,$6,'pull_requests','', '{\"nextPage\":1}')", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
   });
 
   afterAll(async () => {
     await Promise.all(runtimeClients.map((client) => client.end().catch(() => undefined)));
+    await admin.query("delete from sync_cursors where repository_id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from releases where repository_id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from issues where repository_id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from pull_requests where repository_id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from tags where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from repository_name_history where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from repository_access where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from repositories where id in ($1,$2)", [repoA, repoB]);
@@ -97,6 +109,20 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await admin.query("set local role devmemoir_web");
     await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
     await expect(admin.query("insert into commits (id,tenant_id,repository_id,sha,message,first_seen_at,last_seen_at) values ($1,$2,$3,'canary','message',now(),now())", [randomUUID(), tenantA, repoA])).rejects.toThrow();
+    await expect(admin.query("update pull_requests set title='forbidden' where tenant_id=$1", [tenantA])).rejects.toThrow();
+    await admin.query("rollback");
+  });
+
+  it("isolates every M3 source and progress row", async () => {
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_worker");
+    await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
+    for (const table of ["tags", "pull_requests", "issues", "releases", "sync_cursors"]) {
+      const visible = await admin.query<{ tenant_id: string }>(`select tenant_id from ${table}`);
+      expect(visible.rows.map((row) => row.tenant_id)).toEqual([tenantA]);
+      expect((await admin.query(`update ${table} set tenant_id=tenant_id where tenant_id=$1`, [tenantB])).rowCount).toBe(0);
+    }
+    await expect(admin.query("insert into tags (id,tenant_id,repository_id,name,target_sha,first_seen_at,last_seen_at,last_authoritative_observed_at,observation_generation) values ($1,$2,$3,'cross','x',now(),now(),now(),now())", [randomUUID(), tenantB, repoB])).rejects.toThrow();
     await admin.query("rollback");
   });
 
@@ -149,6 +175,8 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await api.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
     expect((await api.query<{ id: string }>("select id from repositories order by id")).rows.map((row) => row.id)).toEqual([repoA]);
     expect((await api.query("update repositories set name='api-cross-tenant' where id=$1", [repoB])).rowCount).toBe(0);
+    await expect(api.query("update pull_requests set title='api-must-not-normalize' where repository_id=$1", [repoA])).rejects.toThrow();
+    await expect(api.query("update sync_cursors set status='completed' where repository_id=$1", [repoA])).rejects.toThrow();
     await expect(api.query("create table rls_api_ddl_forbidden (id integer)")).rejects.toThrow();
     await api.query("rollback");
 

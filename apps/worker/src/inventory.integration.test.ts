@@ -7,6 +7,7 @@ import { InMemoryJobPort, installationInventoryLogicalKey, PgBossJobPort, type Q
 import { createLogger } from "@devmemoir/observability";
 import { processInstallationInventory, processQueueJob, type QueueDependencies } from "./jobs.js";
 import { processDelivery } from "./processor.js";
+import { emptyHistoricalGithubMethods } from "./test-github.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required for M2 pg-boss inventory restart integration tests");
@@ -42,6 +43,7 @@ async function createScope(): Promise<Scope> {
   await store.saveInstallation({ id: installationId, tenantId, githubInstallationId, accountGithubAccountId: accountGithubId });
   const repository: GithubRepository = { id: 9001, name: "restart-repo", full_name: "owner/restart-repo", private: true, visibility: "private", default_branch: "main", owner: { login: "owner" } };
   const github: GithubClient = {
+    ...emptyHistoricalGithubMethods,
     getUser: async () => ({ id: accountGithubId, login: "owner", type: "User" }),
     exchangeOAuthCode: async () => ({ accessToken: "unused" }),
     getInstallation: async () => ({ id: githubInstallationId, account: { id: accountGithubId, login: "owner", type: "User" }, permissions: { Metadata: "read" }, repository_selection: "selected" }),

@@ -5,12 +5,9 @@ import { actorKindFromGithub } from "@devmemoir/domain";
 import { z } from "zod";
 
 export const API_VERSION = "2022-11-28";
+const DEFAULT_PER_PAGE = 100;
+const SECONDARY_LIMIT_FALLBACK_MS = 60_000;
 
-/**
- * GitHub's GET /git/ref/:ref route takes `heads/<branch>` (or
- * `tags/<tag>`), not the display-only branch name and not the fully
- * qualified `refs/heads/<branch>` value returned in API responses.
- */
 export function githubRefParameter(ref: string): string {
   const normalized = ref.replace(/^refs\//, "");
   if (normalized.startsWith("heads/") || normalized.startsWith("tags/")) return normalized;
@@ -27,13 +24,17 @@ const ALLOWED_ENDPOINTS = new Set([
   "GET /repos/{owner}/{repo}/commits",
   "GET /repos/{owner}/{repo}/commits/{ref}",
   "GET /repos/{owner}/{repo}/git/ref/{ref}",
+  "GET /repos/{owner}/{repo}/tags",
+  "GET /repos/{owner}/{repo}/pulls",
+  "GET /repos/{owner}/{repo}/issues",
+  "GET /repos/{owner}/{repo}/releases",
   "GET /user",
   "POST /login/oauth/access_token",
 ]);
 
 export class GithubEndpointDeniedError extends Error {
   constructor(endpoint: string) {
-    super(`GitHub endpoint denied by M1 permit-list: ${endpoint}`);
+    super(`GitHub endpoint denied by permit-list: ${endpoint}`);
     this.name = "GithubEndpointDeniedError";
   }
 }
@@ -44,12 +45,11 @@ export function assertGithubEndpointAllowed(endpoint: string): void {
 
 export function stripCompareFiles<T extends { files?: Array<Record<string, unknown>> }>(response: T): Omit<T, "files"> & { files?: Array<Record<string, unknown>> } {
   if (!response.files) return response;
-  return {
-    ...response,
-    files: response.files.map(() => ({})),
-  };
+  return { ...response, files: response.files.map(() => ({})) };
 }
 
+const actorSchema = z.object({ id: z.number().int().positive(), login: z.string().nullable().optional(), type: z.string().nullable().optional() }).strip();
+const nullableActorSchema = actorSchema.nullable().optional();
 const userSchema = z.object({ id: z.number().int().positive(), login: z.string(), type: z.string().optional() }).strip();
 const installationSchema = z.object({
   id: z.number().int().positive(),
@@ -59,36 +59,75 @@ const installationSchema = z.object({
   suspended_at: z.string().nullable().optional(),
 }).strip();
 const repositorySchema = z.object({
-  id: z.number().int().positive(),
-  node_id: z.string().optional(),
-  name: z.string(),
-  full_name: z.string(),
-  owner: z.object({ login: z.string().optional() }).strip().optional(),
-  private: z.boolean(),
-  visibility: z.string().optional(),
-  default_branch: z.string(),
-  archived: z.boolean().optional(),
-  disabled: z.boolean().optional(),
-  html_url: z.string().optional(),
-  description: z.string().nullable().optional(),
-  pushed_at: z.string().nullable().optional(),
-  created_at: z.string().nullable().optional(),
-  updated_at: z.string().nullable().optional(),
+  id: z.number().int().positive(), node_id: z.string().optional(), name: z.string(), full_name: z.string(),
+  owner: z.object({ login: z.string().optional() }).strip().optional(), private: z.boolean(), visibility: z.string().optional(),
+  default_branch: z.string(), archived: z.boolean().optional(), disabled: z.boolean().optional(), html_url: z.string().optional(),
+  description: z.string().nullable().optional(), pushed_at: z.string().nullable().optional(), created_at: z.string().nullable().optional(), updated_at: z.string().nullable().optional(),
 }).strip();
+const commitSchema = z.object({
+  sha: z.string(), author: nullableActorSchema, committer: nullableActorSchema,
+  commit: z.object({
+    message: z.string().default(""),
+    author: z.object({ date: z.string().nullable().optional() }).strip().nullable().optional(),
+    committer: z.object({ date: z.string().nullable().optional() }).strip().nullable().optional(),
+    verification: z.object({ verified: z.boolean() }).strip().optional(),
+  }).strip(),
+  parents: z.array(z.object({ sha: z.string() }).strip()).default([]), html_url: z.string().optional(),
+}).strip();
+const branchSchema = z.object({ name: z.string(), commit: z.object({ sha: z.string() }).strip(), protected: z.boolean().optional() }).strip();
+const tagSchema = z.object({ name: z.string(), commit: z.object({ sha: z.string() }).strip() }).strip();
+const pullRequestSchema = z.object({
+  id: z.number().int().positive(), number: z.number().int().positive(), title: z.string(), state: z.string(), draft: z.boolean().optional(),
+  user: nullableActorSchema, merged_by: nullableActorSchema,
+  base: z.object({ ref: z.string(), sha: z.string() }).strip(), head: z.object({ ref: z.string(), sha: z.string() }).strip(),
+  html_url: z.string().optional(), created_at: z.string(), updated_at: z.string(), closed_at: z.string().nullable().optional(), merged_at: z.string().nullable().optional(),
+}).strip();
+const issueSchema = z.object({
+  id: z.number().int().positive(), number: z.number().int().positive(), title: z.string(), state: z.string(), state_reason: z.string().nullable().optional(),
+  user: nullableActorSchema, html_url: z.string().optional(), created_at: z.string(), updated_at: z.string(), closed_at: z.string().nullable().optional(),
+}).strip();
+const releaseSchema = z.object({
+  id: z.number().int().positive(), tag_name: z.string(), name: z.string().nullable().optional(), draft: z.boolean(), prerelease: z.boolean(),
+  author: nullableActorSchema, html_url: z.string().optional(), created_at: z.string(), published_at: z.string().nullable().optional(),
+}).strip();
+const unknownRecordSchema = z.record(z.unknown());
 
-type Requester = {
-  request: (route: string, parameters?: Record<string, unknown>) => Promise<{ data: unknown; headers?: Record<string, string | number | undefined> }>;
-};
+export type GithubResponseHeaders = Record<string, string | number | undefined>;
+export type GithubRequestResponse<T = unknown> = { data: T; status?: number; headers?: GithubResponseHeaders };
+type Requester = { request: (route: string, parameters?: Record<string, unknown>) => Promise<GithubRequestResponse> };
 
 export type GithubUser = { id: number; login: string; type?: string | undefined };
 export type GithubInstallation = z.infer<typeof installationSchema>;
 export type GithubRepository = z.infer<typeof repositorySchema>;
 export type GithubCommit = CommitFact & { htmlUrl?: string };
-
-export type InstallationRepositoryPage = {
-  repositories: GithubRepository[];
-  nextPage?: number;
+export type GithubBranch = { name: string; headSha: string; protected?: boolean };
+export type GithubTag = { name: string; targetSha: string };
+export type GithubPullRequest = {
+  id: number; number: number; title: string; state: string; draft?: boolean; author?: GithubActor; mergedBy?: GithubActor;
+  baseRef: string; baseSha: string; headRef: string; headSha: string; htmlUrl?: string;
+  createdAt: Date; updatedAt: Date; closedAt?: Date; mergedAt?: Date;
 };
+export type GithubIssue = {
+  id: number; number: number; title: string; state: string; stateReason?: string; author?: GithubActor; htmlUrl?: string;
+  createdAt: Date; updatedAt: Date; closedAt?: Date;
+};
+export type GithubRelease = {
+  id: number; tagName: string; name?: string; draft: boolean; prerelease: boolean; author?: GithubActor; htmlUrl?: string;
+  createdAt: Date; publishedAt?: Date;
+};
+
+export type InstallationRepositoryPage = { repositories: GithubRepository[]; nextPage?: number };
+export type GithubCommitPage = { commits: GithubCommit[]; nextPage?: number };
+export type GithubBranchPage = { branches: GithubBranch[]; nextPage?: number };
+export type GithubTagPage = { tags: GithubTag[]; nextPage?: number };
+export type GithubPullRequestPage = { pullRequests: GithubPullRequest[]; nextPage?: number };
+export type GithubIssuePage = { issues: GithubIssue[]; nextPage?: number };
+export type GithubReleasePage = { releases: GithubRelease[]; nextPage?: number };
+
+export type GithubPageInput = { owner: string; repo: string; page?: number; perPage?: number };
+export type ListCommitsInput = GithubPageInput & { sha?: string; since?: string };
+export type ListPullRequestsInput = GithubPageInput & { sort?: "created" | "updated" | "popularity" | "long-running"; direction?: "asc" | "desc" };
+export type ListIssuesInput = GithubPageInput & { since?: string; sort?: "created" | "updated" | "comments"; direction?: "asc" | "desc" };
 
 export function nextPageFromLink(link: unknown): number | undefined {
   const value = typeof link === "string" ? link : "";
@@ -106,55 +145,277 @@ export interface GithubClient {
   getInstallation(installationId: number): Promise<GithubInstallation>;
   listInstallationRepositories(page: number, perPage?: number): Promise<InstallationRepositoryPage>;
   getRepository(owner: string, repo: string): Promise<GithubRepository>;
-  listCommits(input: { owner: string; repo: string; sha?: string; page?: number; perPage?: number }): Promise<{ commits: GithubCommit[]; nextPage?: number }>;
+  listCommits(input: ListCommitsInput): Promise<GithubCommitPage>;
   getCommit(input: { owner: string; repo: string; ref: string }): Promise<GithubCommit>;
   getRefHead(input: { owner: string; repo: string; ref: string }): Promise<string | null>;
+  listBranches(input: GithubPageInput): Promise<GithubBranchPage>;
+  listTags(input: GithubPageInput): Promise<GithubTagPage>;
+  listPullRequests(input: ListPullRequestsInput): Promise<GithubPullRequestPage>;
+  listIssues(input: ListIssuesInput): Promise<GithubIssuePage>;
+  listReleases(input: GithubPageInput): Promise<GithubReleasePage>;
 }
 
-function toActor(raw: { id?: number | null; login?: string | null; type?: string | null } | null | undefined): GithubActor | undefined {
+function toActor(raw: z.infer<typeof actorSchema> | null | undefined): GithubActor | undefined {
   if (!raw?.id) return undefined;
-  return { githubAccountId: raw.id, ...(raw.login ? { login: raw.login } : {}), ...(raw.type ? { accountType: raw.type } : {}), actorKind: actorKindFromGithub(raw) };
+  const actorInput = { id: raw.id, ...(raw.login !== undefined ? { login: raw.login } : {}), ...(raw.type !== undefined ? { type: raw.type } : {}) };
+  return { githubAccountId: raw.id, ...(raw.login ? { login: raw.login } : {}), ...(raw.type ? { accountType: raw.type } : {}), actorKind: actorKindFromGithub(actorInput) };
 }
 
-function toCommit(raw: Record<string, any>): GithubCommit {
+function validDate(value: string | null | undefined): Date | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function requiredDate(value: string): Date {
+  const date = validDate(value);
+  if (!date) throw new Error("GitHub metadata contained an invalid timestamp");
+  return date;
+}
+
+function toCommit(input: unknown): GithubCommit {
+  const raw = commitSchema.parse(input);
   const author = toActor(raw.author);
   const committer = toActor(raw.committer);
-  const commit = raw.commit ?? {};
-  const authorDate = commit.author?.date ? new Date(commit.author.date) : undefined;
-  const committerDate = commit.committer?.date ? new Date(commit.committer.date) : undefined;
+  const authorDate = validDate(raw.commit.author?.date);
+  const committerDate = validDate(raw.commit.committer?.date);
   return {
-    repositoryId: "",
-    sha: String(raw.sha),
-    ...(author ? { author } : {}),
-    ...(committer ? { committer } : {}),
-    message: String(commit.message ?? ""),
-    ...(authorDate && !Number.isNaN(authorDate.getTime()) ? { authoredAt: authorDate } : {}),
-    ...(committerDate && !Number.isNaN(committerDate.getTime()) ? { committedAt: committerDate } : {}),
-    parents: Array.isArray(raw.parents) ? raw.parents.map((parent: { sha?: string }) => String(parent.sha ?? "")) : [],
-    ...(raw.commit?.verification?.verified !== undefined ? { verified: Boolean(raw.commit.verification.verified) } : {}),
-    ...(typeof raw.stats?.additions === "number" ? { additions: raw.stats.additions } : {}),
-    ...(typeof raw.stats?.deletions === "number" ? { deletions: raw.stats.deletions } : {}),
-    ...(typeof raw.html_url === "string" ? { htmlUrl: raw.html_url } : {}),
+    repositoryId: "", sha: raw.sha, ...(author ? { author } : {}), ...(committer ? { committer } : {}), message: raw.commit.message,
+    ...(authorDate ? { authoredAt: authorDate } : {}), ...(committerDate ? { committedAt: committerDate } : {}),
+    parents: raw.parents.map((parent) => parent.sha),
+    ...(raw.commit.verification?.verified !== undefined ? { verified: raw.commit.verification.verified } : {}),
+    ...(raw.html_url ? { htmlUrl: raw.html_url } : {}),
   };
+}
+
+function toPullRequest(input: unknown): GithubPullRequest {
+  const raw = pullRequestSchema.parse(input);
+  const author = toActor(raw.user);
+  const mergedBy = toActor(raw.merged_by);
+  const closedAt = validDate(raw.closed_at);
+  const mergedAt = validDate(raw.merged_at);
+  return {
+    id: raw.id, number: raw.number, title: raw.title, state: raw.state, ...(raw.draft !== undefined ? { draft: raw.draft } : {}),
+    ...(author ? { author } : {}), ...(mergedBy ? { mergedBy } : {}),
+    baseRef: raw.base.ref, baseSha: raw.base.sha, headRef: raw.head.ref, headSha: raw.head.sha,
+    ...(raw.html_url ? { htmlUrl: raw.html_url } : {}), createdAt: requiredDate(raw.created_at), updatedAt: requiredDate(raw.updated_at),
+    ...(closedAt ? { closedAt } : {}), ...(mergedAt ? { mergedAt } : {}),
+  };
+}
+
+function toIssue(input: unknown): GithubIssue {
+  const raw = issueSchema.parse(input);
+  const author = toActor(raw.user);
+  const closedAt = validDate(raw.closed_at);
+  return {
+    id: raw.id, number: raw.number, title: raw.title, state: raw.state, ...(raw.state_reason ? { stateReason: raw.state_reason } : {}),
+    ...(author ? { author } : {}), ...(raw.html_url ? { htmlUrl: raw.html_url } : {}),
+    createdAt: requiredDate(raw.created_at), updatedAt: requiredDate(raw.updated_at), ...(closedAt ? { closedAt } : {}),
+  };
+}
+
+function toRelease(input: unknown): GithubRelease {
+  const raw = releaseSchema.parse(input);
+  const author = toActor(raw.author);
+  const publishedAt = validDate(raw.published_at);
+  return {
+    id: raw.id, tagName: raw.tag_name, ...(raw.name ? { name: raw.name } : {}), draft: raw.draft, prerelease: raw.prerelease,
+    ...(author ? { author } : {}), ...(raw.html_url ? { htmlUrl: raw.html_url } : {}), createdAt: requiredDate(raw.created_at),
+    ...(publishedAt ? { publishedAt } : {}),
+  };
+}
+
+function pageParameters(page = 1, perPage = DEFAULT_PER_PAGE): { page: number; per_page: number } {
+  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > DEFAULT_PER_PAGE) {
+    throw new RangeError("GitHub pagination must use page >= 1 and perPage from 1 through 100");
+  }
+  return { page, per_page: perPage };
+}
+
+function nextPageResult<T extends Record<string, unknown>>(items: T, response: GithubRequestResponse): T & { nextPage?: number } {
+  const nextPage = nextPageFromLink(headerValue(response.headers, "link"));
+  return { ...items, ...(nextPage ? { nextPage } : {}) };
+}
+
+function headerValue(headers: GithubResponseHeaders | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  const lowerName = name.toLowerCase();
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === lowerName)?.[1];
+  return entry === undefined ? undefined : String(entry);
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const direct = "status" in error ? error.status : undefined;
+  if (typeof direct === "number") return direct;
+  const response = "response" in error && typeof error.response === "object" && error.response !== null ? error.response : undefined;
+  return response && "status" in response && typeof response.status === "number" ? response.status : undefined;
+}
+
+function errorHeaders(error: unknown): GithubResponseHeaders | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const response = "response" in error && typeof error.response === "object" && error.response !== null ? error.response : undefined;
+  const candidate = response && "headers" in response ? response.headers : "headers" in error ? error.headers : undefined;
+  return typeof candidate === "object" && candidate !== null ? candidate as GithubResponseHeaders : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  if (typeof error !== "object" || error === null) return "";
+  const response = "response" in error && typeof error.response === "object" && error.response !== null ? error.response : undefined;
+  const data = response && "data" in response && typeof response.data === "object" && response.data !== null ? response.data : undefined;
+  if (data && "message" in data && typeof data.message === "string") return data.message;
+  return "message" in error && typeof error.message === "string" ? error.message : "";
+}
+
+function retryAfterResumeAt(value: string | undefined, now: number): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return now + seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(now, date);
+}
+
+function resetResumeAt(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+}
+
+export type GithubRateLimitCode = "primary_rate_limit" | "secondary_rate_limit" | "retry_after";
+export type GithubAccessCode = "unauthorized" | "forbidden" | "not_found";
+
+export class GithubRateLimitPauseError extends Error {
+  constructor(readonly code: GithubRateLimitCode, readonly status: number, readonly resumeAt: Date) {
+    super("GitHub installation request paused");
+    this.name = "GithubRateLimitPauseError";
+  }
+  toJSON(): { class: string; code: GithubRateLimitCode; status: number; resumeAt: string } {
+    return { class: this.name, code: this.code, status: this.status, resumeAt: this.resumeAt.toISOString() };
+  }
+}
+
+export class GithubAccessError extends Error {
+  constructor(readonly code: GithubAccessCode, readonly status: number) {
+    super("GitHub installation access unavailable");
+    this.name = "GithubAccessError";
+  }
+  toJSON(): { class: string; code: GithubAccessCode; status: number } {
+    return { class: this.name, code: this.code, status: this.status };
+  }
+}
+
+function pauseFromMetadata(input: { status?: number | undefined; headers?: GithubResponseHeaders | undefined; message?: string | undefined }, now: number): GithubRateLimitPauseError | undefined {
+  const retryAt = retryAfterResumeAt(headerValue(input.headers, "retry-after"), now);
+  const remaining = Number(headerValue(input.headers, "x-ratelimit-remaining"));
+  const resetAt = resetResumeAt(headerValue(input.headers, "x-ratelimit-reset"));
+  const secondary = (input.status === 403 || input.status === 429) && /secondary rate limit|abuse detection/i.test(input.message ?? "");
+  const primary = remaining === 0;
+  if (!retryAt && !primary && !secondary) return undefined;
+  const code: GithubRateLimitCode = secondary ? "secondary_rate_limit" : primary ? "primary_rate_limit" : "retry_after";
+  const fallbackAt = now + SECONDARY_LIMIT_FALLBACK_MS;
+  const resumeAt = Math.max(now, retryAt ?? 0, primary ? (resetAt ?? fallbackAt) : 0, secondary && !retryAt ? fallbackAt : 0);
+  return new GithubRateLimitPauseError(code, input.status ?? 429, new Date(resumeAt));
+}
+
+function classifyRequestError(error: unknown, now: number): Error {
+  if (error instanceof GithubRateLimitPauseError || error instanceof GithubAccessError) return error;
+  const status = errorStatus(error);
+  const pause = pauseFromMetadata({ status, headers: errorHeaders(error), message: errorMessage(error) }, now);
+  if (pause) return pause;
+  if (status === 401) return new GithubAccessError("unauthorized", status);
+  if (status === 403) return new GithubAccessError("forbidden", status);
+  if (status === 404) return new GithubAccessError("not_found", status);
+  // Never let an upstream response message cross the client boundary: GitHub
+  // errors can echo repository names, paths, or content supplied by fixtures.
+  return new Error("GitHub installation request failed");
+}
+
+type LaneTask = { request: () => Promise<GithubRequestResponse>; resolve: (response: GithubRequestResponse) => void; reject: (error: unknown) => void };
+type LaneState = {
+  active: number;
+  pausedUntil: number | undefined;
+  pauseCode: GithubRateLimitCode | undefined;
+  pauseStatus: number | undefined;
+  queue: LaneTask[];
+};
+
+/** Non-sleeping installation-keyed scheduler. Callers persist pause errors and retry later. */
+export class InstallationRequestLanes {
+  private readonly lanes = new Map<number, LaneState>();
+
+  constructor(private readonly concurrency: 1 | 2 = 1, private readonly now: () => number = Date.now) {
+    if (concurrency !== 1 && concurrency !== 2) throw new RangeError("GitHub installation request concurrency must be 1 or 2");
+  }
+
+  run(installationId: number, request: () => Promise<GithubRequestResponse>): Promise<GithubRequestResponse> {
+    const lane = this.lanes.get(installationId) ?? { active: 0, pausedUntil: undefined, pauseCode: undefined, pauseStatus: undefined, queue: [] };
+    this.lanes.set(installationId, lane);
+    return new Promise((resolve, reject) => {
+      lane.queue.push({ request, resolve, reject });
+      this.pump(lane);
+    });
+  }
+
+  private pump(lane: LaneState): void {
+    while (lane.active < this.concurrency && lane.queue.length > 0) {
+      const task = lane.queue.shift();
+      if (!task) return;
+      const now = this.now();
+      if (lane.pausedUntil !== undefined && lane.pausedUntil > now) {
+        task.reject(new GithubRateLimitPauseError(lane.pauseCode ?? "primary_rate_limit", lane.pauseStatus ?? 429, new Date(lane.pausedUntil)));
+        continue;
+      }
+      if (lane.pausedUntil !== undefined) {
+        lane.pausedUntil = undefined;
+        lane.pauseCode = undefined;
+        lane.pauseStatus = undefined;
+      }
+      lane.active += 1;
+      void Promise.resolve().then(task.request).then((response) => {
+        const successPause = pauseFromMetadata({ status: response.status, headers: response.headers }, this.now());
+        if (successPause) {
+          lane.pausedUntil = successPause.resumeAt.getTime();
+          lane.pauseCode = successPause.code;
+          lane.pauseStatus = successPause.status;
+        }
+        task.resolve(response);
+      }).catch((rawError: unknown) => {
+        const error = classifyRequestError(rawError, this.now());
+        if (error instanceof GithubRateLimitPauseError) {
+          lane.pausedUntil = error.resumeAt.getTime();
+          lane.pauseCode = error.code;
+          lane.pauseStatus = error.status;
+        }
+        task.reject(error);
+      }).finally(() => {
+        lane.active -= 1;
+        this.pump(lane);
+      });
+    }
+  }
 }
 
 export class OctokitGithubClient implements GithubClient {
   private readonly app: App;
   private readonly apiVersion: string;
-  private readonly installationClients = new Map<number, Requester>();
+  private readonly installationClients = new Map<number, Promise<Requester>>();
+  private readonly installationRequestLanes: InstallationRequestLanes;
 
-  constructor(input: { appId: number; privateKey: string; apiVersion?: string; webhookSecret?: string }) {
+  constructor(input: { appId: number; privateKey: string; apiVersion?: string; webhookSecret?: string; installationRequestConcurrency?: 1 | 2 }) {
     this.apiVersion = input.apiVersion ?? API_VERSION;
+    this.installationRequestLanes = new InstallationRequestLanes(input.installationRequestConcurrency ?? 1);
     this.app = new App({ appId: input.appId, privateKey: input.privateKey, ...(input.webhookSecret ? { webhooks: { secret: input.webhookSecret } } : {}) });
   }
 
-  private async installationClient(installationId: number): Promise<Requester> {
+  private installationClient(installationId: number): Promise<Requester> {
     const existing = this.installationClients.get(installationId);
     if (existing) return existing;
-    const client = await this.app.getInstallationOctokit(installationId);
-    const requester: Requester = { request: (route, parameters) => client.request(route, { ...parameters, headers: { ...(parameters?.headers as Record<string, string> | undefined), "X-GitHub-Api-Version": this.apiVersion } }) };
-    this.installationClients.set(installationId, requester);
-    return requester;
+    const pending = this.app.getInstallationOctokit(installationId).then((client) => ({
+      request: (route: string, parameters?: Record<string, unknown>) => client.request(route, { ...parameters, headers: { ...(parameters?.headers as Record<string, string> | undefined), "X-GitHub-Api-Version": this.apiVersion } }),
+    }));
+    this.installationClients.set(installationId, pending);
+    void pending.catch(() => this.installationClients.delete(installationId));
+    return pending;
   }
 
   async getUser(accessToken: string): Promise<GithubUser> {
@@ -167,47 +428,41 @@ export class OctokitGithubClient implements GithubClient {
   async exchangeOAuthCode(input: { code: string; clientId: string; clientSecret: string; redirectUri: string; codeVerifier: string }): Promise<{ accessToken: string }> {
     assertGithubEndpointAllowed("POST /login/oauth/access_token");
     const response = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json" },
+      method: "POST", headers: { accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify({ client_id: input.clientId, client_secret: input.clientSecret, code: input.code, redirect_uri: input.redirectUri, code_verifier: input.codeVerifier }),
     });
     if (!response.ok) throw new Error(`GitHub OAuth exchange failed: ${response.status}`);
-    const body = (await response.json()) as { access_token?: string; error?: string };
-    if (!body.access_token) throw new Error(`GitHub OAuth exchange failed: ${body.error ?? "missing token"}`);
+    const body = (await response.json()) as { access_token?: string };
+    if (!body.access_token) throw new Error("GitHub OAuth exchange failed");
     return { accessToken: body.access_token };
   }
 
   async getInstallation(installationId: number): Promise<GithubInstallation> {
     assertGithubEndpointAllowed("GET /app/installations/{installation_id}");
-    const response = await this.app.octokit.request("GET /app/installations/{installation_id}", { installation_id: installationId, headers: { "X-GitHub-Api-Version": this.apiVersion } });
+    const response = await this.installationRequestLanes.run(installationId, () => this.app.octokit.request("GET /app/installations/{installation_id}", {
+      installation_id: installationId,
+      headers: { "X-GitHub-Api-Version": this.apiVersion },
+    }));
     return installationSchema.parse(response.data);
   }
 
-  async listInstallationRepositories(page: number, perPage = 100): Promise<InstallationRepositoryPage> {
-    // Installation repository inventory is called with an installation client in production.
-    // The explicit method below is overridden by createInstallationGithubClient.
-    throw new Error(`Installation repository listing requires createInstallationGithubClient (page ${page}, perPage ${perPage})`);
-  }
+  async listInstallationRepositories(page: number, perPage = DEFAULT_PER_PAGE): Promise<InstallationRepositoryPage> { void page; void perPage; throw new Error("Installation repository listing requires an installation client"); }
+  async getRepository(owner: string, repo: string): Promise<GithubRepository> { void owner; void repo; throw new Error("Repository reads require an installation client"); }
+  async listCommits(input: ListCommitsInput): Promise<GithubCommitPage> { void input; throw new Error("Commit reads require an installation client"); }
+  async getCommit(input: { owner: string; repo: string; ref: string }): Promise<GithubCommit> { void input; throw new Error("Commit reads require an installation client"); }
+  async getRefHead(input: { owner: string; repo: string; ref: string }): Promise<string | null> { void input; throw new Error("Reference reads require an installation client"); }
+  async listBranches(input: GithubPageInput): Promise<GithubBranchPage> { void input; throw new Error("Branch reads require an installation client"); }
+  async listTags(input: GithubPageInput): Promise<GithubTagPage> { void input; throw new Error("Tag reads require an installation client"); }
+  async listPullRequests(input: ListPullRequestsInput): Promise<GithubPullRequestPage> { void input; throw new Error("Pull request reads require an installation client"); }
+  async listIssues(input: ListIssuesInput): Promise<GithubIssuePage> { void input; throw new Error("Issue reads require an installation client"); }
+  async listReleases(input: GithubPageInput): Promise<GithubReleasePage> { void input; throw new Error("Release reads require an installation client"); }
 
-  async getRepository(owner: string, repo: string): Promise<GithubRepository> {
-    throw new Error(`Use createInstallationGithubClient for repository reads: ${owner}/${repo}`);
-  }
-
-  async listCommits(input: { owner: string; repo: string; sha?: string; page?: number; perPage?: number }): Promise<{ commits: GithubCommit[]; nextPage?: number }> {
-    throw new Error(`Use createInstallationGithubClient for commit reads: ${input.owner}/${input.repo}`);
-  }
-
-  async getCommit(input: { owner: string; repo: string; ref: string }): Promise<GithubCommit> {
-    throw new Error(`Use createInstallationGithubClient for commit reads: ${input.owner}/${input.repo}@${input.ref}`);
-  }
-
-  async getRefHead(input: { owner: string; repo: string; ref: string }): Promise<string | null> {
-    throw new Error(`Use createInstallationGithubClient for ref reads: ${input.owner}/${input.repo}:${input.ref}`);
-  }
-
-  protected async requestInstallation(installationId: number, route: string, params?: Record<string, unknown>) {
-    const client = await this.installationClient(installationId);
-    return client.request(route, params);
+  protected async requestInstallation(installationId: number, route: string, params?: Record<string, unknown>): Promise<GithubRequestResponse> {
+    assertGithubEndpointAllowed(route);
+    return this.installationRequestLanes.run(installationId, async () => {
+      const client = await this.installationClient(installationId);
+      return client.request(route, params);
+    });
   }
 }
 
@@ -218,46 +473,72 @@ export class InstallationGithubClient implements GithubClient {
   exchangeOAuthCode(input: { code: string; clientId: string; clientSecret: string; redirectUri: string; codeVerifier: string }) { return this.base.exchangeOAuthCode(input); }
   getInstallation(installationId: number) { return this.base.getInstallation(installationId); }
 
-  async listInstallationRepositories(page: number, perPage = 100): Promise<InstallationRepositoryPage> {
-    assertGithubEndpointAllowed("GET /installation/repositories");
-    const response = await this.base["requestInstallation"](this.installationId, "GET /installation/repositories", { page, per_page: perPage });
+  async listInstallationRepositories(page: number, perPage = DEFAULT_PER_PAGE): Promise<InstallationRepositoryPage> {
+    const response = await this.request("GET /installation/repositories", pageParameters(page, perPage));
     const data = z.object({ repositories: z.array(repositorySchema).default([]) }).strip().parse(response.data);
-    const link = String(response.headers?.link ?? "");
-    const nextPage = nextPageFromLink(link);
-    return { repositories: data.repositories, ...(nextPage ? { nextPage } : {}) };
+    return nextPageResult({ repositories: data.repositories }, response);
   }
 
   async getRepository(owner: string, repo: string): Promise<GithubRepository> {
-    assertGithubEndpointAllowed("GET /repos/{owner}/{repo}");
-    const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}", { owner, repo });
+    const response = await this.request("GET /repos/{owner}/{repo}", { owner, repo });
     return repositorySchema.parse(response.data);
   }
 
-  async listCommits(input: { owner: string; repo: string; sha?: string; page?: number; perPage?: number }): Promise<{ commits: GithubCommit[]; nextPage?: number }> {
-    assertGithubEndpointAllowed("GET /repos/{owner}/{repo}/commits");
-    const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}/commits", { owner: input.owner, repo: input.repo, ...(input.sha ? { sha: input.sha } : {}), page: input.page ?? 1, per_page: input.perPage ?? 100 });
-    const commits = z.array(z.record(z.unknown())).parse(response.data).map((commit) => toCommit(commit));
-    const link = String(response.headers?.link ?? "");
-    const nextPage = nextPageFromLink(link);
-    return { commits, ...(nextPage ? { nextPage } : {}) };
+  async listCommits(input: ListCommitsInput): Promise<GithubCommitPage> {
+    const response = await this.request("GET /repos/{owner}/{repo}/commits", {
+      owner: input.owner, repo: input.repo, ...(input.sha ? { sha: input.sha } : {}), ...(input.since ? { since: input.since } : {}), ...pageParameters(input.page, input.perPage),
+    });
+    const commits = z.array(commitSchema).parse(response.data).map((commit) => toCommit(commit));
+    return nextPageResult({ commits }, response);
   }
 
   async getCommit(input: { owner: string; repo: string; ref: string }): Promise<GithubCommit> {
-    assertGithubEndpointAllowed("GET /repos/{owner}/{repo}/commits/{ref}");
-    const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}/commits/{ref}", { owner: input.owner, repo: input.repo, ref: input.ref });
-    return toCommit(z.record(z.unknown()).parse(response.data));
+    const response = await this.request("GET /repos/{owner}/{repo}/commits/{ref}", { owner: input.owner, repo: input.repo, ref: input.ref });
+    return toCommit(response.data);
   }
 
   async getRefHead(input: { owner: string; repo: string; ref: string }): Promise<string | null> {
-    assertGithubEndpointAllowed("GET /repos/{owner}/{repo}/git/ref/{ref}");
-    try {
-      const response = await this.base["requestInstallation"](this.installationId, "GET /repos/{owner}/{repo}/git/ref/{ref}", { owner: input.owner, repo: input.repo, ref: githubRefParameter(input.ref) });
-      const data = z.object({ object: z.object({ sha: z.string() }).strip() }).strip().parse(response.data);
-      return data.object.sha;
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "status" in error && error.status === 404) return null;
-      throw error;
-    }
+    const response = await this.request("GET /repos/{owner}/{repo}/git/ref/{ref}", { owner: input.owner, repo: input.repo, ref: githubRefParameter(input.ref) });
+    return z.object({ object: z.object({ sha: z.string() }).strip() }).strip().parse(response.data).object.sha;
+  }
+
+  async listBranches(input: GithubPageInput): Promise<GithubBranchPage> {
+    const response = await this.request("GET /repos/{owner}/{repo}/branches", { owner: input.owner, repo: input.repo, ...pageParameters(input.page, input.perPage) });
+    const branches = z.array(branchSchema).parse(response.data).map((branch) => ({ name: branch.name, headSha: branch.commit.sha, ...(branch.protected !== undefined ? { protected: branch.protected } : {}) }));
+    return nextPageResult({ branches }, response);
+  }
+
+  async listTags(input: GithubPageInput): Promise<GithubTagPage> {
+    const response = await this.request("GET /repos/{owner}/{repo}/tags", { owner: input.owner, repo: input.repo, ...pageParameters(input.page, input.perPage) });
+    const tags = z.array(tagSchema).parse(response.data).map((tag) => ({ name: tag.name, targetSha: tag.commit.sha }));
+    return nextPageResult({ tags }, response);
+  }
+
+  async listPullRequests(input: ListPullRequestsInput): Promise<GithubPullRequestPage> {
+    const response = await this.request("GET /repos/{owner}/{repo}/pulls", {
+      owner: input.owner, repo: input.repo, state: "all", ...(input.sort ? { sort: input.sort } : {}), ...(input.direction ? { direction: input.direction } : {}), ...pageParameters(input.page, input.perPage),
+    });
+    const pullRequests = z.array(pullRequestSchema).parse(response.data).map((pullRequest) => toPullRequest(pullRequest));
+    return nextPageResult({ pullRequests }, response);
+  }
+
+  async listIssues(input: ListIssuesInput): Promise<GithubIssuePage> {
+    const response = await this.request("GET /repos/{owner}/{repo}/issues", {
+      owner: input.owner, repo: input.repo, state: "all", ...(input.since ? { since: input.since } : {}), ...(input.sort ? { sort: input.sort } : {}),
+      ...(input.direction ? { direction: input.direction } : {}), ...pageParameters(input.page, input.perPage),
+    });
+    const records = z.array(unknownRecordSchema).parse(response.data).filter((issue) => !("pull_request" in issue));
+    return nextPageResult({ issues: records.map((issue) => toIssue(issue)) }, response);
+  }
+
+  async listReleases(input: GithubPageInput): Promise<GithubReleasePage> {
+    const response = await this.request("GET /repos/{owner}/{repo}/releases", { owner: input.owner, repo: input.repo, ...pageParameters(input.page, input.perPage) });
+    const releases = z.array(releaseSchema).parse(response.data).map((release) => toRelease(release));
+    return nextPageResult({ releases }, response);
+  }
+
+  private request(route: string, parameters?: Record<string, unknown>): Promise<GithubRequestResponse> {
+    return this.base["requestInstallation"](this.installationId, route, parameters);
   }
 }
 

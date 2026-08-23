@@ -6,7 +6,7 @@ import type { AppConfig } from "@devmemoir/config";
 import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, parseWebhook } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import type { JobPort } from "@devmemoir/jobs";
-import { deliveryLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
+import { deliveryLogicalKey, historicalBackfillLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { RepositorySelectionError, type M1Store, type SessionRecord } from "@devmemoir/db";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
@@ -87,7 +87,36 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     await deps.jobs.enqueue("installation_inventory", logicalKey, payload);
   };
 
-  app.get("/health", async () => ({ ok: true, service: "api", m1: true, m2: true }));
+  const enqueueHistoricalWake = async (tenantId: string, repositoryId: string, installationGithubId: number): Promise<void> => {
+    const logicalKey = historicalBackfillLogicalKey(repositoryId, "coordinator");
+    const payload = { kind: "repository_backfill", tenantId, repositoryId, installationId: installationGithubId };
+    await deps.store.ensureJob(logicalKey, payload);
+    await deps.jobs.enqueue("repository_backfill", logicalKey, payload);
+  };
+
+  const historicalStatus = async (tenantId: string, repositoryId: string) => {
+    const progress = await deps.store.listHistoricalProgress(tenantId, repositoryId);
+    const counts = await deps.store.getHistoricalSourceCounts(tenantId, repositoryId);
+    const current = progress.find((stage) => stage.status === "paused" || stage.status === "in_progress")
+      ?? progress.find((stage) => stage.status === "pending")
+      ?? progress.find((stage) => stage.stage === "completed");
+    const lastSuccess = progress.reduce<Date | undefined>((latest, stage) => !stage.lastSuccessAt || (latest && latest >= stage.lastSuccessAt) ? latest : stage.lastSuccessAt, undefined);
+    return {
+      status: current?.status ?? "pending",
+      stage: current?.stage ?? "default_branch_commits",
+      ...(lastSuccess ? { lastSuccessAt: lastSuccess.toISOString() } : {}),
+      ...(current?.pausedUntil ? { pausedUntil: current.pausedUntil.toISOString() } : {}),
+      counts,
+      completeness: {
+        observed: "Historical facts observed from the connected repository through supported GitHub APIs.",
+        reachableAtSync: "Commit reachability reflects the authoritative default-branch head at the last committed traversal.",
+        knownUnknown: "Deleted or rewritten history that DevMemoir never observed may be unavailable.",
+        outOfScope: "Bodies, comments, source files, paths, patches, artifacts, and all-active-branch historical traversal are not imported in M3.",
+      },
+    };
+  };
+
+  app.get("/health", async () => ({ ok: true, service: "api", m1: true, m2: true, m3: true }));
 
   app.get<{ Querystring: { returnPath?: string } }>("/auth/github/start", async (request, reply) => {
     const started = await auth.startLogin(request.query.returnPath ?? "/");
@@ -178,7 +207,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       connected: true,
       installationStatus: installation.status ?? "active",
       lastInventoryAt: installation.lastInventoryAt?.toISOString(),
-      repositories: repositories.map((repository) => ({
+      repositories: await Promise.all(repositories.map(async (repository) => ({
         id: repository.id,
         githubRepositoryId: repository.githubRepositoryId,
         fullName: repository.fullName,
@@ -193,7 +222,8 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
         lastAuthoritativeObservedAt: repository.lastAuthoritativeObservedAt?.toISOString(),
         archived: repository.archived === true,
         disabled: repository.disabled === true,
-      })),
+        historical: await historicalStatus(session.tenantId, repository.id),
+      }))),
     };
   });
 
@@ -226,12 +256,24 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       throw error;
     }
     if (!connectedRepository) return reply.code(409).send({ error: "repository_access_unavailable" });
-    const client = deps.installationGithub?.(installation.githubInstallationId) ?? deps.github;
-    const head = await client.getRefHead({ owner: connectedRepository.ownerLogin, repo: connectedRepository.name, ref: connectedRepository.defaultBranch });
-    const jobPayload = { kind: "repository_backfill", tenantId: connectedRepository.tenantId, repositoryId: connectedRepository.id, installationId: installation.githubInstallationId, owner: connectedRepository.ownerLogin, repo: connectedRepository.name, ref: `refs/heads/${connectedRepository.defaultBranch}`, before: "0".repeat(40), after: head ?? "0".repeat(40), forced: false };
-    await deps.store.ensureJob(`backfill:${connectedRepository.id}`, jobPayload);
-    await deps.jobs.enqueue("repository_backfill", `backfill:${connectedRepository.id}`, jobPayload);
-    return reply.code(201).send({ repository: connectedRepository, completeness: "Newest 100 commits currently reachable from the default branch of this connected repository." });
+    await enqueueHistoricalWake(connectedRepository.tenantId, connectedRepository.id, installation.githubInstallationId);
+    return reply.code(201).send({
+      repository: connectedRepository,
+      completeness: "Historical facts observed from the connected repository through supported GitHub APIs. Deleted or rewritten history that DevMemoir never observed may be unavailable.",
+    });
+  });
+
+  app.post<{ Body: { repositoryId?: string } }>("/connect/repository/backfill", async (request, reply) => {
+    const session = await requireCsrf(request as RequestWithSession, reply);
+    if (!session) return;
+    if (!request.body?.repositoryId) return reply.code(400).send({ error: "repository_required" });
+    const repository = await deps.store.getRepositoryById(session.tenantId, request.body.repositoryId);
+    const installation = await deps.store.getActiveInstallationForTenant(session.tenantId);
+    if (!repository || !installation || repository.installationId !== installation.id || repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) {
+      return reply.code(409).send({ error: "repository_backfill_unavailable" });
+    }
+    await enqueueHistoricalWake(session.tenantId, repository.id, installation.githubInstallationId);
+    return reply.code(202).send({ queued: true, historical: await historicalStatus(session.tenantId, repository.id) });
   });
 
   app.post<{ Body: { repositoryId?: string } }>("/connect/repository/unselect", async (request, reply) => {
@@ -315,7 +357,12 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     if (!session) return;
     const repositories = await deps.store.listRepositories(session.tenantId);
     const events = defaultTimelineEvents(await deps.store.listActivity(session.tenantId, request.query.repositoryId), deps.config.OWNER_GITHUB_USER_ID);
-    return { completeness: "Newest 100 commits currently reachable from the default branch of this connected repository.", ...(repositories[0] ? { repository: { id: repositories[0].id, fullName: repositories[0].fullName, private: repositories[0].private } } : {}), events: events.map((event) => { const sourceUrl = (event as typeof event & { htmlUrl?: string }).htmlUrl; return { id: event.id, repositoryId: event.repositoryId, occurredAt: event.occurredAt.toISOString(), verb: event.verb, contributionRole: event.contributionRole, contextKind: event.contextKind, actorKind: event.actorKind, ...(event.summaryInput ? { message: event.summaryInput } : {}), ...(sourceUrl ? { sourceUrl } : {}) }; }) };
+    const selected = repositories[0];
+    return {
+      completeness: "Newest 100 commits currently reachable from the default branch of this connected repository.",
+      ...(selected ? { repository: { id: selected.id, fullName: selected.fullName, private: selected.private }, historical: await historicalStatus(session.tenantId, selected.id) } : {}),
+      events: events.map((event) => { const sourceUrl = (event as typeof event & { htmlUrl?: string }).htmlUrl; return { id: event.id, repositoryId: event.repositoryId, occurredAt: event.occurredAt.toISOString(), verb: event.verb, contributionRole: event.contributionRole, contextKind: event.contextKind, actorKind: event.actorKind, ...(event.summaryInput ? { message: event.summaryInput } : {}), ...(sourceUrl ? { sourceUrl } : {}) }; }),
+    };
   });
 
   app.setErrorHandler((error, request, reply) => {

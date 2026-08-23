@@ -85,6 +85,8 @@ export const githubInstallations = pgTable("github_installations", {
   suspendedAt: nullableTime("suspended_at"),
   deletedAt: nullableTime("deleted_at"),
   lastInventoryAt: nullableTime("last_inventory_at"),
+  apiPausedUntil: nullableTime("api_paused_until"),
+  apiPauseReason: varchar("api_pause_reason", { length: 120 }),
   createdAt: time("created_at"),
   updatedAt: time("updated_at"),
 }, (table) => [uniqueIndex("github_installations_external_id_unique").on(table.githubInstallationId), uniqueIndex("github_installations_tenant_id_unique").on(table.tenantId, table.id), index("github_installations_tenant_idx").on(table.tenantId)]);
@@ -160,7 +162,10 @@ export const branches = pgTable("branches", {
   headSha: varchar("head_sha", { length: 64 }),
   protected: boolean("protected").notNull().default(false),
   reachable: boolean("reachable").notNull().default(true),
+  firstSeenAt: nullableTime("first_seen_at"),
   lastSeenAt: nullableTime("last_seen_at"),
+  lastAuthoritativeObservedAt: nullableTime("last_authoritative_observed_at"),
+  observationGeneration: nullableTime("observation_generation"),
   deletedAt: nullableTime("deleted_at"),
 }, (table) => [uniqueIndex("branches_repo_name_unique").on(table.tenantId, table.repositoryId, table.name)]);
 
@@ -219,6 +224,102 @@ export const commitRefs = pgTable("commit_refs", {
 }, (table) => [
   primaryKey({ columns: [table.tenantId, table.commitId, table.branchId] }),
   index("commit_refs_branch_reachable_idx").on(table.tenantId, table.branchId, table.reachable),
+]);
+
+export const tags = pgTable("tags", {
+  id: id(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  name: varchar("name", { length: 255 }).notNull(),
+  targetSha: varchar("target_sha", { length: 64 }).notNull(),
+  targetType: varchar("target_type", { length: 30 }),
+  reachable: boolean("reachable").notNull().default(true),
+  completenessState: varchar("completeness_state", { length: 40 }).notNull().default("reachable_at_sync"),
+  firstSeenAt: time("first_seen_at"),
+  lastSeenAt: time("last_seen_at"),
+  lastAuthoritativeObservedAt: time("last_authoritative_observed_at"),
+  observationGeneration: time("observation_generation"),
+  deletedAt: nullableTime("deleted_at"),
+}, (table) => [
+  uniqueIndex("tags_repo_name_unique").on(table.tenantId, table.repositoryId, table.name),
+  index("tags_repo_reachable_idx").on(table.tenantId, table.repositoryId, table.reachable),
+]);
+
+export const pullRequests = pgTable("pull_requests", {
+  id: id(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  githubPullRequestId: bigint("github_pull_request_id", { mode: "number" }).notNull(),
+  number: integer("number").notNull(),
+  title: text("title").notNull(),
+  state: varchar("state", { length: 30 }).notNull(),
+  draft: boolean("draft").notNull().default(false),
+  authorGithubAccountId: uuid("author_github_account_id").references(() => githubAccounts.id),
+  authorActorKind: varchar("author_actor_kind", { length: 20 }).notNull().default("unknown"),
+  mergerGithubAccountId: uuid("merger_github_account_id").references(() => githubAccounts.id),
+  baseRef: varchar("base_ref", { length: 500 }),
+  baseSha: varchar("base_sha", { length: 64 }),
+  headRef: varchar("head_ref", { length: 500 }),
+  headSha: varchar("head_sha", { length: 64 }),
+  sourceUrl: text("source_url"),
+  githubCreatedAt: time("github_created_at"),
+  githubUpdatedAt: time("github_updated_at"),
+  githubClosedAt: nullableTime("github_closed_at"),
+  githubMergedAt: nullableTime("github_merged_at"),
+  firstSeenAt: time("first_seen_at"),
+  lastSeenAt: time("last_seen_at"),
+  completenessState: varchar("completeness_state", { length: 40 }).notNull().default("observed"),
+}, (table) => [
+  uniqueIndex("pull_requests_repo_github_id_unique").on(table.tenantId, table.repositoryId, table.githubPullRequestId),
+  uniqueIndex("pull_requests_repo_number_unique").on(table.tenantId, table.repositoryId, table.number),
+  index("pull_requests_repo_updated_idx").on(table.tenantId, table.repositoryId, table.githubUpdatedAt),
+]);
+
+export const issues = pgTable("issues", {
+  id: id(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  githubIssueId: bigint("github_issue_id", { mode: "number" }).notNull(),
+  number: integer("number").notNull(),
+  title: text("title").notNull(),
+  state: varchar("state", { length: 30 }).notNull(),
+  stateReason: varchar("state_reason", { length: 40 }),
+  authorGithubAccountId: uuid("author_github_account_id").references(() => githubAccounts.id),
+  authorActorKind: varchar("author_actor_kind", { length: 20 }).notNull().default("unknown"),
+  sourceUrl: text("source_url"),
+  githubCreatedAt: time("github_created_at"),
+  githubUpdatedAt: time("github_updated_at"),
+  githubClosedAt: nullableTime("github_closed_at"),
+  firstSeenAt: time("first_seen_at"),
+  lastSeenAt: time("last_seen_at"),
+  completenessState: varchar("completeness_state", { length: 40 }).notNull().default("observed"),
+}, (table) => [
+  uniqueIndex("issues_repo_github_id_unique").on(table.tenantId, table.repositoryId, table.githubIssueId),
+  uniqueIndex("issues_repo_number_unique").on(table.tenantId, table.repositoryId, table.number),
+  index("issues_repo_updated_idx").on(table.tenantId, table.repositoryId, table.githubUpdatedAt),
+]);
+
+export const releases = pgTable("releases", {
+  id: id(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  githubReleaseId: bigint("github_release_id", { mode: "number" }).notNull(),
+  tagName: varchar("tag_name", { length: 255 }).notNull(),
+  name: text("name"),
+  draft: boolean("draft").notNull().default(false),
+  prerelease: boolean("prerelease").notNull().default(false),
+  authorGithubAccountId: uuid("author_github_account_id").references(() => githubAccounts.id),
+  authorActorKind: varchar("author_actor_kind", { length: 20 }).notNull().default("unknown"),
+  sourceUrl: text("source_url"),
+  githubCreatedAt: time("github_created_at"),
+  githubUpdatedAt: time("github_updated_at"),
+  githubPublishedAt: nullableTime("github_published_at"),
+  firstSeenAt: time("first_seen_at"),
+  lastSeenAt: time("last_seen_at"),
+  completenessState: varchar("completeness_state", { length: 40 }).notNull().default("observed"),
+}, (table) => [
+  uniqueIndex("releases_repo_github_id_unique").on(table.tenantId, table.repositoryId, table.githubReleaseId),
+  index("releases_repo_updated_idx").on(table.tenantId, table.repositoryId, table.githubUpdatedAt),
 ]);
 
 export const webhookDeliveries = pgTable("webhook_deliveries", {
@@ -284,12 +385,18 @@ export const syncCursors = pgTable("sync_cursors", {
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
   repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
   resourceType: varchar("resource_type", { length: 50 }).notNull(),
-  refName: varchar("ref_name", { length: 500 }),
+  refName: varchar("ref_name", { length: 500 }).notNull().default(""),
   headSha: varchar("head_sha", { length: 64 }),
   cursor: jsonb("cursor").$type<Record<string, unknown>>().notNull().default({}),
   highWaterAt: nullableTime("high_water_at"),
   lastSuccessAt: nullableTime("last_success_at"),
   lastFullReconcileAt: nullableTime("last_full_reconcile_at"),
+  status: varchar("status", { length: 30 }).notNull().default("pending"),
+  startedAt: nullableTime("started_at"),
+  completedAt: nullableTime("completed_at"),
+  pausedUntil: nullableTime("paused_until"),
+  errorCode: varchar("error_code", { length: 120 }),
+  completenessState: varchar("completeness_state", { length: 40 }).notNull().default("known_unknown"),
   schemaVersion: integer("schema_version").notNull().default(1),
 }, (table) => [uniqueIndex("sync_cursors_resource_unique").on(table.tenantId, table.repositoryId, table.resourceType, table.refName)]);
 
@@ -321,6 +428,10 @@ export const schema = {
   commits,
   developmentEvents,
   commitRefs,
+  tags,
+  pullRequests,
+  issues,
+  releases,
   webhookDeliveries,
   unroutedWebhookDeliveries,
   syncJobs,
@@ -328,6 +439,6 @@ export const schema = {
   outbox,
 };
 
-export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, repositoryNameHistory, branches, commits, developmentEvents, commitRefs, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
+export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, repositoryNameHistory, branches, commits, developmentEvents, commitRefs, tags, pullRequests, issues, releases, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
 
 export const now = sql`now()`;

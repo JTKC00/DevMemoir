@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { GithubClient, GithubRepository } from "@devmemoir/github";
 import { InMemoryM1Store } from "@devmemoir/db";
 import { refreshInstallationInventory } from "./inventory.js";
+import { emptyHistoricalGithubMethods } from "./test-github.js";
 
 const tenantId = "tenant-inventory";
 const installationId = 7001;
@@ -22,6 +23,7 @@ function repository(id: number, name = `repo-${id}`, overrides: Partial<GithubRe
 
 function githubPages(pages: Record<number, { repositories: GithubRepository[]; nextPage?: number }>, onPageError?: number): GithubClient {
   return {
+    ...emptyHistoricalGithubMethods,
     getUser: async () => ({ id: 7, login: "owner", type: "User" }),
     exchangeOAuthCode: async () => ({ accessToken: "unused" }),
     getInstallation: async () => ({ id: installationId, account: { id: 7, login: "owner", type: "User" }, permissions: { Metadata: "read" }, repository_selection: "selected" }),

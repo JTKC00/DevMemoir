@@ -5,6 +5,7 @@ import { createPool } from "./client.js";
 import { PostgresM1Store } from "./postgres-store.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required in CI");
 const describeIntegration = databaseUrl ? describe : describe.skip;
 
 describeIntegration("M1 durable delivery state", () => {

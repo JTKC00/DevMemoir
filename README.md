@@ -1,6 +1,6 @@
-# DevMemoir M2
+# DevMemoir M3
 
-DevMemoir is a TypeScript/pnpm monorepo proving the first production-shaped vertical slice: one allowlisted owner authenticates, binds one GitHub App installation, selects one repository, imports the newest 100 default-branch commits, receives signed push signals, and views a private factual activity page.
+DevMemoir is a TypeScript/pnpm monorepo for one allowlisted owner, one bound GitHub App installation, and one actively selected repository. M3 progressively imports supported historical repository facts with durable page/stage checkpoints while preserving the existing private factual activity slice.
 
 The coverage boundary shown by the product is deliberately exact:
 
@@ -106,6 +106,20 @@ The inventory uses the GitHub numeric repository ID as identity. Names, owner lo
 
 Only a completed pagination run may mark a previously visible repository `access_removed`. A page failure leaves the previous authoritative inventory intact. Installation suspension marks access unavailable and stops repository work; unsuspend keeps repositories unavailable and unselected until reconciliation, after which the user selects one again. Accepting newly requested GitHub App permissions instead preserves current access and selection while it queues an authoritative refresh; that refresh still clears selection if the repository is no longer accessible. Uninstall/deletion marks access disconnected while retaining repository identity and existing memoir facts. Reinstallation upserts the same installation/repository identities rather than creating duplicates.
 
+## Restartable historical backfill (M3)
+
+Selecting an accessible repository starts or resumes ordered historical stages for default-branch commits, branches, tags, pull requests, issues, and releases. Each worker job fetches one authoritative GitHub page; normalized facts and the next durable `sync_cursors` checkpoint commit in one PostgreSQL transaction. A crash before commit repeats the same page safely, while a retry after commit reads the advanced checkpoint. Completed stages remain durable across worker restart, access loss, unselection, and later re-selection.
+
+Commit discovery is anchored to the authoritative default-branch head and continues beyond the earlier newest-100 activity slice. Commit facts are preserved by repository plus SHA even when a force-push makes them unreachable; `commit_refs` separately records reachability at the committed sync. Branches and tags are metadata inventories only. M3 does not traverse every branch's historical commits.
+
+Pull requests, issues, and releases retain metadata-only identities, titles/names, states, linked actor IDs, source URLs, and lifecycle timestamps. GitHub source timestamps prevent an older retry from regressing a newer stored snapshot. Issue-shaped pull requests are filtered at the GitHub boundary. Bodies, comments, reviews, labels, files, paths, file counts/statistics, patches, diffs, blobs, trees, archives, raw Git emails, release assets, raw responses, and workflow artifacts have no M3 ingestion path.
+
+All installation requests share a concurrency-one lane. Primary and secondary rate limits durably pause the installation/stage without advancing its cursor; 401/403/ambiguous 404 responses gate historical work and require authoritative access reconciliation instead of hot-looping. The complete cursor, transaction, retention, and completeness contract is documented in [M3_BACKFILL_CONTRACT.md](./docs/architecture/M3_BACKFILL_CONTRACT.md).
+
+Owner-facing status uses precise completeness terms: observed facts, reachable-at-sync refs/commits, known-unknown gaps, and intentionally out-of-scope data. It never calls the result complete GitHub history:
+
+> **Historical facts observed from the connected repository through supported GitHub APIs. Deleted or rewritten history that DevMemoir never observed may be unavailable.**
+
 ## GitHub App checklist
 
 Create a GitHub App for the owner account; do not commit its private key or any token.
@@ -157,7 +171,7 @@ pnpm test
 pnpm build
 ```
 
-The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects all migrations (`0001_initial.sql` and `0002_m2_repository_inventory.sql`) to have been applied and verifies capability-role membership through ephemeral LOGIN principals, that tenant A cannot read or write tenant B inventory, that worker A cannot write tenant B, and that the web role cannot mutate GitHub-derived commits:
+The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects all migrations through `0003_m3_historical_backfill.sql` to have been applied and verifies capability-role membership through ephemeral LOGIN principals, tenant isolation for normalized sources and progress, worker scoping, and that the web role cannot mutate GitHub-derived data:
 
 ```bash
 $env:TEST_DATABASE_URL = $env:DATABASE_DIRECT_URL
@@ -169,8 +183,8 @@ CI starts PostgreSQL, applies the migration, and runs this suite. Without a supp
 
 ## Runtime topology
 
-`apps/api` uses `DATABASE_API_URL`, `apps/worker` uses `DATABASE_WORKER_URL`, pg-boss uses `DATABASE_QUEUE_URL`, and migrations use `DATABASE_MIGRATIONS_URL`. `packages/jobs` creates the three pg-boss queues with a stately logical-key policy; business cursors remain in PostgreSQL. Webhook HMAC verification happens on exact raw bytes before JSON parsing, and current plus previous secrets are accepted during rotation overlap.
+`apps/api` uses `DATABASE_API_URL`, `apps/worker` uses `DATABASE_WORKER_URL`, pg-boss uses `DATABASE_QUEUE_URL`, and migrations use `DATABASE_MIGRATIONS_URL`. `packages/jobs` creates the pg-boss queues with a stately logical-key policy; business cursors and rate-limit pauses remain in PostgreSQL. Queue payloads contain opaque IDs and bounded page/stage hints, not repository names or source content. Webhook HMAC verification happens on exact raw bytes before JSON parsing, and current plus previous secrets are accepted during rotation overlap.
 
-## Known M2 limits / deferred scope
+## Known M3 limits / deferred scope
 
-M2 intentionally supports one allowlisted owner and one selected repository, imports only the newest 100 commits reachable from the current default branch, and treats push webhooks as synchronization signals. It does not implement historical backfill for all accessible/selected repositories, organizations, general signup, billing, AI summaries/classification, profiles, scores, source cloning, file/diff storage, PR/issue content, comments, Actions, deployments, all-branch backfill, or analytics dashboards. Live GitHub App E2E still requires owner-created credentials and a reachable HTTPS callback.
+M3 intentionally supports one allowlisted owner and one selected repository. Deleted refs that DevMemoir never observed, rewritten/squashed/rebased history, and GitHub visibility limitations cannot be reconstructed completely. Historical commit traversal is default-branch-first; all-active-branch history is deferred until after Gate A. Bodies, files, paths, comments, reviews, artifacts, analytics, AI, scoring, organization/general multi-user support, and repository source ingestion remain out of scope. Live GitHub App E2E still requires owner-created credentials, a reachable HTTPS callback, and a private sandbox repository.

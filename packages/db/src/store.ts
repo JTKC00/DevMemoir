@@ -3,6 +3,8 @@ import {
   deliveryRedeliveryAction,
   repositoryAccessIsAvailable,
   type CommitFact,
+  type ActorKind,
+  type CompletenessState,
   type DeliveryState,
   type DevelopmentEvent,
   type RepositoryAccessStatus,
@@ -49,6 +51,8 @@ export type InstallationRecord = {
   suspendedAt?: Date;
   deletedAt?: Date;
   lastInventoryAt?: Date;
+  apiPausedUntil?: Date;
+  apiPauseReason?: string;
 };
 
 export type RepositoryRecord = {
@@ -155,10 +159,150 @@ export type RefSyncContinuation = {
   reachableShas?: string[];
 };
 
+export const HISTORICAL_STAGES = [
+  "default_branch_commits",
+  "branches",
+  "tags",
+  "pull_requests",
+  "issues",
+  "releases",
+  "completed",
+] as const;
+export type HistoricalStage = (typeof HISTORICAL_STAGES)[number];
+export type HistoricalSourceStage = Exclude<HistoricalStage, "completed">;
+export type HistoricalStageStatus = "pending" | "in_progress" | "paused" | "completed";
+
+export type HistoricalCursor = {
+  nextPage: number;
+  [key: string]: unknown;
+};
+
+export type HistoricalProgress = {
+  tenantId: string;
+  repositoryId: string;
+  stage: HistoricalStage;
+  refName: string;
+  status: HistoricalStageStatus;
+  cursor: HistoricalCursor;
+  nextPage: number;
+  anchorHeadSha?: string;
+  highWaterAt?: Date;
+  startedAt?: Date;
+  observationStartedAt?: Date;
+  lastSuccessAt?: Date;
+  completedAt?: Date;
+  pausedUntil?: Date;
+  errorCode?: string;
+  completenessState: CompletenessState;
+};
+
+export type HistoricalActor = {
+  githubAccountId: number;
+  login?: string;
+  accountType?: string;
+  actorKind: ActorKind;
+};
+
+export type HistoricalBranchFact = {
+  name: string;
+  headSha: string;
+  protected: boolean;
+};
+
+export type HistoricalTagFact = {
+  name: string;
+  targetSha: string;
+  targetType?: string;
+};
+
+export type HistoricalPullRequestFact = {
+  githubId: number;
+  number: number;
+  title: string;
+  state: string;
+  draft: boolean;
+  author?: HistoricalActor;
+  merger?: HistoricalActor;
+  baseRef?: string;
+  baseSha?: string;
+  headRef?: string;
+  headSha?: string;
+  sourceUrl?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  closedAt?: Date;
+  mergedAt?: Date;
+};
+
+export type HistoricalIssueFact = {
+  githubId: number;
+  number: number;
+  title: string;
+  state: string;
+  stateReason?: string;
+  author?: HistoricalActor;
+  sourceUrl?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  closedAt?: Date;
+};
+
+export type HistoricalReleaseFact = {
+  githubId: number;
+  tagName: string;
+  name?: string;
+  draft: boolean;
+  prerelease: boolean;
+  author?: HistoricalActor;
+  sourceUrl?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  publishedAt?: Date;
+};
+
+type HistoricalPageBase = {
+  tenantId: string;
+  repositoryId: string;
+  installationId: string;
+  expectedCursor: HistoricalCursor;
+  nextCursor: HistoricalCursor;
+  observedAt: Date;
+  highWaterAt?: Date;
+  finalPage: boolean;
+};
+
+export type HistoricalPageCommit =
+  | (HistoricalPageBase & { stage: "default_branch_commits"; refName: string; anchorHeadSha: string; facts: Array<{ commit: CommitFact; event?: DevelopmentEvent; htmlUrl?: string }> })
+  | (HistoricalPageBase & { stage: "branches"; facts: HistoricalBranchFact[] })
+  | (HistoricalPageBase & { stage: "tags"; facts: HistoricalTagFact[] })
+  | (HistoricalPageBase & { stage: "pull_requests"; facts: HistoricalPullRequestFact[] })
+  | (HistoricalPageBase & { stage: "issues"; facts: HistoricalIssueFact[] })
+  | (HistoricalPageBase & { stage: "releases"; facts: HistoricalReleaseFact[] });
+
+export type HistoricalPageCommitResult = {
+  applied: boolean;
+  reason?: "checkpoint_mismatch" | "gated";
+  progress: HistoricalProgress;
+};
+
+export type HistoricalSourceCounts = {
+  commits: number;
+  branches: number;
+  tags: number;
+  pullRequests: number;
+  issues: number;
+  releases: number;
+};
+
 function branchName(ref: string): string {
   if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
   if (ref.startsWith("heads/")) return ref.slice("heads/".length);
   return ref;
+}
+
+function nextHistoricalStage(stage: HistoricalSourceStage): HistoricalStage {
+  const index = HISTORICAL_STAGES.indexOf(stage);
+  return HISTORICAL_STAGES[index + 1] ?? "completed";
 }
 
 export interface M1Store {
@@ -207,6 +351,16 @@ export interface M1Store {
   markBranchCommitsUnreachable(tenantId: string, repositoryId: string, ref: string): Promise<void>;
   setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void>;
   listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]>;
+  startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress>;
+  getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName?: string): Promise<HistoricalProgress | undefined>;
+  listHistoricalProgress(tenantId: string, repositoryId: string): Promise<HistoricalProgress[]>;
+  resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined>;
+  commitHistoricalPage(input: HistoricalPageCommit): Promise<HistoricalPageCommitResult>;
+  pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string }): Promise<HistoricalProgress | undefined>;
+  resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date }): Promise<HistoricalProgress | undefined>;
+  pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void>;
+  resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void>;
+  getHistoricalSourceCounts(tenantId: string, repositoryId: string): Promise<HistoricalSourceCounts>;
 }
 
 export class InMemoryM1Store implements M1Store {
@@ -225,6 +379,12 @@ export class InMemoryM1Store implements M1Store {
   readonly unroutedWebhooks = new Map<string, UnroutedWebhookRecord>();
   readonly refSyncContinuations = new Map<string, RefSyncContinuation>();
   readonly commitReachability = new Map<string, boolean>();
+  readonly historicalProgress = new Map<string, HistoricalProgress>();
+  readonly historicalBranches = new Map<string, HistoricalBranchFact & { reachable: boolean; generation: Date }>();
+  readonly historicalTags = new Map<string, HistoricalTagFact & { reachable: boolean; generation: Date }>();
+  readonly historicalPullRequests = new Map<string, HistoricalPullRequestFact>();
+  readonly historicalIssues = new Map<string, HistoricalIssueFact>();
+  readonly historicalReleases = new Map<string, HistoricalReleaseFact>();
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
 
@@ -486,5 +646,195 @@ export class InMemoryM1Store implements M1Store {
       const reachabilityKey = `${tenantId}:${repository.id}:${branchName(`refs/heads/${repository.defaultBranch}`)}:${event.sourceExternalId}`;
       return !this.commitReachability.has(reachabilityKey) || this.commitReachability.get(reachabilityKey) === true;
     }).sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
+  }
+
+  private historicalKey(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): string {
+    return `${tenantId}:${repositoryId}:${stage}:${refName}`;
+  }
+
+  private historicalGate(tenantId: string, repositoryId: string, installationId: string, now: Date): boolean {
+    const installation = [...this.installations.values()].find((value) => value.id === installationId && value.tenantId === tenantId);
+    if (!installation || (installation.status && installation.status !== "active") || (installation.apiPausedUntil && installation.apiPausedUntil > now)) return false;
+    const repository = [...this.repositories.values()].find((value) => value.id === repositoryId && value.tenantId === tenantId && value.installationId === installationId);
+    return Boolean(repository?.selected && (!repository.accessStatus || repositoryAccessIsAvailable(repository.accessStatus)));
+  }
+
+  async startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress> {
+    if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) throw new Error("historical_backfill_gated");
+    for (const stage of HISTORICAL_STAGES) {
+      const refName = stage === "default_branch_commits" ? branchName(input.defaultBranch) : "";
+      const key = this.historicalKey(input.tenantId, input.repositoryId, stage, refName);
+      if (this.historicalProgress.has(key)) continue;
+      const first = stage === "default_branch_commits";
+      this.historicalProgress.set(key, {
+        tenantId: input.tenantId,
+        repositoryId: input.repositoryId,
+        stage,
+        refName,
+        status: first ? "in_progress" : "pending",
+        cursor: { nextPage: 1 },
+        nextPage: 1,
+        ...(first ? { startedAt: input.now, observationStartedAt: input.now } : {}),
+        completenessState: "known_unknown",
+      });
+    }
+    const progress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, "default_branch_commits", branchName(input.defaultBranch)));
+    if (!progress) throw new Error("historical_progress_missing");
+    return { ...progress, cursor: { ...progress.cursor } };
+  }
+
+  async getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): Promise<HistoricalProgress | undefined> {
+    const normalizedRef = stage === "default_branch_commits" ? branchName(refName) : refName;
+    const progress = this.historicalProgress.get(this.historicalKey(tenantId, repositoryId, stage, normalizedRef));
+    return progress ? { ...progress, cursor: { ...progress.cursor } } : undefined;
+  }
+
+  async listHistoricalProgress(tenantId: string, repositoryId: string): Promise<HistoricalProgress[]> {
+    return [...this.historicalProgress.values()]
+      .filter((value) => value.tenantId === tenantId && value.repositoryId === repositoryId)
+      .sort((left, right) => HISTORICAL_STAGES.indexOf(left.stage) - HISTORICAL_STAGES.indexOf(right.stage))
+      .map((value) => ({ ...value, cursor: { ...value.cursor } }));
+  }
+
+  async resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined> {
+    if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
+    const previousHead = await this.getBranchHead(input.tenantId, input.repositoryId, input.refName);
+    await this.markBranchCommitsUnreachable(input.tenantId, input.repositoryId, input.refName);
+    const progress: HistoricalProgress = {
+      tenantId: input.tenantId,
+      repositoryId: input.repositoryId,
+      stage: "default_branch_commits",
+      refName: branchName(input.refName),
+      status: "in_progress",
+      cursor: { nextPage: 1, previousHead },
+      nextPage: 1,
+      anchorHeadSha: input.anchorHeadSha,
+      startedAt: input.now,
+      observationStartedAt: input.now,
+      completenessState: "known_unknown",
+    };
+    this.historicalProgress.set(this.historicalKey(input.tenantId, input.repositoryId, progress.stage, progress.refName), progress);
+    return { ...progress, cursor: { ...progress.cursor } };
+  }
+
+  async commitHistoricalPage(input: HistoricalPageCommit): Promise<HistoricalPageCommitResult> {
+    const refName = input.stage === "default_branch_commits" ? branchName(input.refName) : "";
+    const key = this.historicalKey(input.tenantId, input.repositoryId, input.stage, refName);
+    const progress = this.historicalProgress.get(key);
+    if (!progress) throw new Error("historical_progress_missing");
+    if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.observedAt)) return { applied: false, reason: "gated", progress: { ...progress, cursor: { ...progress.cursor } } };
+    if (JSON.stringify(progress.cursor) !== JSON.stringify(input.expectedCursor)) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
+    if (input.stage === "default_branch_commits") {
+      if (progress.anchorHeadSha && progress.anchorHeadSha !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
+      if (input.finalPage) {
+        const publishedHead = await this.getBranchHead(input.tenantId, input.repositoryId, refName);
+        const expectedPublishedHead = typeof progress.cursor.previousHead === "string" ? progress.cursor.previousHead : null;
+        if (publishedHead !== expectedPublishedHead && publishedHead !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
+      }
+      for (const fact of input.facts) {
+        await this.saveCommit(input.tenantId, input.repositoryId, fact.commit, fact.event, fact.htmlUrl);
+        await this.setCommitReachability(input.tenantId, input.repositoryId, refName, fact.commit.sha, true);
+      }
+      if (input.finalPage) {
+        await this.setBranchHead(input.tenantId, input.repositoryId, refName, input.anchorHeadSha);
+      }
+    } else if (input.stage === "branches") {
+      const generation = progress.startedAt ?? input.observedAt;
+      for (const fact of input.facts) this.historicalBranches.set(`${input.tenantId}:${input.repositoryId}:${fact.name}`, { ...fact, reachable: true, generation });
+      if (input.finalPage) for (const [factKey, value] of this.historicalBranches) if (factKey.startsWith(`${input.tenantId}:${input.repositoryId}:`) && value.generation < generation) value.reachable = false;
+    } else if (input.stage === "tags") {
+      const generation = progress.startedAt ?? input.observedAt;
+      for (const fact of input.facts) this.historicalTags.set(`${input.tenantId}:${input.repositoryId}:${fact.name}`, { ...fact, reachable: true, generation });
+      if (input.finalPage) for (const [factKey, value] of this.historicalTags) if (factKey.startsWith(`${input.tenantId}:${input.repositoryId}:`) && value.generation < generation) value.reachable = false;
+    } else if (input.stage === "pull_requests") {
+      for (const fact of input.facts) {
+        const factKey = `${input.tenantId}:${input.repositoryId}:${fact.githubId}`;
+        const previous = this.historicalPullRequests.get(factKey);
+        if (!previous || fact.updatedAt >= previous.updatedAt) this.historicalPullRequests.set(factKey, { ...fact });
+      }
+    } else if (input.stage === "issues") {
+      for (const fact of input.facts) {
+        const factKey = `${input.tenantId}:${input.repositoryId}:${fact.githubId}`;
+        const previous = this.historicalIssues.get(factKey);
+        if (!previous || fact.updatedAt >= previous.updatedAt) this.historicalIssues.set(factKey, { ...fact });
+      }
+    } else {
+      for (const fact of input.facts) {
+        const factKey = `${input.tenantId}:${input.repositoryId}:${fact.githubId}`;
+        const previous = this.historicalReleases.get(factKey);
+        // GitHub's release REST shape has no updated_at. published_at (or
+        // created_at) is the best source clock, so equal-clock replays must not
+        // overwrite an already-observed snapshot.
+        if (!previous || fact.updatedAt > previous.updatedAt) this.historicalReleases.set(factKey, { ...fact });
+      }
+    }
+    progress.cursor = input.stage === "default_branch_commits" ? { ...input.nextCursor, previousHead: progress.cursor.previousHead } : { ...input.nextCursor };
+    progress.nextPage = input.nextCursor.nextPage;
+    progress.status = input.finalPage ? "completed" : "in_progress";
+    progress.lastSuccessAt = input.observedAt;
+    if (input.highWaterAt) progress.highWaterAt = input.highWaterAt;
+    progress.completenessState = input.finalPage ? (input.stage === "default_branch_commits" || input.stage === "branches" || input.stage === "tags" ? "reachable_at_sync" : "observed") : "known_unknown";
+    if (input.finalPage) progress.completedAt = input.observedAt;
+    if (input.finalPage) {
+      const next = nextHistoricalStage(input.stage);
+      const nextRef = "";
+      const nextProgress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, next, nextRef));
+      if (nextProgress) {
+        nextProgress.status = next === "completed" ? "completed" : "in_progress";
+        nextProgress.startedAt = input.observedAt;
+        nextProgress.observationStartedAt = input.observedAt;
+        if (next === "completed") {
+          nextProgress.completedAt = input.observedAt;
+          nextProgress.lastSuccessAt = input.observedAt;
+          nextProgress.completenessState = "observed";
+        }
+      }
+    }
+    return { applied: true, progress: { ...progress, cursor: { ...progress.cursor } } };
+  }
+
+  async pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string }): Promise<HistoricalProgress | undefined> {
+    const refName = input.stage === "default_branch_commits" ? branchName(input.refName ?? "") : input.refName ?? "";
+    const progress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, input.stage, refName));
+    if (!progress || progress.status === "completed") return progress;
+    progress.status = "paused";
+    progress.errorCode = input.errorCode;
+    if (input.pausedUntil) progress.pausedUntil = input.pausedUntil; else delete progress.pausedUntil;
+    return { ...progress, cursor: { ...progress.cursor } };
+  }
+
+  async resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date }): Promise<HistoricalProgress | undefined> {
+    const refName = input.stage === "default_branch_commits" ? branchName(input.refName ?? "") : input.refName ?? "";
+    const progress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, input.stage, refName));
+    if (!progress || progress.status === "completed" || (progress.pausedUntil && progress.pausedUntil > input.now)) return progress ? { ...progress, cursor: { ...progress.cursor } } : undefined;
+    progress.status = "in_progress";
+    delete progress.pausedUntil;
+    delete progress.errorCode;
+    return { ...progress, cursor: { ...progress.cursor } };
+  }
+
+  async pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void> {
+    const installation = [...this.installations.values()].find((value) => value.id === input.installationId && value.tenantId === input.tenantId);
+    if (installation) Object.assign(installation, { apiPausedUntil: input.pausedUntil, apiPauseReason: input.reason });
+  }
+
+  async resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void> {
+    const installation = [...this.installations.values()].find((value) => value.id === input.installationId && value.tenantId === input.tenantId);
+    if (installation && (!installation.apiPausedUntil || installation.apiPausedUntil <= input.now)) {
+      delete installation.apiPausedUntil;
+      delete installation.apiPauseReason;
+    }
+  }
+
+  async getHistoricalSourceCounts(tenantId: string, repositoryId: string): Promise<HistoricalSourceCounts> {
+    const prefix = `${tenantId}:${repositoryId}:`;
+    return {
+      commits: [...this.commits.keys()].filter((key) => key.startsWith(prefix)).length,
+      branches: [...this.historicalBranches.keys()].filter((key) => key.startsWith(prefix)).length,
+      tags: [...this.historicalTags.keys()].filter((key) => key.startsWith(prefix)).length,
+      pullRequests: [...this.historicalPullRequests.keys()].filter((key) => key.startsWith(prefix)).length,
+      issues: [...this.historicalIssues.keys()].filter((key) => key.startsWith(prefix)).length,
+      releases: [...this.historicalReleases.keys()].filter((key) => key.startsWith(prefix)).length,
+    };
   }
 }

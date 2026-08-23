@@ -9,12 +9,21 @@ import type {
   InventoryReconcileResult,
   InstallationRecord,
   InstallationLifecycleStatus,
+  HistoricalActor,
+  HistoricalCursor,
+  HistoricalPageCommit,
+  HistoricalPageCommitResult,
+  HistoricalProgress,
+  HistoricalSourceCounts,
+  HistoricalSourceStage,
+  HistoricalStage,
   M1Store,
   RepositoryRecord,
   RefSyncContinuation,
   SessionRecord,
   UserRecord,
 } from "./store.js";
+import { HISTORICAL_STAGES } from "./store.js";
 
 type Row = QueryResultRow & Record<string, unknown>;
 
@@ -44,6 +53,7 @@ function installationFromRow(row: Row | undefined): InstallationRecord | undefin
   const suspendedAt = date(row.suspended_at);
   const deletedAt = date(row.deleted_at);
   const lastInventoryAt = date(row.last_inventory_at);
+  const apiPausedUntil = date(row.api_paused_until);
   const permissions = row.permissions && typeof row.permissions === "object" && !Array.isArray(row.permissions) ? row.permissions as Record<string, string> : undefined;
   return {
     id: String(row.id),
@@ -56,7 +66,43 @@ function installationFromRow(row: Row | undefined): InstallationRecord | undefin
     ...(suspendedAt ? { suspendedAt } : {}),
     ...(deletedAt ? { deletedAt } : {}),
     ...(lastInventoryAt ? { lastInventoryAt } : {}),
+    ...(apiPausedUntil ? { apiPausedUntil } : {}),
+    ...(row.api_pause_reason ? { apiPauseReason: String(row.api_pause_reason) } : {}),
   };
+}
+
+function historicalProgressFromRow(row: Row | undefined): HistoricalProgress | undefined {
+  if (!row) return undefined;
+  const value = row.cursor && typeof row.cursor === "object" && !Array.isArray(row.cursor) ? row.cursor as Record<string, unknown> : {};
+  const nextPage = typeof value.nextPage === "number" && Number.isInteger(value.nextPage) && value.nextPage > 0 ? value.nextPage : 1;
+  const cursor: HistoricalCursor = { ...value, nextPage };
+  const highWaterAt = date(row.high_water_at);
+  const startedAt = date(row.started_at);
+  const lastSuccessAt = date(row.last_success_at);
+  const completedAt = date(row.completed_at);
+  const pausedUntil = date(row.paused_until);
+  return {
+    tenantId: String(row.tenant_id),
+    repositoryId: String(row.repository_id),
+    stage: row.resource_type as HistoricalStage,
+    refName: String(row.ref_name ?? ""),
+    status: row.status as HistoricalProgress["status"],
+    cursor,
+    nextPage,
+    ...(row.head_sha ? { anchorHeadSha: String(row.head_sha) } : {}),
+    ...(highWaterAt ? { highWaterAt } : {}),
+    ...(startedAt ? { startedAt, observationStartedAt: startedAt } : {}),
+    ...(lastSuccessAt ? { lastSuccessAt } : {}),
+    ...(completedAt ? { completedAt } : {}),
+    ...(pausedUntil ? { pausedUntil } : {}),
+    ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
+    completenessState: row.completeness_state as HistoricalProgress["completenessState"],
+  };
+}
+
+function nextHistoricalStage(stage: HistoricalSourceStage): HistoricalStage {
+  const index = HISTORICAL_STAGES.indexOf(stage);
+  return HISTORICAL_STAGES[index + 1] ?? "completed";
 }
 
 function repositoryFromRow(row: Row | undefined): RepositoryRecord | undefined {
@@ -514,12 +560,16 @@ export class PostgresM1Store implements M1Store {
 
   async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void> {
     await this.tenantQuery(tenantId, async (client) => {
-      const authorId = commit.author ? await this.ensureGithubAccount(client, commit.author.githubAccountId, commit.author.login, commit.author.accountType ?? "User", commit.author.actorKind) : undefined;
-      const committerId = commit.committer ? await this.ensureGithubAccount(client, commit.committer.githubAccountId, commit.committer.login, commit.committer.accountType ?? "User", commit.committer.actorKind) : undefined;
-      const eventActorId = event?.actorGithubAccountId === undefined ? undefined : await this.ensureGithubAccount(client, event.actorGithubAccountId, undefined, event.actorKind === "bot" ? "Bot" : "User", event.actorKind);
-      await client.query(`insert into commits (id,tenant_id,repository_id,sha,author_github_account_id,committer_github_account_id,message,authored_at,committed_at,parent_shas,verified,additions,deletions,first_seen_at,last_seen_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now()) on conflict (tenant_id,repository_id,sha) do update set author_github_account_id=coalesce(excluded.author_github_account_id,commits.author_github_account_id),committer_github_account_id=coalesce(excluded.committer_github_account_id,commits.committer_github_account_id),message=case when excluded.message <> '' then excluded.message else commits.message end,authored_at=coalesce(excluded.authored_at,commits.authored_at),committed_at=coalesce(excluded.committed_at,commits.committed_at),parent_shas=case when jsonb_array_length(excluded.parent_shas) > 0 then excluded.parent_shas else commits.parent_shas end,verified=coalesce(excluded.verified,commits.verified),additions=coalesce(excluded.additions,commits.additions),deletions=coalesce(excluded.deletions,commits.deletions),last_seen_at=now()`, [createId(), tenantId, repositoryId, commit.sha, authorId ?? null, committerId ?? null, commit.message, commit.authoredAt ?? null, commit.committedAt ?? null, JSON.stringify(commit.parents), commit.verified ?? null, commit.additions ?? null, commit.deletions ?? null]);
-      if (event) await this.writeDevelopmentEvent(client, tenantId, repositoryId, event, eventActorId, htmlUrl, commit.message);
+      await this.writeCommit(client, tenantId, repositoryId, commit, event, htmlUrl, true);
     });
+  }
+
+  private async writeCommit(client: PoolClient, tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string, allowLegacyStats = false): Promise<void> {
+    const authorId = commit.author ? await this.ensureGithubAccount(client, commit.author.githubAccountId, commit.author.login, commit.author.accountType ?? "User", commit.author.actorKind) : undefined;
+    const committerId = commit.committer ? await this.ensureGithubAccount(client, commit.committer.githubAccountId, commit.committer.login, commit.committer.accountType ?? "User", commit.committer.actorKind) : undefined;
+    const eventActorId = event?.actorGithubAccountId === undefined ? undefined : await this.ensureGithubAccount(client, event.actorGithubAccountId, undefined, event.actorKind === "bot" ? "Bot" : "User", event.actorKind);
+    await client.query(`insert into commits (id,tenant_id,repository_id,sha,author_github_account_id,committer_github_account_id,message,authored_at,committed_at,parent_shas,verified,additions,deletions,first_seen_at,last_seen_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now()) on conflict (tenant_id,repository_id,sha) do update set author_github_account_id=coalesce(excluded.author_github_account_id,commits.author_github_account_id),committer_github_account_id=coalesce(excluded.committer_github_account_id,commits.committer_github_account_id),message=case when excluded.message <> '' then excluded.message else commits.message end,authored_at=coalesce(excluded.authored_at,commits.authored_at),committed_at=coalesce(excluded.committed_at,commits.committed_at),parent_shas=case when jsonb_array_length(excluded.parent_shas) > 0 then excluded.parent_shas else commits.parent_shas end,verified=coalesce(excluded.verified,commits.verified),additions=case when $14 then coalesce(excluded.additions,commits.additions) else commits.additions end,deletions=case when $14 then coalesce(excluded.deletions,commits.deletions) else commits.deletions end,last_seen_at=now()`, [createId(), tenantId, repositoryId, commit.sha, authorId ?? null, committerId ?? null, commit.message, commit.authoredAt ?? null, commit.committedAt ?? null, JSON.stringify(commit.parents), commit.verified ?? null, allowLegacyStats ? commit.additions ?? null : null, allowLegacyStats ? commit.deletions ?? null : null, allowLegacyStats]);
+    if (event) await this.writeDevelopmentEvent(client, tenantId, repositoryId, event, eventActorId, htmlUrl, commit.message);
   }
 
   private async writeDevelopmentEvent(client: PoolClient, tenantId: string, repositoryId: string, event: DevelopmentEvent, actorId?: string, htmlUrl?: string, message?: string): Promise<void> {
@@ -571,6 +621,231 @@ export class PostgresM1Store implements M1Store {
       const branchId = branch.rows[0]?.id;
       const commitId = commit.rows[0]?.id;
       if (branchId && commitId) await client.query("insert into commit_refs (tenant_id,commit_id,branch_id,last_seen_at,reachable) values ($1,$2,$3,now(),$4) on conflict (tenant_id,commit_id,branch_id) do update set last_seen_at=now(),reachable=excluded.reachable", [tenantId, commitId, branchId, reachable]);
+    });
+  }
+
+  private async historicalGate(client: PoolClient, tenantId: string, repositoryId: string, installationId: string, now: Date): Promise<boolean> {
+    const result = await client.query(
+      `select 1
+         from github_installations i
+         join repository_access ra on ra.tenant_id=i.tenant_id and ra.installation_id=i.id
+        where i.tenant_id=$1 and i.id=$3 and i.status='active'
+          and (i.api_paused_until is null or i.api_paused_until <= $4)
+          and ra.repository_id=$2 and ra.selected=true and ra.access_status='accessible'
+        limit 1`,
+      [tenantId, repositoryId, installationId, now],
+    );
+    return result.rowCount === 1;
+  }
+
+  async startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress> {
+    return this.tenantQuery(input.tenantId, async (client) => {
+      if (!await this.historicalGate(client, input.tenantId, input.repositoryId, input.installationId, input.now)) throw new Error("historical_backfill_gated");
+      for (const stage of HISTORICAL_STAGES) {
+        const refName = stage === "default_branch_commits" ? branchName(input.defaultBranch) : "";
+        const first = stage === "default_branch_commits";
+        await client.query(
+          `insert into sync_cursors (id,tenant_id,repository_id,resource_type,ref_name,cursor,status,started_at,completeness_state,schema_version)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,'known_unknown',3)
+           on conflict (tenant_id,repository_id,resource_type,ref_name) do nothing`,
+          [createId(), input.tenantId, input.repositoryId, stage, refName, { nextPage: 1 }, first ? "in_progress" : "pending", first ? input.now : null],
+        );
+      }
+      const result = await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='default_branch_commits' and ref_name=$3", [input.tenantId, input.repositoryId, branchName(input.defaultBranch)]);
+      const progress = historicalProgressFromRow(result.rows[0]);
+      if (!progress) throw new Error("historical_progress_missing");
+      return progress;
+    });
+  }
+
+  async getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): Promise<HistoricalProgress | undefined> {
+    return this.tenantQuery(tenantId, async (client) => historicalProgressFromRow((await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4", [tenantId, repositoryId, stage, stage === "default_branch_commits" ? branchName(refName) : refName])).rows[0]));
+  }
+
+  async listHistoricalProgress(tenantId: string, repositoryId: string): Promise<HistoricalProgress[]> {
+    return this.tenantQuery(tenantId, async (client) => {
+      const result = await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type=any($3::text[])", [tenantId, repositoryId, HISTORICAL_STAGES]);
+      return result.rows.map(historicalProgressFromRow).filter((value): value is HistoricalProgress => Boolean(value)).sort((left, right) => HISTORICAL_STAGES.indexOf(left.stage) - HISTORICAL_STAGES.indexOf(right.stage));
+    });
+  }
+
+  async resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined> {
+    const refName = branchName(input.refName);
+    return this.tenantQuery(input.tenantId, async (client) => {
+      if (!await this.historicalGate(client, input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [`m3:${input.tenantId}:${input.repositoryId}:${refName}`]);
+      const branch = await client.query<Row>("select id,head_sha from branches where tenant_id=$1 and repository_id=$2 and name=$3 for update", [input.tenantId, input.repositoryId, refName]);
+      const previousHead = branch.rows[0]?.head_sha ? String(branch.rows[0].head_sha) : null;
+      if (branch.rows[0]?.id) await client.query("update commit_refs set reachable=false where tenant_id=$1 and branch_id=$2", [input.tenantId, branch.rows[0].id]);
+      const result = await client.query<Row>(
+        `insert into sync_cursors (id,tenant_id,repository_id,resource_type,ref_name,head_sha,cursor,status,started_at,completed_at,paused_until,error_code,high_water_at,last_success_at,completeness_state,schema_version)
+         values ($1,$2,$3,'default_branch_commits',$4,$5,$6,'in_progress',$7,null,null,null,null,null,'known_unknown',3)
+         on conflict (tenant_id,repository_id,resource_type,ref_name) do update set
+           head_sha=excluded.head_sha,cursor=excluded.cursor,status='in_progress',started_at=excluded.started_at,
+           completed_at=null,paused_until=null,error_code=null,high_water_at=null,last_success_at=null,
+           completeness_state='known_unknown',schema_version=3
+         returning *`,
+        [createId(), input.tenantId, input.repositoryId, refName, input.anchorHeadSha, { nextPage: 1, previousHead }, input.now],
+      );
+      return historicalProgressFromRow(result.rows[0]);
+    });
+  }
+
+  async commitHistoricalPage(input: HistoricalPageCommit): Promise<HistoricalPageCommitResult> {
+    const refName = input.stage === "default_branch_commits" ? branchName(input.refName) : "";
+    return this.tenantQuery(input.tenantId, async (client) => {
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [`m3:${input.tenantId}:${input.repositoryId}:${input.stage}:${refName}`]);
+      const rowResult = await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4 for update", [input.tenantId, input.repositoryId, input.stage, refName]);
+      const progress = historicalProgressFromRow(rowResult.rows[0]);
+      if (!progress) throw new Error("historical_progress_missing");
+      if (!await this.historicalGate(client, input.tenantId, input.repositoryId, input.installationId, input.observedAt) || progress.status === "paused") return { applied: false, reason: "gated", progress };
+      const match = await client.query<{ matches: boolean }>("select $1::jsonb = $2::jsonb as matches", [progress.cursor, input.expectedCursor]);
+      if (!match.rows[0]?.matches || progress.status === "completed") return { applied: false, reason: "checkpoint_mismatch", progress };
+      const generation = progress.startedAt ?? input.observedAt;
+
+      if (input.stage === "default_branch_commits") {
+        if (progress.anchorHeadSha && progress.anchorHeadSha !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress };
+        let branchId: string | undefined;
+        if (input.finalPage) {
+          const branchResult = await client.query<Row>("select id,head_sha from branches where tenant_id=$1 and repository_id=$2 and name=$3 for update", [input.tenantId, input.repositoryId, refName]);
+          const publishedHead = branchResult.rows[0]?.head_sha ? String(branchResult.rows[0].head_sha) : null;
+          const expectedPublishedHead = typeof progress.cursor.previousHead === "string" ? progress.cursor.previousHead : null;
+          if (publishedHead !== expectedPublishedHead && publishedHead !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress };
+          branchId = branchResult.rows[0]?.id ? String(branchResult.rows[0].id) : undefined;
+        }
+        for (const fact of input.facts) await this.writeCommit(client, input.tenantId, input.repositoryId, fact.commit, fact.event, fact.htmlUrl, false);
+        const shas = input.facts.map((fact) => fact.commit.sha);
+        if (!branchId) {
+          const branchResult = await client.query<Row>(
+            `insert into branches (id,tenant_id,repository_id,name,reachable,first_seen_at,last_seen_at)
+             values ($1,$2,$3,$4,true,$5,$5)
+             on conflict (tenant_id,repository_id,name) do update set last_seen_at=excluded.last_seen_at returning id`,
+            [createId(), input.tenantId, input.repositoryId, refName, input.observedAt],
+          );
+          branchId = branchResult.rows[0]?.id ? String(branchResult.rows[0].id) : undefined;
+        }
+        if (branchId && shas.length > 0) await client.query(
+          `insert into commit_refs (tenant_id,commit_id,branch_id,last_seen_at,reachable)
+           select $1,c.id,$2,$4,true from commits c where c.tenant_id=$1 and c.repository_id=$3 and c.sha=any($5::text[])
+           on conflict (tenant_id,commit_id,branch_id) do update set last_seen_at=excluded.last_seen_at,reachable=true`,
+          [input.tenantId, branchId, input.repositoryId, input.observedAt, shas],
+        );
+        if (input.finalPage && branchId) await client.query(
+          "update branches set head_sha=$4,reachable=true,deleted_at=null,last_seen_at=$5,last_authoritative_observed_at=$5 where tenant_id=$1 and repository_id=$2 and id=$3",
+          [input.tenantId, input.repositoryId, branchId, input.anchorHeadSha, input.observedAt],
+        );
+      } else if (input.stage === "branches") {
+        for (const fact of input.facts) await client.query(
+          `insert into branches (id,tenant_id,repository_id,name,head_sha,protected,reachable,first_seen_at,last_seen_at,last_authoritative_observed_at,observation_generation,deleted_at)
+           values ($1,$2,$3,$4,$5,$6,true,$7,$7,$7,$8,null)
+           on conflict (tenant_id,repository_id,name) do update set head_sha=excluded.head_sha,protected=excluded.protected,reachable=true,last_seen_at=excluded.last_seen_at,last_authoritative_observed_at=excluded.last_authoritative_observed_at,observation_generation=excluded.observation_generation,deleted_at=null`,
+          [createId(), input.tenantId, input.repositoryId, fact.name, fact.headSha, fact.protected, input.observedAt, generation],
+        );
+        if (input.finalPage) await client.query("update branches set reachable=false,deleted_at=$3 where tenant_id=$1 and repository_id=$2 and (observation_generation is null or observation_generation <> $4)", [input.tenantId, input.repositoryId, input.observedAt, generation]);
+      } else if (input.stage === "tags") {
+        for (const fact of input.facts) await client.query(
+          `insert into tags (id,tenant_id,repository_id,name,target_sha,target_type,reachable,completeness_state,first_seen_at,last_seen_at,last_authoritative_observed_at,observation_generation,deleted_at)
+           values ($1,$2,$3,$4,$5,$6,true,'reachable_at_sync',$7,$7,$7,$8,null)
+           on conflict (tenant_id,repository_id,name) do update set target_sha=excluded.target_sha,target_type=excluded.target_type,reachable=true,completeness_state='reachable_at_sync',last_seen_at=excluded.last_seen_at,last_authoritative_observed_at=excluded.last_authoritative_observed_at,observation_generation=excluded.observation_generation,deleted_at=null`,
+          [createId(), input.tenantId, input.repositoryId, fact.name, fact.targetSha, fact.targetType ?? null, input.observedAt, generation],
+        );
+        if (input.finalPage) await client.query("update tags set reachable=false,deleted_at=$3 where tenant_id=$1 and repository_id=$2 and observation_generation <> $4", [input.tenantId, input.repositoryId, input.observedAt, generation]);
+      } else if (input.stage === "pull_requests") {
+        for (const fact of input.facts) {
+          const authorId = fact.author ? await this.ensureGithubAccount(client, fact.author.githubAccountId, fact.author.login, fact.author.accountType ?? "User", fact.author.actorKind) : null;
+          const mergerId = fact.merger ? await this.ensureGithubAccount(client, fact.merger.githubAccountId, fact.merger.login, fact.merger.accountType ?? "User", fact.merger.actorKind) : null;
+          await client.query(
+            `insert into pull_requests (id,tenant_id,repository_id,github_pull_request_id,number,title,state,draft,author_github_account_id,author_actor_kind,merger_github_account_id,base_ref,base_sha,head_ref,head_sha,source_url,github_created_at,github_updated_at,github_closed_at,github_merged_at,first_seen_at,last_seen_at,completeness_state)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21,'observed')
+             on conflict (tenant_id,repository_id,github_pull_request_id) do update set number=excluded.number,title=excluded.title,state=excluded.state,draft=excluded.draft,author_github_account_id=excluded.author_github_account_id,author_actor_kind=excluded.author_actor_kind,merger_github_account_id=excluded.merger_github_account_id,base_ref=excluded.base_ref,base_sha=excluded.base_sha,head_ref=excluded.head_ref,head_sha=excluded.head_sha,source_url=excluded.source_url,github_created_at=excluded.github_created_at,github_updated_at=excluded.github_updated_at,github_closed_at=excluded.github_closed_at,github_merged_at=excluded.github_merged_at,last_seen_at=excluded.last_seen_at,completeness_state='observed'
+             where excluded.github_updated_at >= pull_requests.github_updated_at`,
+            [createId(), input.tenantId, input.repositoryId, fact.githubId, fact.number, fact.title, fact.state, fact.draft, authorId, fact.author?.actorKind ?? "unknown", mergerId, fact.baseRef ?? null, fact.baseSha ?? null, fact.headRef ?? null, fact.headSha ?? null, fact.sourceUrl ?? null, fact.createdAt, fact.updatedAt, fact.closedAt ?? null, fact.mergedAt ?? null, input.observedAt],
+          );
+        }
+      } else if (input.stage === "issues") {
+        for (const fact of input.facts) {
+          const authorId = fact.author ? await this.ensureGithubAccount(client, fact.author.githubAccountId, fact.author.login, fact.author.accountType ?? "User", fact.author.actorKind) : null;
+          await client.query(
+            `insert into issues (id,tenant_id,repository_id,github_issue_id,number,title,state,state_reason,author_github_account_id,author_actor_kind,source_url,github_created_at,github_updated_at,github_closed_at,first_seen_at,last_seen_at,completeness_state)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,'observed')
+             on conflict (tenant_id,repository_id,github_issue_id) do update set number=excluded.number,title=excluded.title,state=excluded.state,state_reason=excluded.state_reason,author_github_account_id=excluded.author_github_account_id,author_actor_kind=excluded.author_actor_kind,source_url=excluded.source_url,github_created_at=excluded.github_created_at,github_updated_at=excluded.github_updated_at,github_closed_at=excluded.github_closed_at,last_seen_at=excluded.last_seen_at,completeness_state='observed'
+             where excluded.github_updated_at >= issues.github_updated_at`,
+            [createId(), input.tenantId, input.repositoryId, fact.githubId, fact.number, fact.title, fact.state, fact.stateReason ?? null, authorId, fact.author?.actorKind ?? "unknown", fact.sourceUrl ?? null, fact.createdAt, fact.updatedAt, fact.closedAt ?? null, input.observedAt],
+          );
+        }
+      } else {
+        for (const fact of input.facts) {
+          const authorId = fact.author ? await this.ensureGithubAccount(client, fact.author.githubAccountId, fact.author.login, fact.author.accountType ?? "User", fact.author.actorKind) : null;
+          await client.query(
+            `insert into releases (id,tenant_id,repository_id,github_release_id,tag_name,name,draft,prerelease,author_github_account_id,author_actor_kind,source_url,github_created_at,github_updated_at,github_published_at,first_seen_at,last_seen_at,completeness_state)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,'observed')
+             on conflict (tenant_id,repository_id,github_release_id) do update set tag_name=excluded.tag_name,name=excluded.name,draft=excluded.draft,prerelease=excluded.prerelease,author_github_account_id=excluded.author_github_account_id,author_actor_kind=excluded.author_actor_kind,source_url=excluded.source_url,github_created_at=excluded.github_created_at,github_updated_at=excluded.github_updated_at,github_published_at=excluded.github_published_at,last_seen_at=excluded.last_seen_at,completeness_state='observed'
+             where excluded.github_updated_at > releases.github_updated_at`,
+            [createId(), input.tenantId, input.repositoryId, fact.githubId, fact.tagName, fact.name ?? null, fact.draft, fact.prerelease, authorId, fact.author?.actorKind ?? "unknown", fact.sourceUrl ?? null, fact.createdAt, fact.updatedAt, fact.publishedAt ?? null, input.observedAt],
+          );
+        }
+      }
+
+      const nextCursor = input.stage === "default_branch_commits" ? { ...input.nextCursor, previousHead: progress.cursor.previousHead } : input.nextCursor;
+      const completeness = input.finalPage && (input.stage === "default_branch_commits" || input.stage === "branches" || input.stage === "tags") ? "reachable_at_sync" : input.finalPage ? "observed" : "known_unknown";
+      const updatedResult = await client.query<Row>(
+        `update sync_cursors set cursor=$5,status=$6,last_success_at=$7,completed_at=$8,
+           high_water_at=coalesce($9,high_water_at),completeness_state=$10,error_code=null,paused_until=null
+         where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4 returning *`,
+        [input.tenantId, input.repositoryId, input.stage, refName, nextCursor, input.finalPage ? "completed" : "in_progress", input.observedAt, input.finalPage ? input.observedAt : null, input.highWaterAt ?? null, completeness],
+      );
+      const updated = historicalProgressFromRow(updatedResult.rows[0]);
+      if (!updated) throw new Error("historical_progress_missing_after_commit");
+      if (input.finalPage) {
+        const next = nextHistoricalStage(input.stage);
+        await client.query(
+          `update sync_cursors set status=$5::varchar,started_at=coalesce(started_at,$6),completed_at=case when $5::varchar='completed' then $6 else completed_at end,last_success_at=case when $5::varchar='completed' then $6 else last_success_at end,completeness_state=case when $5::varchar='completed' then 'observed' else completeness_state end
+           where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4`,
+          [input.tenantId, input.repositoryId, next, "", next === "completed" ? "completed" : "in_progress", input.observedAt],
+        );
+      }
+      return { applied: true, progress: updated };
+    });
+  }
+
+  async pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string }): Promise<HistoricalProgress | undefined> {
+    const refName = input.stage === "default_branch_commits" ? branchName(input.refName ?? "") : input.refName ?? "";
+    return this.tenantQuery(input.tenantId, async (client) => historicalProgressFromRow((await client.query<Row>(
+      "update sync_cursors set status='paused',paused_until=$5,error_code=$6 where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4 and status <> 'completed' returning *",
+      [input.tenantId, input.repositoryId, input.stage, refName, input.pausedUntil ?? null, input.errorCode],
+    )).rows[0]));
+  }
+
+  async resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date }): Promise<HistoricalProgress | undefined> {
+    const refName = input.stage === "default_branch_commits" ? branchName(input.refName ?? "") : input.refName ?? "";
+    return this.tenantQuery(input.tenantId, async (client) => historicalProgressFromRow((await client.query<Row>(
+      "update sync_cursors set status='in_progress',paused_until=null,error_code=null where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4 and status='paused' and (paused_until is null or paused_until <= $5) returning *",
+      [input.tenantId, input.repositoryId, input.stage, refName, input.now],
+    )).rows[0]));
+  }
+
+  async pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void> {
+    await this.tenantQuery(input.tenantId, async (client) => { await client.query("update github_installations set api_paused_until=$3,api_pause_reason=$4 where tenant_id=$1 and id=$2", [input.tenantId, input.installationId, input.pausedUntil, input.reason]); });
+  }
+
+  async resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void> {
+    await this.tenantQuery(input.tenantId, async (client) => { await client.query("update github_installations set api_paused_until=null,api_pause_reason=null where tenant_id=$1 and id=$2 and (api_paused_until is null or api_paused_until <= $3)", [input.tenantId, input.installationId, input.now]); });
+  }
+
+  async getHistoricalSourceCounts(tenantId: string, repositoryId: string): Promise<HistoricalSourceCounts> {
+    return this.tenantQuery(tenantId, async (client) => {
+      const result = await client.query<Row>(
+        `select
+           (select count(*)::int from commits where tenant_id=$1 and repository_id=$2) commits,
+           (select count(*)::int from branches where tenant_id=$1 and repository_id=$2) branches,
+           (select count(*)::int from tags where tenant_id=$1 and repository_id=$2) tags,
+           (select count(*)::int from pull_requests where tenant_id=$1 and repository_id=$2) pull_requests,
+           (select count(*)::int from issues where tenant_id=$1 and repository_id=$2) issues,
+           (select count(*)::int from releases where tenant_id=$1 and repository_id=$2) releases`,
+        [tenantId, repositoryId],
+      );
+      const row = result.rows[0];
+      return { commits: Number(row?.commits ?? 0), branches: Number(row?.branches ?? 0), tags: Number(row?.tags ?? 0), pullRequests: Number(row?.pull_requests ?? 0), issues: Number(row?.issues ?? 0), releases: Number(row?.releases ?? 0) };
     });
   }
 

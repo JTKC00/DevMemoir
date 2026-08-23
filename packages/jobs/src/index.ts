@@ -23,6 +23,11 @@ export type SyncJobPayload = {
   inventoryOperationId?: string;
   eventName?: string;
   action?: string;
+  /** M3 stage/page hints are opaque execution hints. PostgreSQL progress is authoritative. */
+  stage?: "default_branch_commits" | "branches" | "tags" | "pull_requests" | "issues" | "releases" | "completed";
+  page?: number;
+  anchorHeadSha?: string;
+  observationStartedAt?: string;
 };
 
 export type QueueJob<T = unknown> = {
@@ -159,7 +164,20 @@ export function deliveryLogicalKey(deliveryId: string): string {
 }
 
 export function commitSyncLogicalKey(repositoryId: string, ref: string, after: string, nextPage?: number): string {
-  return `sync:${repositoryId}:${ref}:${after}${nextPage ? `:page:${nextPage}` : ""}`;
+  // M3 only traverses the selected repository's default branch. Ref names can
+  // contain private project vocabulary, so they never belong in queue keys.
+  void ref;
+  return `sync:${repositoryId}:${after}${nextPage ? `:page:${nextPage}` : ""}`;
+}
+
+export function historicalBackfillLogicalKey(
+  repositoryId: string,
+  stage: NonNullable<SyncJobPayload["stage"]> | "coordinator",
+  page?: number,
+  anchorHeadSha?: string,
+): string {
+  const position = page === undefined ? "wake" : `page:${page}`;
+  return `backfill:${repositoryId}:${stage}:${position}${anchorHeadSha ? `:${anchorHeadSha}` : ""}`;
 }
 
 export function installationInventoryLogicalKey(installationGithubId: number, operationId: string): string {
