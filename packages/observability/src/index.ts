@@ -10,6 +10,8 @@ export const ALLOWED_LOG_KEYS = new Set([
   "attempt",
   "duration_ms",
   "result",
+  "changed_count",
+  "projection_version",
   "rate_limit_bucket",
   "error_code",
   "error_name",

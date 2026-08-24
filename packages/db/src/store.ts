@@ -91,7 +91,30 @@ export type InventoryReconcileResult = {
   added: number;
   updated: number;
   removed: number;
+  projectionRelevantRepositoryIds: string[];
 };
+
+export type RepositoryProjectionInputs = Pick<RepositoryRecord, "ownerLogin" | "name" | "fullName" | "private"> & {
+  visibility?: string | undefined;
+  archivedAt?: Date | undefined;
+  githubCreatedAt?: Date | undefined;
+};
+
+export function emptyInventoryReconcileResult(observed: number): InventoryReconcileResult {
+  return { observed, added: 0, updated: 0, removed: 0, projectionRelevantRepositoryIds: [] };
+}
+
+export function repositoryProjectionInputsChanged(
+  previous: RepositoryProjectionInputs | undefined,
+  next: RepositoryProjectionInputs,
+): boolean {
+  if (!previous) return false;
+  if (previous.ownerLogin !== next.ownerLogin || previous.name !== next.name || previous.fullName !== next.fullName) return true;
+  if (previous.private !== next.private) return true;
+  if ((previous.visibility ?? "") !== (next.visibility ?? "")) return true;
+  if (Boolean(previous.archivedAt) !== Boolean(next.archivedAt)) return true;
+  return (previous.githubCreatedAt?.getTime() ?? undefined) !== (next.githubCreatedAt?.getTime() ?? undefined);
+}
 
 export type InstallationLifecycleStatus = "active" | "suspended" | "deleted" | "disconnected";
 
@@ -521,11 +544,12 @@ export class InMemoryM1Store implements M1Store {
   async reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult> {
     const installation = this.installations.get(input.githubInstallationId);
     if (!installation || installation.tenantId !== input.tenantId) throw new Error("Installation not found for inventory reconciliation");
-    if (installation.lastInventoryAt && installation.lastInventoryAt >= input.observedAt) return { observed: input.repositories.length, added: 0, updated: 0, removed: 0 };
+    if (installation.lastInventoryAt && installation.lastInventoryAt >= input.observedAt) return emptyInventoryReconcileResult(input.repositories.length);
     const observed = new Map<number, RepositoryRecord>();
     for (const candidate of input.repositories) observed.set(candidate.githubRepositoryId, candidate);
     let added = 0;
     let updated = 0;
+    const projectionRelevantRepositoryIds: string[] = [];
     for (const candidate of observed.values()) {
       const key = `${input.tenantId}:${candidate.githubRepositoryId}`;
       const previous = this.repositories.get(key);
@@ -534,7 +558,10 @@ export class InMemoryM1Store implements M1Store {
         const previousHistory = this.repositoryNameHistory.filter((entry) => entry.tenantId === input.tenantId && entry.repositoryId === previous.id).sort((left, right) => (right.validTo?.getTime() ?? 0) - (left.validTo?.getTime() ?? 0))[0];
         this.repositoryNameHistory.push({ tenantId: input.tenantId, repositoryId: previous.id, ownerLogin: previous.ownerLogin, name: previous.name, fullName: previous.fullName, validFrom: previousHistory?.validTo ?? previous.firstSeenAt ?? input.observedAt, validTo: input.observedAt });
       }
-      const { revokedAt: _revokedAt, ...withoutRevokedAt } = previous ?? {};
+      const { revokedAt: _revokedAt, archivedAt: _previousArchivedAt, ...withoutRevokedAt } = previous ?? {};
+      const archived = candidate.archived ?? Boolean(previous?.archivedAt);
+      const archivedAt = archived ? previous?.archivedAt ?? input.observedAt : undefined;
+      const githubCreatedAt = candidate.githubCreatedAt ?? previous?.githubCreatedAt;
       const saved: RepositoryRecord = {
         ...withoutRevokedAt,
         ...candidate,
@@ -546,7 +573,13 @@ export class InMemoryM1Store implements M1Store {
         firstSeenAt: previous?.firstSeenAt ?? candidate.firstSeenAt ?? input.observedAt,
         lastSeenAt: input.observedAt,
         lastAuthoritativeObservedAt: input.observedAt,
+        archived,
       };
+      if (archivedAt) saved.archivedAt = archivedAt;
+      else delete saved.archivedAt;
+      if (githubCreatedAt) saved.githubCreatedAt = githubCreatedAt;
+      else delete saved.githubCreatedAt;
+      if (previous && repositoryProjectionInputsChanged(previous, saved)) projectionRelevantRepositoryIds.push(saved.id);
       this.repositories.set(key, saved);
       if (previous) updated += 1; else added += 1;
     }
@@ -558,7 +591,7 @@ export class InMemoryM1Store implements M1Store {
       removed += 1;
     }
     this.installations.set(input.githubInstallationId, { ...installation, lastInventoryAt: input.observedAt });
-    return { observed: observed.size, added, updated, removed };
+    return { observed: observed.size, added, updated, removed, projectionRelevantRepositoryIds };
   }
   async updateInstallationLifecycle(githubInstallationId: number, status: InstallationLifecycleStatus, now: Date): Promise<void> {
     const installation = this.installations.get(githubInstallationId);

@@ -30,9 +30,10 @@ describe("repository access inventory semantics", () => {
     await store.selectRepository("tenant-a", candidateB?.id ?? "");
     expect(await store.listRepositories("tenant-a")).toEqual([expect.objectContaining({ githubRepositoryId: 102, selected: true })]);
 
-    await store.reconcileInstallationInventory({ tenantId: "tenant-a", githubInstallationId: 71, observedAt: new Date("2026-08-21T00:02:00Z"), repositories: [inventoryRepository("new-id-is-ignored", 101, "a-renamed"), inventoryRepository("ignored-id", 102, "b")] });
+    const renamed = await store.reconcileInstallationInventory({ tenantId: "tenant-a", githubInstallationId: 71, observedAt: new Date("2026-08-21T00:02:00Z"), repositories: [inventoryRepository("new-id-is-ignored", 101, "a-renamed"), inventoryRepository("ignored-id", 102, "b")] });
     const readded = await store.getRepositoryByGithubId("tenant-a", 101);
     expect(readded).toMatchObject({ id: candidate?.id, accessStatus: "accessible", selected: false, fullName: "owner/a-renamed" });
+    expect(renamed.projectionRelevantRepositoryIds).toEqual([candidate?.id]);
     expect(await store.getRepositoryByGithubId("tenant-a", 102)).toMatchObject({ selected: true });
     await expect(store.selectRepository("tenant-a", readded?.id ?? "")).rejects.toBeInstanceOf(RepositorySelectionError);
     await store.unselectRepository("tenant-a", candidateB?.id ?? "");

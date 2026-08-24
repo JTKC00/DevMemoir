@@ -6,6 +6,7 @@ import {
   parseWebhook,
   projectCanonicalFacts,
   projectCommitFacts,
+  type NormalizedPullRequestFact,
 } from "./index.js";
 
 describe("delivery state semantics", () => {
@@ -133,6 +134,53 @@ describe("canonical commit events", () => {
       releases: [],
     });
     expect(defaultTimelineEvents(collaboratorOpened, 7)).toMatchObject([{ verb: "merged", actorGithubAccountId: 7, contributionRole: "merger", ownerContributionRole: "merger" }]);
+  });
+
+  describe("default timeline PR eligibility", () => {
+    const createdAt = new Date("2026-01-01T00:00:00Z");
+    const mergedAt = new Date("2026-01-01T01:00:00Z");
+    const closedAt = new Date("2026-01-01T01:00:01Z");
+    function projectPr(pullRequest: NormalizedPullRequestFact) {
+      return projectCanonicalFacts({
+        tenantId: "tenant-1",
+        repositoryId: "repo-a",
+        githubRepositoryId: 101,
+        ownerGithubAccountId: 7,
+        private: false,
+        commits: [],
+        pullRequests: [pullRequest],
+        issues: [],
+        releases: [],
+      });
+    }
+
+    it("shows an owner-opened collaborator-merged PR without implying the owner merged", () => {
+      const events = projectPr({ githubId: 21, title: "Owner opened", author: { githubAccountId: 7, actorKind: "user" }, merger: { githubAccountId: 9, actorKind: "user" }, createdAt, updatedAt: closedAt, mergedAt, closedAt });
+      expect(defaultTimelineEvents(events, 7)).toMatchObject([{ verb: "merged", actorGithubAccountId: 9, contributionRole: "merger", ownerContributionRole: "opener" }]);
+    });
+
+    it("shows a collaborator-opened owner-merged PR without implying the owner opened it", () => {
+      const events = projectPr({ githubId: 22, title: "Owner merged", author: { githubAccountId: 9, actorKind: "user" }, merger: { githubAccountId: 7, actorKind: "user" }, createdAt, updatedAt: closedAt, mergedAt, closedAt });
+      expect(defaultTimelineEvents(events, 7)).toMatchObject([{ verb: "merged", actorGithubAccountId: 7, contributionRole: "merger", ownerContributionRole: "merger" }]);
+    });
+
+    it("shows an owner-opened unmerged closed PR with an unknown closer", () => {
+      const events = projectPr({ githubId: 23, title: "Owner closed", author: { githubAccountId: 7, actorKind: "user" }, createdAt, updatedAt: closedAt, closedAt });
+      expect(defaultTimelineEvents(events, 7)).toMatchObject([{ verb: "closed", actorKind: "unknown", ownerContributionRole: "opener" }]);
+    });
+
+    it("collaborator opens + collaborator merges + owner uninvolved", () => {
+      const events = projectPr({ githubId: 24, title: "Collaborator only merged", author: { githubAccountId: 9, actorKind: "user" }, merger: { githubAccountId: 11, actorKind: "user" }, createdAt, updatedAt: closedAt, mergedAt, closedAt });
+      expect(events.filter((event) => event.sourceKind === "pull_request").map((event) => event.verb).sort()).toEqual(["closed", "merged", "opened"]);
+      expect(defaultTimelineEvents(events, 7)).toHaveLength(0);
+      expect(filterContextEvents(events, "project").filter((event) => event.sourceKind === "pull_request").map((event) => `${event.verb}:${event.actorGithubAccountId}`).sort()).toEqual(["merged:11", "opened:9"]);
+    });
+
+    it("hides a collaborator-only closed PR from default while keeping project facts", () => {
+      const events = projectPr({ githubId: 25, title: "Collaborator only closed", author: { githubAccountId: 9, actorKind: "user" }, createdAt, updatedAt: closedAt, closedAt });
+      expect(defaultTimelineEvents(events, 7)).toHaveLength(0);
+      expect(filterContextEvents(events, "project")).toMatchObject([{ verb: "opened", actorGithubAccountId: 9, sourceKind: "pull_request" }]);
+    });
   });
 
   it("never transfers commit authorship between owner and collaborator", () => {

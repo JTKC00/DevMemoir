@@ -51,14 +51,17 @@ It contains no title, login, message, or URL. `development_events.logical_event_
 The default API view filters bots and lets the domain timeline projector collapse presentation-only duplicates without deleting facts:
 
 - owner-authored commits are preferred over owner-committed commits;
+- a PR is eligible for the owner's default memoir only when the owner has a factual PR contribution role such as opener or merger. Collaborator-only PR lifecycle remains project context and is excluded from the default owner memoir;
 - a PR is represented by its merged lifecycle when present, otherwise its owner opening/closing fact;
-- a collaborator merger may be displayed while retaining the owner's opener role;
-- published releases remain explicit project milestones.
+- a collaborator merger may be displayed while retaining the owner's opener role, but only when the owner already has a factual contribution role on that PR;
+- published releases remain explicit project milestones, including collaborator-published releases.
 
 Explicit `personal`, `project`, and `unknown` context queries return canonical facts rather than silently transferring actor identity. Source links are rendered when present; private rows remain tenant-scoped and are marked with their visibility.
 
 ## Atomicity and triggers
 
-The worker reprojects after authoritative commit sync, after an accepted historical page, and after repository source synchronization. The PostgreSQL implementation runs source reads, projection replacement, and inserts in one tenant-scoped transaction. Any projection failure rolls back both the delete and all inserts, leaving the previous projection visible. The in-memory store mirrors this rollback contract for unit tests.
+The worker reprojects after authoritative commit sync, after an accepted historical page, and after repository source synchronization. Authoritative repository inventory changes to projection-relevant normalized metadata trigger local canonical reprojection for the selected tracked repository. Projection continues to read PostgreSQL normalized facts only; inventory reconciliation does not call GitHub again for projection. Archive timestamps use the first authoritative observation time when GitHub does not supply a historical archived-at value. Visibility on projected rows is the current normalized observation, not historical event-time visibility.
+
+Inventory reconciliation and canonical projection remain separate transactions. If reprojection fails after inventory commit, normalized source facts stay committed, the previous projection remains visible, and the inventory job retries the local reprojection. The PostgreSQL implementation runs source reads, projection replacement, and inserts in one tenant-scoped transaction. Any projection failure rolls back both the delete and all inserts, leaving the previous projection visible. The in-memory store mirrors this rollback contract for unit tests.
 
 `0004_m4_canonical_projection.sql` adds the projection metadata, logical-key index, event vocabulary checks, query indexes, commit URLs, and read-only API/Web grants. The worker is the only runtime role with projection mutation privileges.
