@@ -1,8 +1,9 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { createId, deliveryRedeliveryAction, repositoryAccessIsAvailable, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
 import { InstallationResolutionError, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
+  ActivityQuery,
   AuthTransactionRecord,
   DeliveryInsertResult,
   DeliveryRecord,
@@ -18,6 +19,7 @@ import type {
   HistoricalSourceStage,
   HistoricalStage,
   M1Store,
+  ProjectionResult,
   RepositoryRecord,
   RefSyncContinuation,
   SessionRecord,
@@ -127,7 +129,7 @@ function repositoryFromRow(row: Row | undefined): RepositoryRecord | undefined {
     ...(row.visibility ? { visibility: String(row.visibility) } : {}),
     defaultBranch: String(row.default_branch),
     ...(row.description ? { description: String(row.description) } : {}),
-    ...(row.archived_at ? { archived: true } : {}),
+    ...(row.archived_at ? { archived: true, archivedAt: new Date(String(row.archived_at)) } : {}),
     ...(row.disabled !== null && row.disabled !== undefined ? { disabled: Boolean(row.disabled) } : {}),
     ...(row.access_status ? { accessStatus: (row.access_status === "selected" || row.access_status === "unselected" ? "accessible" : row.access_status) as RepositoryAccessStatus, selected: row.selected !== null && row.selected !== undefined ? Boolean(row.selected) : row.access_status === "selected" } : {}),
     ...(firstSeenAt ? { firstSeenAt } : {}),
@@ -558,22 +560,21 @@ export class PostgresM1Store implements M1Store {
     });
   }
 
-  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void> {
+  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, htmlUrl?: string): Promise<void> {
     await this.tenantQuery(tenantId, async (client) => {
-      await this.writeCommit(client, tenantId, repositoryId, commit, event, htmlUrl, true);
+      await this.writeCommit(client, tenantId, repositoryId, commit, htmlUrl, true);
     });
   }
 
-  private async writeCommit(client: PoolClient, tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string, allowLegacyStats = false): Promise<void> {
+  private async writeCommit(client: PoolClient, tenantId: string, repositoryId: string, commit: CommitFact, htmlUrl?: string, allowLegacyStats = false): Promise<void> {
     const authorId = commit.author ? await this.ensureGithubAccount(client, commit.author.githubAccountId, commit.author.login, commit.author.accountType ?? "User", commit.author.actorKind) : undefined;
     const committerId = commit.committer ? await this.ensureGithubAccount(client, commit.committer.githubAccountId, commit.committer.login, commit.committer.accountType ?? "User", commit.committer.actorKind) : undefined;
-    const eventActorId = event?.actorGithubAccountId === undefined ? undefined : await this.ensureGithubAccount(client, event.actorGithubAccountId, undefined, event.actorKind === "bot" ? "Bot" : "User", event.actorKind);
-    await client.query(`insert into commits (id,tenant_id,repository_id,sha,author_github_account_id,committer_github_account_id,message,authored_at,committed_at,parent_shas,verified,additions,deletions,first_seen_at,last_seen_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now()) on conflict (tenant_id,repository_id,sha) do update set author_github_account_id=coalesce(excluded.author_github_account_id,commits.author_github_account_id),committer_github_account_id=coalesce(excluded.committer_github_account_id,commits.committer_github_account_id),message=case when excluded.message <> '' then excluded.message else commits.message end,authored_at=coalesce(excluded.authored_at,commits.authored_at),committed_at=coalesce(excluded.committed_at,commits.committed_at),parent_shas=case when jsonb_array_length(excluded.parent_shas) > 0 then excluded.parent_shas else commits.parent_shas end,verified=coalesce(excluded.verified,commits.verified),additions=case when $14 then coalesce(excluded.additions,commits.additions) else commits.additions end,deletions=case when $14 then coalesce(excluded.deletions,commits.deletions) else commits.deletions end,last_seen_at=now()`, [createId(), tenantId, repositoryId, commit.sha, authorId ?? null, committerId ?? null, commit.message, commit.authoredAt ?? null, commit.committedAt ?? null, JSON.stringify(commit.parents), commit.verified ?? null, allowLegacyStats ? commit.additions ?? null : null, allowLegacyStats ? commit.deletions ?? null : null, allowLegacyStats]);
-    if (event) await this.writeDevelopmentEvent(client, tenantId, repositoryId, event, eventActorId, htmlUrl, commit.message);
+    await client.query(`insert into commits (id,tenant_id,repository_id,sha,author_github_account_id,committer_github_account_id,message,authored_at,committed_at,parent_shas,verified,additions,deletions,html_url,first_seen_at,last_seen_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now()) on conflict (tenant_id,repository_id,sha) do update set author_github_account_id=coalesce(excluded.author_github_account_id,commits.author_github_account_id),committer_github_account_id=coalesce(excluded.committer_github_account_id,commits.committer_github_account_id),message=case when excluded.message <> '' then excluded.message else commits.message end,authored_at=coalesce(excluded.authored_at,commits.authored_at),committed_at=coalesce(excluded.committed_at,commits.committed_at),parent_shas=case when jsonb_array_length(excluded.parent_shas) > 0 then excluded.parent_shas else commits.parent_shas end,verified=coalesce(excluded.verified,commits.verified),additions=case when $15 then coalesce(excluded.additions,commits.additions) else commits.additions end,deletions=case when $15 then coalesce(excluded.deletions,commits.deletions) else commits.deletions end,html_url=coalesce(excluded.html_url,commits.html_url),last_seen_at=now()`, [createId(), tenantId, repositoryId, commit.sha, authorId ?? null, committerId ?? null, commit.message, commit.authoredAt ?? null, commit.committedAt ?? null, JSON.stringify(commit.parents), commit.verified ?? null, allowLegacyStats ? commit.additions ?? null : null, allowLegacyStats ? commit.deletions ?? null : null, htmlUrl ?? commit.htmlUrl ?? null, allowLegacyStats]);
   }
 
   private async writeDevelopmentEvent(client: PoolClient, tenantId: string, repositoryId: string, event: DevelopmentEvent, actorId?: string, htmlUrl?: string, message?: string): Promise<void> {
-    await client.query(`insert into development_events (id,tenant_id,repository_id,source_system,source_kind,source_external_id,event_type,verb,actor_github_account_id,actor_kind,contribution_role,context_kind,occurred_at,source_updated_at,title,summary_input,source_url,completeness_state,visibility) values ($1,$2,$3,'github',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) on conflict (tenant_id,repository_id,source_system,source_kind,source_external_id,verb) do update set actor_github_account_id=coalesce(excluded.actor_github_account_id,development_events.actor_github_account_id),actor_kind=case when excluded.actor_github_account_id is not null then excluded.actor_kind else development_events.actor_kind end,contribution_role=excluded.contribution_role,context_kind=case when excluded.actor_github_account_id is not null then excluded.context_kind else development_events.context_kind end,occurred_at=excluded.occurred_at,source_updated_at=coalesce(excluded.source_updated_at,development_events.source_updated_at),summary_input=coalesce(excluded.summary_input,development_events.summary_input),source_url=coalesce(excluded.source_url,development_events.source_url),completeness_state=excluded.completeness_state,visibility=excluded.visibility`, [event.id, tenantId, repositoryId, event.sourceKind, event.sourceExternalId, event.eventType, event.verb, actorId ?? null, event.actorKind, event.contributionRole, event.contextKind, event.occurredAt, event.sourceUpdatedAt ?? null, event.title ?? null, event.summaryInput ?? message ?? null, htmlUrl ?? null, event.completenessState, event.visibility]);
+    const logicalEventKey = event.logicalEventKey ?? canonicalLogicalEventKey(tenantId, event);
+    await client.query(`insert into development_events (id,tenant_id,repository_id,source_system,source_kind,source_external_id,event_type,verb,actor_github_account_id,actor_kind,contribution_role,context_kind,occurred_at,source_updated_at,title,summary_input,source_url,completeness_state,visibility,attribution_confidence,projection_version,logical_event_key) values ($1,$2,$3,'github',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) on conflict (logical_event_key) do update set event_type=excluded.event_type,verb=excluded.verb,actor_github_account_id=excluded.actor_github_account_id,actor_kind=excluded.actor_kind,contribution_role=excluded.contribution_role,context_kind=excluded.context_kind,occurred_at=excluded.occurred_at,source_updated_at=excluded.source_updated_at,title=excluded.title,summary_input=excluded.summary_input,source_url=excluded.source_url,completeness_state=excluded.completeness_state,visibility=excluded.visibility,attribution_confidence=excluded.attribution_confidence,projection_version=excluded.projection_version`, [event.id || createId(), tenantId, repositoryId, event.sourceKind, event.sourceExternalId, event.eventType, event.verb, actorId ?? null, event.actorKind, event.contributionRole, event.contextKind, event.occurredAt, event.sourceUpdatedAt ?? null, event.title ?? null, event.summaryInput ?? message ?? null, htmlUrl ?? event.sourceUrl ?? null, event.completenessState, event.visibility, event.attributionConfidence, event.projectionVersion, logicalEventKey]);
   }
 
   async saveDevelopmentEvent(tenantId: string, repositoryId: string, event: DevelopmentEvent, options?: { htmlUrl?: string; message?: string }): Promise<void> {
@@ -713,7 +714,7 @@ export class PostgresM1Store implements M1Store {
           if (publishedHead !== expectedPublishedHead && publishedHead !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress };
           branchId = branchResult.rows[0]?.id ? String(branchResult.rows[0].id) : undefined;
         }
-        for (const fact of input.facts) await this.writeCommit(client, input.tenantId, input.repositoryId, fact.commit, fact.event, fact.htmlUrl, false);
+        for (const fact of input.facts) await this.writeCommit(client, input.tenantId, input.repositoryId, fact.commit, fact.htmlUrl, false);
         const shas = input.facts.map((fact) => fact.commit.sha);
         if (!branchId) {
           const branchResult = await client.query<Row>(
@@ -854,10 +855,75 @@ export class PostgresM1Store implements M1Store {
     });
   }
 
-  async listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]> {
+  async listActivity(tenantId: string, repositoryId?: string, query?: ActivityQuery): Promise<ActivityRecord[]> {
     return this.tenantQuery(tenantId, async (client) => {
-      const result = await client.query<Row>(`select e.id,e.repository_id,e.source_kind,e.source_external_id,e.event_type,e.verb,ga.github_account_id as actor_github_id,e.actor_kind,e.contribution_role,e.context_kind,e.occurred_at,e.source_updated_at,e.title,e.summary_input,e.source_url,e.completeness_state,e.visibility,c.message from development_events e join repositories r on r.id=e.repository_id and r.tenant_id=e.tenant_id left join commits c on c.tenant_id=e.tenant_id and c.repository_id=e.repository_id and c.sha=e.source_external_id left join github_accounts ga on ga.id=e.actor_github_account_id where e.tenant_id=$1 ${repositoryId ? "and e.repository_id=$2" : ""} and (e.source_kind <> 'commit' or exists (select 1 from commit_refs cr join branches b on b.id=cr.branch_id where cr.tenant_id=e.tenant_id and cr.commit_id=c.id and b.repository_id=e.repository_id and b.name=r.default_branch and cr.reachable=true)) order by e.occurred_at desc limit 100`, repositoryId ? [tenantId, repositoryId] : [tenantId]);
-      return result.rows.map((row) => ({ id: String(row.id), repositoryId: String(row.repository_id), sourceKind: row.source_kind as DevelopmentEvent["sourceKind"], sourceExternalId: String(row.source_external_id), eventType: String(row.event_type), verb: String(row.verb), ...(row.actor_github_id ? { actorGithubAccountId: Number(row.actor_github_id) } : {}), actorKind: row.actor_kind as DevelopmentEvent["actorKind"], contributionRole: row.contribution_role as DevelopmentEvent["contributionRole"], contextKind: row.context_kind as DevelopmentEvent["contextKind"], occurredAt: new Date(String(row.occurred_at)), ...(date(row.source_updated_at) ? { sourceUpdatedAt: date(row.source_updated_at) } : {}), ...(row.title ? { title: String(row.title) } : {}), ...(row.summary_input ? { summaryInput: String(row.summary_input) } : {}), completenessState: row.completeness_state as DevelopmentEvent["completenessState"], visibility: row.visibility as DevelopmentEvent["visibility"], ...(row.message ? { message: String(row.message) } : {}), ...(row.source_url ? { htmlUrl: String(row.source_url) } : {}) }));
+      const contextClause = query?.context && query.context !== "default" ? ` and e.context_kind=$${repositoryId ? 3 : 2}` : "";
+      const botClause = query && !query.includeBots ? " and e.actor_kind <> 'bot'" : "";
+      const params = repositoryId ? [tenantId, repositoryId] : [tenantId];
+      if (query?.context && query.context !== "default") params.push(query.context);
+      const result = await client.query<Row>(`select e.id,e.repository_id,e.source_kind,e.source_external_id,e.event_type,e.verb,ga.github_account_id as actor_github_id,e.actor_kind,e.contribution_role,e.context_kind,e.occurred_at,e.source_updated_at,e.title,e.summary_input,e.source_url,e.completeness_state,e.visibility,e.attribution_confidence,e.projection_version,e.logical_event_key,c.message from development_events e join repositories r on r.id=e.repository_id and r.tenant_id=e.tenant_id left join commits c on c.tenant_id=e.tenant_id and c.repository_id=e.repository_id and c.sha=e.source_external_id left join github_accounts ga on ga.id=e.actor_github_account_id where e.tenant_id=$1 ${repositoryId ? "and e.repository_id=$2" : ""}${contextClause}${botClause} order by e.occurred_at desc,e.logical_event_key asc limit 1000`, params);
+      return result.rows.map((row) => ({ id: String(row.id), repositoryId: String(row.repository_id), sourceKind: row.source_kind as DevelopmentEvent["sourceKind"], sourceExternalId: String(row.source_external_id), eventType: row.event_type as DevelopmentEvent["eventType"], verb: row.verb as DevelopmentEvent["verb"], ...(row.actor_github_id ? { actorGithubAccountId: Number(row.actor_github_id) } : {}), actorKind: row.actor_kind as DevelopmentEvent["actorKind"], contributionRole: row.contribution_role as DevelopmentEvent["contributionRole"], contextKind: row.context_kind as DevelopmentEvent["contextKind"], occurredAt: new Date(String(row.occurred_at)), ...(date(row.source_updated_at) ? { sourceUpdatedAt: date(row.source_updated_at) } : {}), ...(row.title ? { title: String(row.title) } : {}), ...(row.summary_input ? { summaryInput: String(row.summary_input) } : {}), completenessState: row.completeness_state as DevelopmentEvent["completenessState"], visibility: row.visibility as DevelopmentEvent["visibility"], attributionConfidence: row.attribution_confidence as DevelopmentEvent["attributionConfidence"], projectionVersion: Number(row.projection_version), logicalEventKey: String(row.logical_event_key), ...(row.message ? { message: String(row.message) } : {}), ...(row.source_url ? { sourceUrl: String(row.source_url) } : {}) }));
+    });
+  }
+
+  async reprojectRepository(input: { tenantId: string; repositoryId: string; ownerGithubAccountId: number; projectionVersion?: number; failureAfterEvents?: number }): Promise<ProjectionResult> {
+    return this.tenantQuery(input.tenantId, async (client) => {
+      const repositoryResult = await client.query<Row>("select github_repository_id,private,visibility,github_created_at,archived_at from repositories where tenant_id=$1 and id=$2", [input.tenantId, input.repositoryId]);
+      const repository = repositoryResult.rows[0];
+      if (!repository) throw new Error("repository_not_found_for_projection");
+      const actor = (row: Row, prefix: string) => row[`${prefix}_github_id`] === null || row[`${prefix}_github_id`] === undefined ? undefined : ({ githubAccountId: Number(row[`${prefix}_github_id`]), actorKind: row[`${prefix}_actor_kind`] as "user" | "bot" | "unknown", ...(row[`${prefix}_login`] ? { login: String(row[`${prefix}_login`]) } : {}), ...(row[`${prefix}_account_type`] ? { accountType: String(row[`${prefix}_account_type`]) } : {}) });
+      const required = (row: Row, field: string): Date => {
+        const value = date(row[field]);
+        if (!value) throw new Error("projection_source_missing_timestamp");
+        return value;
+      };
+      const commitRows = await client.query<Row>(`select c.sha,c.message,c.authored_at,c.committed_at,c.parent_shas,c.verified,c.html_url,aa.github_account_id as author_github_id,aa.actor_kind as author_actor_kind,aa.login as author_login,aa.account_type as author_account_type,ca.github_account_id as committer_github_id,ca.actor_kind as committer_actor_kind,ca.login as committer_login,ca.account_type as committer_account_type from commits c left join github_accounts aa on aa.id=c.author_github_account_id left join github_accounts ca on ca.id=c.committer_github_account_id where c.tenant_id=$1 and c.repository_id=$2 order by c.sha`, [input.tenantId, input.repositoryId]);
+      const pullRows = await client.query<Row>(`select p.github_pull_request_id,p.title,p.source_url,p.github_created_at,p.github_updated_at,p.github_closed_at,p.github_merged_at,aa.github_account_id as author_github_id,aa.actor_kind as author_actor_kind,aa.login as author_login,aa.account_type as author_account_type,ma.github_account_id as merger_github_id,ma.actor_kind as merger_actor_kind,ma.login as merger_login,ma.account_type as merger_account_type,p.completeness_state from pull_requests p left join github_accounts aa on aa.id=p.author_github_account_id left join github_accounts ma on ma.id=p.merger_github_account_id where p.tenant_id=$1 and p.repository_id=$2 order by p.github_pull_request_id`, [input.tenantId, input.repositoryId]);
+      const issueRows = await client.query<Row>(`select i.github_issue_id,i.title,i.source_url,i.github_created_at,i.github_updated_at,i.github_closed_at,aa.github_account_id as author_github_id,aa.actor_kind as author_actor_kind,aa.login as author_login,aa.account_type as author_account_type,i.completeness_state from issues i left join github_accounts aa on aa.id=i.author_github_account_id where i.tenant_id=$1 and i.repository_id=$2 order by i.github_issue_id`, [input.tenantId, input.repositoryId]);
+      const releaseRows = await client.query<Row>(`select r.github_release_id,r.name,r.source_url,r.github_updated_at,r.github_published_at,aa.github_account_id as author_github_id,aa.actor_kind as author_actor_kind,aa.login as author_login,aa.account_type as author_account_type,r.completeness_state from releases r left join github_accounts aa on aa.id=r.author_github_account_id where r.tenant_id=$1 and r.repository_id=$2 order by r.github_release_id`, [input.tenantId, input.repositoryId]);
+      const renameRows = await client.query<Row>("select valid_to from repository_name_history where tenant_id=$1 and repository_id=$2 and valid_to is not null order by valid_to", [input.tenantId, input.repositoryId]);
+      const tagRows = await client.query<Row>("select name,deleted_at,completeness_state from tags where tenant_id=$1 and repository_id=$2 and deleted_at is not null order by name", [input.tenantId, input.repositoryId]);
+      const projectionInput: CanonicalProjectionInput = {
+        tenantId: input.tenantId,
+        repositoryId: input.repositoryId,
+        githubRepositoryId: Number(repository.github_repository_id),
+        ownerGithubAccountId: input.ownerGithubAccountId,
+        private: Boolean(repository.private),
+        ...(repository.visibility ? { visibility: String(repository.visibility) } : {}),
+        ...(date(repository.github_created_at) ? { githubCreatedAt: date(repository.github_created_at) } : {}),
+        ...(date(repository.archived_at) ? { archivedAt: date(repository.archived_at) } : {}),
+        commits: commitRows.rows.map((row) => {
+          const author = actor(row, "author");
+          const committer = actor(row, "committer");
+          const authoredAt = date(row.authored_at);
+          const committedAt = date(row.committed_at);
+          return { repositoryId: input.repositoryId, sha: String(row.sha), ...(author ? { author } : {}), ...(committer ? { committer } : {}), message: String(row.message), ...(authoredAt ? { authoredAt } : {}), ...(committedAt ? { committedAt } : {}), parents: Array.isArray(row.parent_shas) ? row.parent_shas.filter((value): value is string => typeof value === "string") : [], ...(row.verified === null || row.verified === undefined ? {} : { verified: Boolean(row.verified) }), ...(row.html_url ? { htmlUrl: String(row.html_url) } : {}) };
+        }),
+        pullRequests: pullRows.rows.map((row) => {
+          const author = actor(row, "author");
+          const merger = actor(row, "merger");
+          return { githubId: Number(row.github_pull_request_id), title: String(row.title), ...(author ? { author } : {}), ...(merger ? { merger } : {}), ...(row.source_url ? { sourceUrl: String(row.source_url) } : {}), createdAt: required(row, "github_created_at"), updatedAt: required(row, "github_updated_at"), ...(date(row.github_closed_at) ? { closedAt: date(row.github_closed_at) } : {}), ...(date(row.github_merged_at) ? { mergedAt: date(row.github_merged_at) } : {}), ...(row.completeness_state ? { completenessState: row.completeness_state as "observed" | "reachable_at_sync" | "known_unknown" | "out_of_scope" } : {}) };
+        }),
+        issues: issueRows.rows.map((row) => {
+          const author = actor(row, "author");
+          return { githubId: Number(row.github_issue_id), title: String(row.title), ...(author ? { author } : {}), ...(row.source_url ? { sourceUrl: String(row.source_url) } : {}), createdAt: required(row, "github_created_at"), updatedAt: required(row, "github_updated_at"), ...(date(row.github_closed_at) ? { closedAt: date(row.github_closed_at) } : {}), ...(row.completeness_state ? { completenessState: row.completeness_state as "observed" | "reachable_at_sync" | "known_unknown" | "out_of_scope" } : {}) };
+        }),
+        releases: releaseRows.rows.map((row) => {
+          const author = actor(row, "author");
+          return { githubId: Number(row.github_release_id), ...(row.name ? { name: String(row.name) } : {}), ...(author ? { author } : {}), ...(row.source_url ? { sourceUrl: String(row.source_url) } : {}), updatedAt: required(row, "github_updated_at"), ...(date(row.github_published_at) ? { publishedAt: date(row.github_published_at) } : {}), ...(row.completeness_state ? { completenessState: row.completeness_state as "observed" | "reachable_at_sync" | "known_unknown" | "out_of_scope" } : {}) };
+        }),
+        repositoryRenames: renameRows.rows.map((row) => ({ observedAt: required(row, "valid_to") })),
+        tags: tagRows.rows.map((row) => ({ name: String(row.name), deletedAt: required(row, "deleted_at"), ...(row.completeness_state ? { completenessState: row.completeness_state as "observed" | "reachable_at_sync" | "known_unknown" | "out_of_scope" } : {}) })),
+        projectionVersion: input.projectionVersion ?? PROJECTION_VERSION,
+      };
+      const projected = projectCanonicalFacts(projectionInput);
+      await client.query("delete from development_events where tenant_id=$1 and repository_id=$2", [input.tenantId, input.repositoryId]);
+      for (const [index, event] of projected.entries()) {
+        if (input.failureAfterEvents !== undefined && index >= input.failureAfterEvents) throw new Error("projection_injected_failure");
+        const actorId = event.actorGithubAccountId === undefined ? undefined : await this.ensureGithubAccount(client, event.actorGithubAccountId, undefined, event.actorKind === "bot" ? "Bot" : "User", event.actorKind);
+        await this.writeDevelopmentEvent(client, input.tenantId, input.repositoryId, event, actorId, event.sourceUrl, event.summaryInput);
+      }
+      return { projectionVersion: input.projectionVersion ?? PROJECTION_VERSION, eventCount: projected.length };
     });
   }
 

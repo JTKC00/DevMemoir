@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getTableColumns } from "drizzle-orm";
-import { githubIdentities, commits, issues, pullRequests, releases, repositoryNameHistory, syncCursors, tags, webhookDeliveries } from "./schema.js";
+import { developmentEvents, githubIdentities, commits, issues, pullRequests, releases, repositoryNameHistory, syncCursors, tags, webhookDeliveries } from "./schema.js";
 
 if (process.env.CI && !process.env.TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required in CI");
 
@@ -26,6 +26,11 @@ describe("M2 schema contract", () => {
       expect(columns).not.toContain("assets");
       expect(columns).not.toContain("rawJson");
     }
+  });
+
+  it("defines versioned canonical event identity and attribution metadata", () => {
+    const columns = Object.keys(getTableColumns(developmentEvents));
+    expect(columns).toEqual(expect.arrayContaining(["logicalEventKey", "projectionVersion", "attributionConfidence", "visibility", "contextKind", "sourceUrl"]));
   });
 
   it.skipIf(!process.env.TEST_DATABASE_URL)("runs against real PostgreSQL when TEST_DATABASE_URL is provided", async () => {

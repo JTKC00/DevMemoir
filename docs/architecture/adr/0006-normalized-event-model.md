@@ -9,7 +9,7 @@ Transport payloads are incomplete and unstable for trustworthy timelines. DevMem
 
 ## Decision
 
-Retain normalized GitHub source entities, then deterministically project one `development_events` table keyed by tenant/repository/source/verb. Do not create separate per-event tables.
+Retain normalized GitHub source entities, then deterministically project one `development_events` table keyed by tenant/repository/source/verb. Do not create separate per-event tables. Milestone 4 makes the projection versioned and gives each fact a stable logical key of `tenant:repository:source:external-id:event-type:verb:contribution-role`; the worker replaces one repository slice atomically from normalized source facts.
 
 Each event records stable source identity, nullable GitHub actor, `actor_kind` (`user|bot|unknown`), contribution role, `context_kind` (`personal|project|unknown`), timestamps, visibility, attribution confidence, and completeness state (`observed|reachable_at_sync|known_unknown|out_of_scope`). Unknown/ghost actors remain nullable; never match display names or store/match raw Git emails.
 
@@ -28,7 +28,7 @@ The UI states exactly: **“Newest 100 commits currently reachable from the defa
 
 ## Consequences
 
-Projection enables stable queries and reprocessing while preserving source evidence. Some project facts are intentionally not personal memoir entries. Completeness and collapse policy must remain visible/tested as new event types arrive.
+Projection enables stable queries and reprocessing while preserving source evidence. Some project facts are intentionally not personal memoir entries. Author, committer, opener, merger, releaser, and unknown-action roles remain distinct; bot filtering and duplicate collapse belong to query/UI policy, never to source retention. Completeness and collapse policy must remain visible/tested as new event types arrive.
 
 ## Validation
 

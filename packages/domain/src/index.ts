@@ -41,11 +41,31 @@ export function isTerminalDeliveryState(state: DeliveryState): boolean {
 
 export type ActorKind = "user" | "bot" | "unknown";
 export type ContextKind = "personal" | "project" | "unknown";
+export type AttributionConfidence = "exact_github_actor" | "unknown";
 export type CompletenessState =
   | "observed"
   | "reachable_at_sync"
   | "known_unknown"
   | "out_of_scope";
+
+export const PROJECTION_VERSION = 1;
+
+export type SourceKind = "commit" | "pull_request" | "issue" | "release" | "repository" | "tag";
+export type EventVerb =
+  | "authored"
+  | "committed"
+  | "opened"
+  | "merged"
+  | "closed"
+  | "reopened"
+  | "published"
+  | "edited"
+  | "created"
+  | "archived"
+  | "renamed"
+  | "deleted";
+export type ContributionRole = "author" | "committer" | "opener" | "merger" | "releaser" | "maintainer" | "unknown_action";
+export type Visibility = "public" | "private" | "internal" | "unknown";
 
 export type GithubActor = {
   githubAccountId: number;
@@ -66,28 +86,106 @@ export type CommitFact = {
   verified?: boolean;
   additions?: number;
   deletions?: number;
+  htmlUrl?: string;
 };
 
 export type DevelopmentEvent = {
   id: string;
   repositoryId: string;
-  sourceKind: "commit" | "pull_request" | "issue" | "release" | "repository";
+  sourceKind: SourceKind;
   sourceExternalId: string;
-  eventType: string;
-  verb: string;
+  eventType: SourceKind;
+  verb: EventVerb;
   actorGithubAccountId?: number | undefined;
   actorKind: ActorKind;
-  contributionRole: "author" | "committer" | "opener" | "merger" | "releaser" | "maintainer";
+  contributionRole: ContributionRole;
   contextKind: ContextKind;
   occurredAt: Date;
   sourceUpdatedAt?: Date | undefined;
   title?: string | undefined;
   summaryInput?: string | undefined;
+  sourceUrl?: string | undefined;
   completenessState: CompletenessState;
-  visibility: "public" | "private" | "internal" | "unknown";
+  visibility: Visibility;
+  attributionConfidence: AttributionConfidence;
+  projectionVersion: number;
+  logicalEventKey?: string | undefined;
 };
 
-export type TimelineEvent = DevelopmentEvent & { displayVerb: string };
+export type TimelineEvent = DevelopmentEvent & {
+  displayVerb: EventVerb;
+  /** Owner contribution retained when the displayed lifecycle actor is a collaborator. */
+  ownerContributionRole?: ContributionRole | undefined;
+};
+
+export type ProjectionActor = {
+  githubAccountId?: number | undefined;
+  actorKind: ActorKind;
+  login?: string | undefined;
+  accountType?: string | undefined;
+};
+
+export type NormalizedPullRequestFact = {
+  githubId: number;
+  title: string;
+  author?: ProjectionActor | undefined;
+  merger?: ProjectionActor | undefined;
+  sourceUrl?: string | undefined;
+  createdAt: Date;
+  updatedAt: Date;
+  closedAt?: Date | undefined;
+  mergedAt?: Date | undefined;
+  completenessState?: CompletenessState | undefined;
+};
+
+export type NormalizedIssueFact = {
+  githubId: number;
+  title: string;
+  author?: ProjectionActor | undefined;
+  sourceUrl?: string | undefined;
+  createdAt: Date;
+  updatedAt: Date;
+  closedAt?: Date | undefined;
+  completenessState?: CompletenessState | undefined;
+};
+
+export type NormalizedReleaseFact = {
+  githubId: number;
+  name?: string | undefined;
+  author?: ProjectionActor | undefined;
+  sourceUrl?: string | undefined;
+  publishedAt?: Date | undefined;
+  updatedAt: Date;
+  completenessState?: CompletenessState | undefined;
+};
+
+export type NormalizedRepositoryRenameFact = {
+  observedAt: Date;
+};
+
+export type NormalizedTagFact = {
+  name: string;
+  deletedAt?: Date | undefined;
+  completenessState?: CompletenessState | undefined;
+};
+
+export type CanonicalProjectionInput = {
+  tenantId: string;
+  repositoryId: string;
+  githubRepositoryId: number;
+  ownerGithubAccountId?: number | undefined;
+  private: boolean;
+  visibility?: string | undefined;
+  githubCreatedAt?: Date | undefined;
+  archivedAt?: Date | undefined;
+  commits: Array<CommitFact>;
+  pullRequests: Array<NormalizedPullRequestFact>;
+  issues: Array<NormalizedIssueFact>;
+  releases: Array<NormalizedReleaseFact>;
+  repositoryRenames?: Array<NormalizedRepositoryRenameFact>;
+  tags?: Array<NormalizedTagFact>;
+  projectionVersion?: number | undefined;
+};
 
 export function actorKindFromGithub(actor: {
   type?: string | null;
@@ -112,58 +210,221 @@ function eventForCommit(
   commit: CommitFact,
   actor: GithubActor | undefined,
   role: "author" | "committer",
+  verb: "authored" | "committed",
   ownerGithubAccountId?: number,
+  tenantId?: string,
+  projectionVersion = PROJECTION_VERSION,
+  visibility: Visibility = "unknown",
 ): DevelopmentEvent {
   const actorKind = actor?.actorKind ?? "unknown";
   const actorId = actor?.githubAccountId;
   return {
-    id: createId(),
+    id: "",
     repositoryId: commit.repositoryId,
     sourceKind: "commit",
     sourceExternalId: commit.sha,
     eventType: "commit",
-    verb: role === "author" ? "authored" : "committed",
+    verb,
     actorGithubAccountId: actorId,
     actorKind,
     contributionRole: role,
-    contextKind: actorId && ownerGithubAccountId === actorId ? "personal" : actorId ? "project" : "unknown",
-    occurredAt: commit.authoredAt ?? commit.committedAt ?? new Date(0),
-    sourceUpdatedAt: commit.committedAt,
+    contextKind: contextForActor(actorId, ownerGithubAccountId),
+    occurredAt: (role === "author" ? commit.authoredAt : commit.committedAt) as Date,
+    ...(commit.committedAt ? { sourceUpdatedAt: commit.committedAt } : {}),
     summaryInput: truncatePrivateText(commit.message),
+    ...(commit.htmlUrl ? { sourceUrl: commit.htmlUrl } : {}),
     completenessState: "observed",
-    visibility: "unknown",
+    visibility,
+    attributionConfidence: actorId === undefined ? "unknown" : "exact_github_actor",
+    projectionVersion,
+    ...(tenantId ? { logicalEventKey: canonicalLogicalEventKey(tenantId, { repositoryId: commit.repositoryId, sourceKind: "commit", sourceExternalId: commit.sha, eventType: "commit", verb, contributionRole: role }) } : {}),
   };
 }
 
+function contextForActor(actorId: number | undefined, ownerGithubAccountId?: number): ContextKind {
+  if (actorId === undefined || ownerGithubAccountId === undefined) return "unknown";
+  return actorId === ownerGithubAccountId ? "personal" : "project";
+}
+
+export function canonicalLogicalEventKey(
+  tenantId: string,
+  dimensions: Pick<DevelopmentEvent, "repositoryId" | "sourceKind" | "sourceExternalId" | "eventType" | "verb" | "contributionRole">,
+): string {
+  return [tenantId, dimensions.repositoryId, dimensions.sourceKind, dimensions.sourceExternalId, dimensions.eventType, dimensions.verb, dimensions.contributionRole].join(":");
+}
+
+function visibilityForRepository(privateRepository: boolean, visibility?: string): Visibility {
+  if (privateRepository) return "private";
+  if (visibility === "public" || visibility === "private" || visibility === "internal") return visibility;
+  return "unknown";
+}
+
+function eventForLifecycle(input: {
+  tenantId: string;
+  repositoryId: string;
+  sourceKind: SourceKind;
+  sourceExternalId: string;
+  verb: EventVerb;
+  contributionRole: ContributionRole;
+  actor?: ProjectionActor | undefined;
+  occurredAt?: Date | undefined;
+  sourceUpdatedAt?: Date | undefined;
+  title?: string | undefined;
+  summaryInput?: string | undefined;
+  sourceUrl?: string | undefined;
+  completenessState?: CompletenessState | undefined;
+  visibility: Visibility;
+  projectionVersion: number;
+}): DevelopmentEvent | undefined {
+  if (!input.occurredAt) return undefined;
+  const actorId = input.actor?.githubAccountId;
+  const event: DevelopmentEvent = {
+    id: "",
+    repositoryId: input.repositoryId,
+    sourceKind: input.sourceKind,
+    sourceExternalId: input.sourceExternalId,
+    eventType: input.sourceKind,
+    verb: input.verb,
+    ...(actorId === undefined ? {} : { actorGithubAccountId: actorId }),
+    actorKind: input.actor?.actorKind ?? "unknown",
+    contributionRole: input.contributionRole,
+    contextKind: contextForActor(actorId, undefined),
+    occurredAt: input.occurredAt,
+    ...(input.sourceUpdatedAt ? { sourceUpdatedAt: input.sourceUpdatedAt } : {}),
+    ...(input.title ? { title: truncatePrivateText(input.title) } : {}),
+    ...(input.summaryInput ? { summaryInput: truncatePrivateText(input.summaryInput) } : {}),
+    ...(input.sourceUrl ? { sourceUrl: input.sourceUrl } : {}),
+    completenessState: input.completenessState ?? "observed",
+    visibility: input.visibility,
+    attributionConfidence: actorId === undefined ? "unknown" : "exact_github_actor",
+    projectionVersion: input.projectionVersion,
+  };
+  event.logicalEventKey = canonicalLogicalEventKey(input.tenantId, event);
+  return event;
+}
+
+function withOwnerContext(event: DevelopmentEvent, ownerGithubAccountId?: number): DevelopmentEvent {
+  const actorId = event.actorGithubAccountId;
+  return { ...event, contextKind: contextForActor(actorId, ownerGithubAccountId) };
+}
+
+function projectCommitFact(commit: CommitFact, ownerGithubAccountId: number | undefined, tenantId?: string, projectionVersion = PROJECTION_VERSION, visibility: Visibility = "unknown"): DevelopmentEvent[] {
+  const result: DevelopmentEvent[] = [];
+  if (commit.authoredAt) result.push(withOwnerContext(eventForCommit(commit, commit.author, "author", "authored", ownerGithubAccountId, tenantId, projectionVersion, visibility), ownerGithubAccountId));
+  if (commit.committedAt) result.push(withOwnerContext(eventForCommit(commit, commit.committer, "committer", "committed", ownerGithubAccountId, tenantId, projectionVersion, visibility), ownerGithubAccountId));
+  return result;
+}
+
 export function projectCommitFacts(commit: CommitFact, ownerGithubAccountId?: number): DevelopmentEvent[] {
-  const authorId = commit.author?.githubAccountId;
-  const committerId = commit.committer?.githubAccountId;
-  if (authorId !== undefined && authorId === committerId) {
-    return [eventForCommit(commit, commit.author, "author", ownerGithubAccountId)];
+  return projectCommitFact(commit, ownerGithubAccountId);
+}
+
+function tagIdentity(name: string): string {
+  return createHash("sha256").update(name).digest("hex");
+}
+
+export function projectCanonicalFacts(input: CanonicalProjectionInput): DevelopmentEvent[] {
+  const projectionVersion = input.projectionVersion ?? PROJECTION_VERSION;
+  const visibility = visibilityForRepository(input.private, input.visibility);
+  const events: DevelopmentEvent[] = [];
+  for (const commit of input.commits) events.push(...projectCommitFact(commit, input.ownerGithubAccountId, input.tenantId, projectionVersion, visibility));
+
+  for (const pullRequest of input.pullRequests) {
+    const sourceExternalId = String(pullRequest.githubId);
+    const opened = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "pull_request", sourceExternalId, verb: "opened", contributionRole: "opener", actor: pullRequest.author, occurredAt: pullRequest.createdAt, sourceUpdatedAt: pullRequest.updatedAt, title: pullRequest.title, sourceUrl: pullRequest.sourceUrl, completenessState: pullRequest.completenessState, visibility, projectionVersion });
+    const merged = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "pull_request", sourceExternalId, verb: "merged", contributionRole: "merger", actor: pullRequest.merger, occurredAt: pullRequest.mergedAt, sourceUpdatedAt: pullRequest.updatedAt, title: pullRequest.title, sourceUrl: pullRequest.sourceUrl, completenessState: pullRequest.completenessState, visibility, projectionVersion });
+    const closed = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "pull_request", sourceExternalId, verb: "closed", contributionRole: "unknown_action", occurredAt: pullRequest.closedAt, sourceUpdatedAt: pullRequest.updatedAt, title: pullRequest.title, sourceUrl: pullRequest.sourceUrl, completenessState: pullRequest.completenessState, visibility, projectionVersion });
+    if (opened) events.push(withOwnerContext(opened, input.ownerGithubAccountId ?? Number.NaN));
+    if (merged) events.push(withOwnerContext(merged, input.ownerGithubAccountId ?? Number.NaN));
+    if (closed) events.push(withOwnerContext(closed, input.ownerGithubAccountId ?? Number.NaN));
   }
-  return [
-    eventForCommit(commit, commit.author, "author", ownerGithubAccountId),
-    eventForCommit(commit, commit.committer, "committer", ownerGithubAccountId),
-  ].filter((event) => event.actorGithubAccountId !== undefined || event.contextKind !== "unknown");
+
+  for (const issue of input.issues) {
+    const sourceExternalId = String(issue.githubId);
+    const opened = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "issue", sourceExternalId, verb: "opened", contributionRole: "opener", actor: issue.author, occurredAt: issue.createdAt, sourceUpdatedAt: issue.updatedAt, title: issue.title, sourceUrl: issue.sourceUrl, completenessState: issue.completenessState, visibility, projectionVersion });
+    const closed = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "issue", sourceExternalId, verb: "closed", contributionRole: "unknown_action", occurredAt: issue.closedAt, sourceUpdatedAt: issue.updatedAt, title: issue.title, sourceUrl: issue.sourceUrl, completenessState: issue.completenessState, visibility, projectionVersion });
+    if (opened) events.push(withOwnerContext(opened, input.ownerGithubAccountId ?? Number.NaN));
+    if (closed) events.push(withOwnerContext(closed, input.ownerGithubAccountId ?? Number.NaN));
+  }
+
+  for (const release of input.releases) {
+    const published = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "release", sourceExternalId: String(release.githubId), verb: "published", contributionRole: "releaser", actor: release.author, occurredAt: release.publishedAt, sourceUpdatedAt: release.updatedAt, title: release.name, sourceUrl: release.sourceUrl, completenessState: release.completenessState, visibility, projectionVersion });
+    if (published) events.push(withOwnerContext(published, input.ownerGithubAccountId ?? Number.NaN));
+  }
+
+  const repositoryId = String(input.githubRepositoryId);
+  const created = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "repository", sourceExternalId: repositoryId, verb: "created", contributionRole: "unknown_action", actor: undefined, occurredAt: input.githubCreatedAt, sourceUpdatedAt: input.githubCreatedAt, title: "Repository created", visibility, projectionVersion });
+  const archived = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "repository", sourceExternalId: repositoryId, verb: "archived", contributionRole: "unknown_action", actor: undefined, occurredAt: input.archivedAt, sourceUpdatedAt: input.archivedAt, title: "Repository archived", visibility, projectionVersion });
+  if (created) events.push(created);
+  if (archived) events.push(archived);
+  for (const rename of input.repositoryRenames ?? []) {
+    const renamed = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "repository", sourceExternalId: `${repositoryId}:rename:${rename.observedAt.toISOString()}`, verb: "renamed", contributionRole: "unknown_action", actor: undefined, occurredAt: rename.observedAt, sourceUpdatedAt: rename.observedAt, title: "Repository renamed", visibility, projectionVersion });
+    if (renamed) events.push(renamed);
+  }
+  for (const tag of input.tags ?? []) {
+    const deleted = eventForLifecycle({ tenantId: input.tenantId, repositoryId: input.repositoryId, sourceKind: "tag", sourceExternalId: tagIdentity(tag.name), verb: "deleted", contributionRole: "unknown_action", actor: undefined, occurredAt: tag.deletedAt, sourceUpdatedAt: tag.deletedAt, title: "Tag deleted", completenessState: tag.completenessState, visibility, projectionVersion });
+    if (deleted) events.push(deleted);
+  }
+  return events.sort((left, right) => {
+    const byDate = right.occurredAt.getTime() - left.occurredAt.getTime();
+    if (byDate !== 0) return byDate;
+    return (left.logicalEventKey ?? "").localeCompare(right.logicalEventKey ?? "");
+  });
 }
 
 export function defaultTimelineEvents(
   events: DevelopmentEvent[],
   ownerGithubAccountId: number,
 ): TimelineEvent[] {
+  const visible = events.filter((event) => event.actorKind !== "bot");
   const result: TimelineEvent[] = [];
-  const seen = new Set<string>();
-  for (const event of events) {
-    if (event.actorKind === "bot") continue;
-    const ownerEvent = event.actorGithubAccountId === ownerGithubAccountId;
-    const milestone = event.contextKind === "project" && event.eventType === "release";
-    if (!ownerEvent && !milestone) continue;
-    const collapseKey = `${event.sourceKind}:${event.sourceExternalId}:${ownerEvent ? ownerGithubAccountId : "milestone"}`;
-    if (seen.has(collapseKey)) continue;
-    seen.add(collapseKey);
-    result.push({ ...event, displayVerb: event.verb });
+  const groups = new Map<string, DevelopmentEvent[]>();
+  for (const event of visible) {
+    const key = `${event.repositoryId}:${event.sourceKind}:${event.sourceExternalId}`;
+    const group = groups.get(key) ?? [];
+    group.push(event);
+    groups.set(key, group);
   }
-  return result.sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
+  for (const group of groups.values()) {
+    const first = group[0];
+    if (!first) continue;
+    if (first.sourceKind === "commit") {
+      const ownerEvents = group.filter((event) => event.actorGithubAccountId === ownerGithubAccountId);
+      const authored = ownerEvents.find((event) => event.verb === "authored");
+      const committed = ownerEvents.find((event) => event.verb === "committed");
+      const chosen = authored ?? committed;
+      if (chosen) result.push({ ...chosen, displayVerb: chosen.verb, ownerContributionRole: chosen.contributionRole });
+      continue;
+    }
+    if (first.sourceKind === "pull_request") {
+      const ownerOpened = group.find((event) => event.actorGithubAccountId === ownerGithubAccountId && event.contributionRole === "opener");
+      const ownerMerged = group.find((event) => event.actorGithubAccountId === ownerGithubAccountId && event.verb === "merged");
+      const merged = group.find((event) => event.verb === "merged");
+      const closed = group.find((event) => event.verb === "closed");
+      const opened = group.find((event) => event.verb === "opened" && event.actorGithubAccountId === ownerGithubAccountId);
+      const chosen = merged ?? (closed && ownerOpened ? closed : opened);
+      if (chosen) {
+        result.push({
+          ...chosen,
+          displayVerb: chosen.verb,
+          ...(ownerMerged ? { ownerContributionRole: ownerMerged.contributionRole } : ownerOpened ? { ownerContributionRole: ownerOpened.contributionRole } : {}),
+        });
+      }
+      continue;
+    }
+    const ownerEvent = group.find((event) => event.actorGithubAccountId === ownerGithubAccountId);
+    const milestone = first.sourceKind === "release" && first.contextKind === "project";
+    if (ownerEvent) result.push({ ...ownerEvent, displayVerb: ownerEvent.verb, ownerContributionRole: ownerEvent.contributionRole });
+    else if (milestone) result.push({ ...first, displayVerb: first.verb });
+  }
+  return result.sort((a, b) => {
+    const byDate = b.occurredAt.getTime() - a.occurredAt.getTime();
+    return byDate !== 0 ? byDate : (a.logicalEventKey ?? "").localeCompare(b.logicalEventKey ?? "");
+  });
+}
+
+export function filterContextEvents(events: DevelopmentEvent[], context: "personal" | "project" | "unknown", includeBots = false): DevelopmentEvent[] {
+  return events.filter((event) => (includeBots || event.actorKind !== "bot") && event.contextKind === context);
 }
 
 const actorPayloadSchema = z

@@ -1,4 +1,4 @@
-# DevMemoir M3
+# DevMemoir M4
 
 DevMemoir is a TypeScript/pnpm monorepo for one allowlisted owner, one bound GitHub App installation, and one actively selected repository. M3 progressively imports supported historical repository facts with durable page/stage checkpoints while preserving the existing private factual activity slice.
 
@@ -6,7 +6,7 @@ The coverage boundary shown by the product is deliberately exact:
 
 > **Newest 100 commits currently reachable from the default branch of this connected repository.**
 
-M1 stores commit facts and canonical events only. It never stores raw author emails, source files, blobs, patches, paths, PR/issue bodies, comments, or `push.commits[]` as authoritative data.
+The canonical M4 projection stores normalized factual events from source facts. It never stores raw author emails, source files, blobs, patches, paths, PR/issue bodies, comments, or `push.commits[]` as authoritative data.
 
 ## Local PostgreSQL
 
@@ -171,7 +171,7 @@ pnpm test
 pnpm build
 ```
 
-The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects all migrations through `0003_m3_historical_backfill.sql` to have been applied and verifies capability-role membership through ephemeral LOGIN principals, tenant isolation for normalized sources and progress, worker scoping, and that the web role cannot mutate GitHub-derived data:
+The PostgreSQL RLS suite is enabled when `TEST_DATABASE_URL` is set. It expects all migrations through `0004_m4_canonical_projection.sql` to have been applied and verifies capability-role membership through ephemeral LOGIN principals, tenant isolation for normalized sources, canonical events, and progress, worker scoping, and that the web role cannot mutate GitHub-derived data:
 
 ```bash
 $env:TEST_DATABASE_URL = $env:DATABASE_DIRECT_URL

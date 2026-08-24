@@ -352,16 +352,20 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     return reply.code(202).send({ accepted: true, state: nextState });
   });
 
-  app.get<{ Querystring: { repositoryId?: string } }>("/api/activity", async (request, reply) => {
+  app.get<{ Querystring: { repositoryId?: string; context?: string; includeBots?: string } }>("/api/activity", async (request, reply) => {
     const session = await requireSession(request as RequestWithSession, reply);
     if (!session) return;
+    const requestedContext = request.query.context ?? "default";
+    if (!["default", "personal", "project", "unknown"].includes(requestedContext)) return reply.code(400).send({ error: "invalid_activity_context" });
+    const includeBots = request.query.includeBots === "true";
     const repositories = await deps.store.listRepositories(session.tenantId);
-    const events = defaultTimelineEvents(await deps.store.listActivity(session.tenantId, request.query.repositoryId), deps.config.OWNER_GITHUB_USER_ID);
+    const canonicalEvents = await deps.store.listActivity(session.tenantId, request.query.repositoryId, { context: requestedContext as "default" | "personal" | "project" | "unknown", includeBots });
+    const events = requestedContext === "default" ? defaultTimelineEvents(canonicalEvents, deps.config.OWNER_GITHUB_USER_ID) : canonicalEvents;
     const selected = repositories[0];
     return {
       completeness: "Newest 100 commits currently reachable from the default branch of this connected repository.",
       ...(selected ? { repository: { id: selected.id, fullName: selected.fullName, private: selected.private }, historical: await historicalStatus(session.tenantId, selected.id) } : {}),
-      events: events.map((event) => { const sourceUrl = (event as typeof event & { htmlUrl?: string }).htmlUrl; return { id: event.id, repositoryId: event.repositoryId, occurredAt: event.occurredAt.toISOString(), verb: event.verb, contributionRole: event.contributionRole, contextKind: event.contextKind, actorKind: event.actorKind, ...(event.summaryInput ? { message: event.summaryInput } : {}), ...(sourceUrl ? { sourceUrl } : {}) }; }),
+      events: events.map((event) => { const sourceUrl = event.sourceUrl ?? (event as typeof event & { htmlUrl?: string }).htmlUrl; const ownerContributionRole = "ownerContributionRole" in event ? event.ownerContributionRole : undefined; return { id: event.id, repositoryId: event.repositoryId, sourceKind: event.sourceKind, sourceExternalId: event.sourceExternalId, eventType: event.eventType, occurredAt: event.occurredAt.toISOString(), verb: event.verb, contributionRole: event.contributionRole, ...(ownerContributionRole ? { ownerContributionRole } : {}), contextKind: event.contextKind, actorKind: event.actorKind, ...(event.actorGithubAccountId !== undefined ? { actorGithubAccountId: event.actorGithubAccountId } : {}), attributionConfidence: event.attributionConfidence, completenessState: event.completenessState, visibility: event.visibility, projectionVersion: event.projectionVersion, ...(event.summaryInput ? { message: event.summaryInput } : {}), ...(event.title ? { title: event.title } : {}), ...(sourceUrl ? { sourceUrl } : {}) }; }),
     };
   });
 

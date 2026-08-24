@@ -8,7 +8,6 @@ import {
   type M1Store,
   type RepositoryRecord,
 } from "@devmemoir/db";
-import { projectCommitFacts } from "@devmemoir/domain";
 import {
   GithubAccessError,
   GithubRateLimitPauseError,
@@ -253,8 +252,7 @@ async function commitDefaultBranchPage(
     finalPage,
     facts: response.commits.map((commit) => {
       const normalized = { ...commit, repositoryId: input.repository.id };
-      const event = projectCommitFacts(normalized, deps.ownerGithubAccountId)[0];
-      return { commit: normalized, ...(event ? { event } : {}), ...(commit.htmlUrl ? { htmlUrl: commit.htmlUrl } : {}) };
+      return { commit: normalized, ...(commit.htmlUrl ? { htmlUrl: commit.htmlUrl } : {}) };
     }),
   });
 }
@@ -370,6 +368,8 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
     }
     return;
   }
+
+  await deps.store.reprojectRepository({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, ownerGithubAccountId: deps.ownerGithubAccountId });
 
   await enqueueCurrent({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, installationId: scoped.installationId }, deps);
   const counts = await deps.store.getHistoricalSourceCounts(scoped.tenantId, scoped.repository.id);

@@ -25,6 +25,7 @@ describeIntegration("M3 PostgreSQL historical page transactions", () => {
     const migration = await readFile(resolve(migrationsDir, "0003_m3_historical_backfill.sql"), "utf8");
     await pool.query(migration);
     await pool.query(migration);
+    await pool.query(await readFile(resolve(migrationsDir, "0004_m4_canonical_projection.sql"), "utf8"));
     await pool.query("insert into tenants (id,slug,created_at) values ($1,$2,now())", [tenantId, `m3-${tenantId}`]);
     await pool.query("insert into github_accounts (id,github_account_id,account_type,actor_kind) values ($1,$2,'User','user')", [accountId, Math.floor(Math.random() * 1_000_000_000) + 10_000]);
     await pool.query("insert into github_installations (id,tenant_id,github_installation_id,account_github_account_id,status,created_at,updated_at) values ($1,$2,$3,$4,'active',now(),now())", [installationId, tenantId, Math.floor(Math.random() * 1_000_000_000) + 10_000, accountId]);

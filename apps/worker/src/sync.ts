@@ -1,5 +1,4 @@
 import type { GithubClient, GithubCommit } from "@devmemoir/github";
-import { projectCommitFacts } from "@devmemoir/domain";
 import type { M1Store, RepositoryRecord } from "@devmemoir/db";
 
 export type RefSyncInput = {
@@ -55,10 +54,7 @@ export async function synchronizeRefHead(input: RefSyncInput, github: GithubClie
       if (previousHead && commit.sha === previousHead) foundPrevious = true;
     }
     for (const commit of pageCommits) {
-      await store.saveCommit(input.tenantId, input.repository.id, commit, undefined, commit.htmlUrl);
-      for (const event of projectCommitFacts(commit, input.ownerGithubAccountId)) {
-        await store.saveDevelopmentEvent(input.tenantId, input.repository.id, event, { ...(commit.htmlUrl ? { htmlUrl: commit.htmlUrl } : {}), message: commit.message });
-      }
+      await store.saveCommit(input.tenantId, input.repository.id, commit, commit.htmlUrl);
       if (!importedShas.includes(commit.sha)) importedShas.push(commit.sha);
       importedCommits += 1;
     }

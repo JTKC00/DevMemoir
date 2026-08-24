@@ -76,6 +76,7 @@ export async function processBackfill(payload: SyncJobPayload, deps: QueueDepend
     const authoritativeHead = await github.getRefHead({ owner: repository.ownerLogin, repo: repository.name, ref });
     const after = authoritativeHead ?? "0".repeat(40);
     const result = await synchronizeRefHead({ tenantId: payload.tenantId, repository, installationId: payload.installationId, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID, ref, before: payload.before ?? "0".repeat(40), after, forced: payload.forced ?? false }, github, deps.store);
+    await deps.store.reprojectRepository({ tenantId: payload.tenantId, repositoryId: repository.id, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
     if (result.status === "partial" && result.nextPage) {
       const continuationPayload: SyncJobPayload = {
         kind: "sync_commits",

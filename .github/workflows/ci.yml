@@ -1,4 +1,4 @@
-name: M3 CI
+name: M4 CI
 
 on:
   push:
@@ -48,9 +48,9 @@ jobs:
         run: pnpm typecheck
       - name: Lint
         run: pnpm lint
-      - name: Unit and M3 backfill tests
+      - name: Unit and M1-M4 regression tests
         run: pnpm test
-      - name: PostgreSQL integration and RLS tests
+      - name: PostgreSQL integration, projection, and RLS tests
         run: pnpm --filter @devmemoir/db test
       - name: pg-boss restart integration tests
         run: pnpm --filter @devmemoir/jobs test && pnpm --filter @devmemoir/worker test

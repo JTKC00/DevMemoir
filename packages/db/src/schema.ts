@@ -183,6 +183,7 @@ export const commits = pgTable("commits", {
   verified: boolean("verified"),
   additions: integer("additions"),
   deletions: integer("deletions"),
+  htmlUrl: text("html_url"),
   firstSeenAt: time("first_seen_at"),
   lastSeenAt: time("last_seen_at"),
 }, (table) => [
@@ -210,9 +211,15 @@ export const developmentEvents = pgTable("development_events", {
   sourceUrl: text("source_url"),
   completenessState: varchar("completeness_state", { length: 40 }).notNull().default("observed"),
   visibility: varchar("visibility", { length: 20 }).notNull().default("unknown"),
+  attributionConfidence: varchar("attribution_confidence", { length: 40 }).notNull().default("unknown"),
+  projectionVersion: integer("projection_version").notNull().default(0),
+  logicalEventKey: varchar("logical_event_key", { length: 1024 }).notNull(),
 }, (table) => [
   uniqueIndex("development_events_source_unique").on(table.tenantId, table.repositoryId, table.sourceSystem, table.sourceKind, table.sourceExternalId, table.verb),
+  uniqueIndex("development_events_logical_key_unique").on(table.logicalEventKey),
   index("development_events_tenant_date_idx").on(table.tenantId, table.occurredAt),
+  index("development_events_tenant_repository_date_idx").on(table.tenantId, table.repositoryId, table.occurredAt),
+  index("development_events_context_actor_idx").on(table.tenantId, table.repositoryId, table.contextKind, table.actorKind),
 ]);
 
 export const commitRefs = pgTable("commit_refs", {

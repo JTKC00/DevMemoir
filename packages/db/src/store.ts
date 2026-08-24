@@ -1,12 +1,15 @@
 import {
   createId,
+  canonicalLogicalEventKey,
   deliveryRedeliveryAction,
+  projectCanonicalFacts,
   repositoryAccessIsAvailable,
   type CommitFact,
   type ActorKind,
   type CompletenessState,
   type DeliveryState,
   type DevelopmentEvent,
+  type CanonicalProjectionInput,
   type RepositoryAccessStatus,
 } from "@devmemoir/domain";
 
@@ -70,6 +73,7 @@ export type RepositoryRecord = {
   description?: string;
   htmlUrl?: string;
   archived?: boolean;
+  archivedAt?: Date;
   disabled?: boolean;
   selected?: boolean;
   accessStatus?: RepositoryAccessStatus;
@@ -135,6 +139,16 @@ export type DeliveryRecord = {
 export type ActivityRecord = DevelopmentEvent & {
   htmlUrl?: string;
   message?: string;
+};
+
+export type ActivityQuery = {
+  context?: "default" | "personal" | "project" | "unknown";
+  includeBots?: boolean;
+};
+
+export type ProjectionResult = {
+  projectionVersion: number;
+  eventCount: number;
 };
 
 export type DeliveryInsertResult = {
@@ -213,6 +227,7 @@ export type HistoricalTagFact = {
   name: string;
   targetSha: string;
   targetType?: string;
+  deletedAt?: Date;
 };
 
 export type HistoricalPullRequestFact = {
@@ -272,7 +287,7 @@ type HistoricalPageBase = {
 };
 
 export type HistoricalPageCommit =
-  | (HistoricalPageBase & { stage: "default_branch_commits"; refName: string; anchorHeadSha: string; facts: Array<{ commit: CommitFact; event?: DevelopmentEvent; htmlUrl?: string }> })
+  | (HistoricalPageBase & { stage: "default_branch_commits"; refName: string; anchorHeadSha: string; facts: Array<{ commit: CommitFact; htmlUrl?: string }> })
   | (HistoricalPageBase & { stage: "branches"; facts: HistoricalBranchFact[] })
   | (HistoricalPageBase & { stage: "tags"; facts: HistoricalTagFact[] })
   | (HistoricalPageBase & { stage: "pull_requests"; facts: HistoricalPullRequestFact[] })
@@ -343,14 +358,15 @@ export interface M1Store {
   /** Atomically publish a completed walk only when the observed head is still current. */
   finalizeRefSync(input: { tenantId: string; repositoryId: string; ref: string; expectedHead: string | null; headSha: string | null; invalidatePrevious: boolean; reachableShas: string[] }): Promise<boolean>;
   /** Persist the source fact even when no event can be projected for it. */
-  saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void>;
+  saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, htmlUrl?: string): Promise<void>;
   saveDevelopmentEvent(tenantId: string, repositoryId: string, event: DevelopmentEvent, options?: { htmlUrl?: string; message?: string }): Promise<void>;
   getRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<RefSyncContinuation | undefined>;
   setRefSyncContinuation(tenantId: string, repositoryId: string, ref: string, continuation: RefSyncContinuation): Promise<void>;
   clearRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<void>;
   markBranchCommitsUnreachable(tenantId: string, repositoryId: string, ref: string): Promise<void>;
   setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void>;
-  listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]>;
+  listActivity(tenantId: string, repositoryId?: string, query?: ActivityQuery): Promise<ActivityRecord[]>;
+  reprojectRepository(input: { tenantId: string; repositoryId: string; ownerGithubAccountId: number; projectionVersion?: number; failureAfterEvents?: number }): Promise<ProjectionResult>;
   startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress>;
   getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName?: string): Promise<HistoricalProgress | undefined>;
   listHistoricalProgress(tenantId: string, repositoryId: string): Promise<HistoricalProgress[]>;
@@ -615,19 +631,19 @@ export class InMemoryM1Store implements M1Store {
     this.refSyncContinuations.delete(key);
     return true;
   }
-  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, event?: DevelopmentEvent, htmlUrl?: string): Promise<void> {
-    this.commits.set(`${tenantId}:${repositoryId}:${commit.sha}`, { tenantId, repositoryId, commit, ...(htmlUrl ? { htmlUrl } : {}) });
-    if (event) await this.saveDevelopmentEvent(tenantId, repositoryId, event, { ...(htmlUrl ? { htmlUrl } : {}), message: commit.message });
+  async saveCommit(tenantId: string, repositoryId: string, commit: CommitFact, htmlUrl?: string): Promise<void> {
+    this.commits.set(`${tenantId}:${repositoryId}:${commit.sha}`, { tenantId, repositoryId, commit: { ...commit, ...(htmlUrl ? { htmlUrl } : {}) }, ...(htmlUrl ? { htmlUrl } : {}) });
   }
   async saveDevelopmentEvent(tenantId: string, repositoryId: string, event: DevelopmentEvent, options?: { htmlUrl?: string; message?: string }): Promise<void> {
-    const key = `${tenantId}:${repositoryId}:${event.sourceKind}:${event.sourceExternalId}:${event.verb}`;
-    const existingIndex = this.events.findIndex((value) => this.eventKeys.has(`${tenantId}:${repositoryId}:${value.sourceKind}:${value.sourceExternalId}:${value.verb}`) && value.repositoryId === repositoryId && value.sourceKind === event.sourceKind && value.sourceExternalId === event.sourceExternalId && value.verb === event.verb);
+    const logicalEventKey = event.logicalEventKey ?? canonicalLogicalEventKey(tenantId, event);
+    const key = logicalEventKey;
+    const existingIndex = this.events.findIndex((value) => (value.logicalEventKey ?? canonicalLogicalEventKey(tenantId, value)) === logicalEventKey);
     if (existingIndex === -1) {
-      this.events.push({ ...event, ...(options?.htmlUrl ? { htmlUrl: options.htmlUrl } : {}), ...(options?.message ? { message: options.message } : {}) });
+      this.events.push({ ...event, id: event.id || createId(), logicalEventKey, ...(options?.htmlUrl ? { htmlUrl: options.htmlUrl } : {}), ...(options?.message ? { message: options.message } : {}) });
       this.eventKeys.add(key);
     } else {
       const existing = this.events[existingIndex];
-      if (existing) this.events[existingIndex] = { ...existing, ...(options?.htmlUrl ? { htmlUrl: options.htmlUrl } : {}), ...(options?.message ? { message: options.message } : {}) };
+      if (existing) this.events[existingIndex] = { ...existing, ...event, id: existing.id, logicalEventKey, ...(options?.htmlUrl ? { htmlUrl: options.htmlUrl } : {}), ...(options?.message ? { message: options.message } : {}) };
     }
   }
   async getRefSyncContinuation(tenantId: string, repositoryId: string, ref: string): Promise<RefSyncContinuation | undefined> { return this.refSyncContinuations.get(`${tenantId}:${repositoryId}:${branchName(ref)}`); }
@@ -638,14 +654,64 @@ export class InMemoryM1Store implements M1Store {
     for (const key of this.commitReachability.keys()) if (key.startsWith(prefix)) this.commitReachability.set(key, false);
   }
   async setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void> { this.commitReachability.set(`${tenantId}:${repositoryId}:${branchName(ref)}:${sha}`, reachable); }
-  async listActivity(tenantId: string, repositoryId?: string): Promise<ActivityRecord[]> {
+  async listActivity(tenantId: string, repositoryId?: string, query?: ActivityQuery): Promise<ActivityRecord[]> {
     return this.events.filter((event) => {
       const repository = [...this.repositories.values()].find((value) => value.tenantId === tenantId && value.id === event.repositoryId);
       if (!repository || (repositoryId && event.repositoryId !== repositoryId)) return false;
-      if (event.sourceKind !== "commit") return true;
-      const reachabilityKey = `${tenantId}:${repository.id}:${branchName(`refs/heads/${repository.defaultBranch}`)}:${event.sourceExternalId}`;
-      return !this.commitReachability.has(reachabilityKey) || this.commitReachability.get(reachabilityKey) === true;
-    }).sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
+      if (query && !query.includeBots && event.actorKind === "bot") return false;
+      if (query?.context && query.context !== "default" && event.contextKind !== query.context) return false;
+      return true;
+    }).sort((a, b) => {
+      const byDate = b.occurredAt.getTime() - a.occurredAt.getTime();
+      return byDate !== 0 ? byDate : (a.logicalEventKey ?? "").localeCompare(b.logicalEventKey ?? "");
+    });
+  }
+
+  async reprojectRepository(input: { tenantId: string; repositoryId: string; ownerGithubAccountId: number; projectionVersion?: number; failureAfterEvents?: number }): Promise<ProjectionResult> {
+    const repository = [...this.repositories.values()].find((value) => value.tenantId === input.tenantId && value.id === input.repositoryId);
+    if (!repository) throw new Error("repository_not_found_for_projection");
+    const sourceCommits = [...this.commits.values()].filter((value) => value.tenantId === input.tenantId && value.repositoryId === input.repositoryId).map((value) => ({ ...value.commit, ...(value.htmlUrl ? { htmlUrl: value.htmlUrl } : {}) }));
+    const sourcePrefix = `${input.tenantId}:${input.repositoryId}:`;
+    const sourcePullRequests = [...this.historicalPullRequests.entries()].filter(([key]) => key.startsWith(sourcePrefix)).map(([, value]) => ({ githubId: value.githubId, title: value.title, ...(value.author ? { author: value.author } : {}), ...(value.merger ? { merger: value.merger } : {}), ...(value.sourceUrl ? { sourceUrl: value.sourceUrl } : {}), createdAt: value.createdAt, updatedAt: value.updatedAt, ...(value.closedAt ? { closedAt: value.closedAt } : {}), ...(value.mergedAt ? { mergedAt: value.mergedAt } : {}) }));
+    const sourceIssues = [...this.historicalIssues.entries()].filter(([key]) => key.startsWith(sourcePrefix)).map(([, value]) => ({ githubId: value.githubId, title: value.title, ...(value.author ? { author: value.author } : {}), ...(value.sourceUrl ? { sourceUrl: value.sourceUrl } : {}), createdAt: value.createdAt, updatedAt: value.updatedAt, ...(value.closedAt ? { closedAt: value.closedAt } : {}) }));
+    const sourceReleases = [...this.historicalReleases.entries()].filter(([key]) => key.startsWith(sourcePrefix)).map(([, value]) => ({ githubId: value.githubId, ...(value.name ? { name: value.name } : {}), ...(value.author ? { author: value.author } : {}), ...(value.sourceUrl ? { sourceUrl: value.sourceUrl } : {}), updatedAt: value.updatedAt, ...(value.publishedAt ? { publishedAt: value.publishedAt } : {}) }));
+    const sourceRenames = this.repositoryNameHistory.filter((value) => value.tenantId === input.tenantId && value.repositoryId === input.repositoryId && value.validTo).map((value) => ({ observedAt: value.validTo as Date }));
+    const sourceTags = [...this.historicalTags.entries()]
+      .filter(([key, value]) => key.startsWith(sourcePrefix) && value.deletedAt)
+      .map(([, value]) => ({ name: value.name, deletedAt: value.deletedAt as Date }));
+    const projectionInput: CanonicalProjectionInput = {
+      tenantId: input.tenantId,
+      repositoryId: input.repositoryId,
+      githubRepositoryId: repository.githubRepositoryId,
+      ownerGithubAccountId: input.ownerGithubAccountId,
+      private: repository.private,
+      ...(repository.visibility ? { visibility: repository.visibility } : {}),
+      ...(repository.githubCreatedAt ? { githubCreatedAt: repository.githubCreatedAt } : {}),
+      ...(repository.archivedAt ? { archivedAt: repository.archivedAt } : {}),
+      commits: sourceCommits,
+      pullRequests: sourcePullRequests,
+      issues: sourceIssues,
+      releases: sourceReleases,
+      repositoryRenames: sourceRenames,
+      tags: sourceTags,
+    };
+    const projected = projectCanonicalFacts(projectionInput);
+    const previous = this.events.filter((event) => event.repositoryId === input.repositoryId && event.logicalEventKey?.startsWith(`${input.tenantId}:`));
+    try {
+      this.events.splice(0, this.events.length, ...this.events.filter((event) => !(event.repositoryId === input.repositoryId && event.logicalEventKey?.startsWith(`${input.tenantId}:`))));
+      this.eventKeys.clear();
+      for (const existing of this.events) this.eventKeys.add(existing.logicalEventKey ?? canonicalLogicalEventKey(input.tenantId, existing));
+      for (const [index, event] of projected.entries()) {
+        if (input.failureAfterEvents !== undefined && index >= input.failureAfterEvents) throw new Error("projection_injected_failure");
+        await this.saveDevelopmentEvent(input.tenantId, input.repositoryId, event, { ...(event.sourceUrl ? { htmlUrl: event.sourceUrl } : {}), ...(event.summaryInput ? { message: event.summaryInput } : {}) });
+      }
+    } catch (error) {
+      this.events.splice(0, this.events.length, ...this.events.filter((event) => !(event.repositoryId === input.repositoryId && event.logicalEventKey?.startsWith(`${input.tenantId}:`))), ...previous);
+      this.eventKeys.clear();
+      for (const event of this.events) this.eventKeys.add(event.logicalEventKey ?? canonicalLogicalEventKey(input.tenantId, event));
+      throw error;
+    }
+    return { projectionVersion: input.projectionVersion ?? 1, eventCount: projected.length };
   }
 
   private historicalKey(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): string {
@@ -732,7 +798,7 @@ export class InMemoryM1Store implements M1Store {
         if (publishedHead !== expectedPublishedHead && publishedHead !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
       }
       for (const fact of input.facts) {
-        await this.saveCommit(input.tenantId, input.repositoryId, fact.commit, fact.event, fact.htmlUrl);
+        await this.saveCommit(input.tenantId, input.repositoryId, fact.commit, fact.htmlUrl);
         await this.setCommitReachability(input.tenantId, input.repositoryId, refName, fact.commit.sha, true);
       }
       if (input.finalPage) {
@@ -744,8 +810,14 @@ export class InMemoryM1Store implements M1Store {
       if (input.finalPage) for (const [factKey, value] of this.historicalBranches) if (factKey.startsWith(`${input.tenantId}:${input.repositoryId}:`) && value.generation < generation) value.reachable = false;
     } else if (input.stage === "tags") {
       const generation = progress.startedAt ?? input.observedAt;
-      for (const fact of input.facts) this.historicalTags.set(`${input.tenantId}:${input.repositoryId}:${fact.name}`, { ...fact, reachable: true, generation });
-      if (input.finalPage) for (const [factKey, value] of this.historicalTags) if (factKey.startsWith(`${input.tenantId}:${input.repositoryId}:`) && value.generation < generation) value.reachable = false;
+      for (const fact of input.facts) {
+        const { deletedAt: _deletedAt, ...currentFact } = fact;
+        this.historicalTags.set(`${input.tenantId}:${input.repositoryId}:${fact.name}`, { ...currentFact, reachable: true, generation });
+      }
+      if (input.finalPage) for (const [factKey, value] of this.historicalTags) if (factKey.startsWith(`${input.tenantId}:${input.repositoryId}:`) && value.generation < generation) {
+        value.reachable = false;
+        value.deletedAt = input.observedAt;
+      }
     } else if (input.stage === "pull_requests") {
       for (const fact of input.facts) {
         const factKey = `${input.tenantId}:${input.repositoryId}:${fact.githubId}`;

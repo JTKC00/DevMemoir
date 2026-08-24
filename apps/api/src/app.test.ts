@@ -150,6 +150,30 @@ describe("M1 webhook receipt", () => {
     expect(jobs.jobs.size).toBe(actions.length);
   });
 
+  it("serves canonical activity with private source links and explicit bot context", async () => {
+    store.events.length = 0;
+    store.commits.clear();
+    store.repositories.clear();
+    store.sessions.clear();
+    const repository = await store.saveRepository({ id: "repo-activity", tenantId: "tenant-1", installationId: "installation-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: true, defaultBranch: "main" });
+    const authoredAt = new Date("2026-01-01T00:00:00Z");
+    await store.saveCommit("tenant-1", repository.id, { repositoryId: repository.id, sha: "owner-sha", author: { githubAccountId: 7, actorKind: "user" }, committer: { githubAccountId: 7, actorKind: "user" }, message: "owner commit", authoredAt, committedAt: authoredAt, parents: [] }, "https://github.example/private/owner-sha");
+    await store.saveCommit("tenant-1", repository.id, { repositoryId: repository.id, sha: "bot-sha", committer: { githubAccountId: 99, actorKind: "bot" }, message: "bot commit", committedAt: new Date("2026-01-02T00:00:00Z"), parents: [] }, "https://github.example/private/bot-sha");
+    await store.reprojectRepository({ tenantId: "tenant-1", repositoryId: repository.id, ownerGithubAccountId: 7 });
+    expect((await app.inject({ method: "GET", url: "/api/activity" })).statusCode).toBe(401);
+    const token = "activity-session-token";
+    await store.createSession({ userId: "user-1", tenantId: "tenant-1", tokenHash: hashOpaqueToken(token, config.SESSION_SECRET), csrfTokenHash: hashOpaqueToken("csrf", config.SESSION_SECRET), expiresAt: new Date(Date.now() + 60_000) });
+
+    const defaultResponse = await app.inject({ method: "GET", url: "/api/activity?context=default", headers: { authorization: `Bearer ${token}` } });
+    expect(defaultResponse.statusCode).toBe(200);
+    expect(defaultResponse.json<{ events: Array<Record<string, unknown>> }>().events).toMatchObject([{ sourceKind: "commit", sourceExternalId: "owner-sha", verb: "authored", visibility: "private", sourceUrl: "https://github.example/private/owner-sha" }]);
+    expect(defaultResponse.json<{ events: Array<Record<string, unknown>> }>().events).toHaveLength(1);
+
+    const projectResponse = await app.inject({ method: "GET", url: "/api/activity?context=project&includeBots=true", headers: { authorization: `Bearer ${token}` } });
+    expect(projectResponse.statusCode).toBe(200);
+    expect(projectResponse.json<{ events: Array<Record<string, unknown>> }>().events).toMatchObject([{ actorKind: "bot", actorGithubAccountId: 99, visibility: "private" }]);
+  });
+
   it("routes installation permission changes to authoritative refresh", async () => {
     const response = await send("guid-permissions", "installation", { action: "new_permissions_accepted", installation: { id: 22 }, repositories: [{ id: 999, name: "permission-payload-must-not-be-trusted" }] });
     expect(response.statusCode).toBe(202);
