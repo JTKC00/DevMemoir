@@ -174,6 +174,39 @@ describe("M1 webhook receipt", () => {
     expect(projectResponse.json<{ events: Array<Record<string, unknown>> }>().events).toMatchObject([{ actorKind: "bot", actorGithubAccountId: 99, visibility: "private" }]);
   });
 
+  it("keeps collaborator-only PRs out of the default memoir while remaining queryable as project facts", async () => {
+    store.events.length = 0;
+    store.commits.clear();
+    store.historicalPullRequests.clear();
+    store.repositories.clear();
+    store.sessions.clear();
+    const repository = await store.saveRepository({ id: "repo-pr-eligibility", tenantId: "tenant-1", installationId: "installation-1", githubRepositoryId: 10, ownerLogin: "owner", name: "repo", fullName: "owner/repo", private: false, defaultBranch: "main" });
+    store.historicalPullRequests.set(`tenant-1:${repository.id}:88`, {
+      githubId: 88,
+      number: 88,
+      title: "Collaborator only",
+      state: "closed",
+      draft: false,
+      author: { githubAccountId: 9, actorKind: "user" },
+      merger: { githubAccountId: 11, actorKind: "user" },
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T01:00:00Z"),
+      closedAt: new Date("2026-01-01T01:00:00Z"),
+      mergedAt: new Date("2026-01-01T00:59:00Z"),
+    });
+    await store.reprojectRepository({ tenantId: "tenant-1", repositoryId: repository.id, ownerGithubAccountId: 7 });
+    const token = "pr-eligibility-session";
+    await store.createSession({ userId: "user-1", tenantId: "tenant-1", tokenHash: hashOpaqueToken(token, config.SESSION_SECRET), csrfTokenHash: hashOpaqueToken("csrf", config.SESSION_SECRET), expiresAt: new Date(Date.now() + 60_000) });
+    const defaultResponse = await app.inject({ method: "GET", url: "/api/activity?context=default", headers: { authorization: `Bearer ${token}` } });
+    expect(defaultResponse.statusCode).toBe(200);
+    expect(defaultResponse.json<{ events: Array<{ sourceKind: string }> }>().events.filter((event) => event.sourceKind === "pull_request")).toHaveLength(0);
+    const projectResponse = await app.inject({ method: "GET", url: "/api/activity?context=project", headers: { authorization: `Bearer ${token}` } });
+    expect(projectResponse.json<{ events: Array<{ verb: string; actorGithubAccountId?: number }> }>().events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceKind: "pull_request", verb: "opened", actorGithubAccountId: 9 }),
+      expect.objectContaining({ sourceKind: "pull_request", verb: "merged", actorGithubAccountId: 11 }),
+    ]));
+  });
+
   it("routes installation permission changes to authoritative refresh", async () => {
     const response = await send("guid-permissions", "installation", { action: "new_permissions_accepted", installation: { id: 22 }, repositories: [{ id: 999, name: "permission-payload-must-not-be-trusted" }] });
     expect(response.statusCode).toBe(202);

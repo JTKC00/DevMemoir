@@ -398,7 +398,8 @@ export function defaultTimelineEvents(
     }
     if (first.sourceKind === "pull_request") {
       const ownerOpened = group.find((event) => event.actorGithubAccountId === ownerGithubAccountId && event.contributionRole === "opener");
-      const ownerMerged = group.find((event) => event.actorGithubAccountId === ownerGithubAccountId && event.verb === "merged");
+      const ownerMerged = group.find((event) => event.actorGithubAccountId === ownerGithubAccountId && (event.verb === "merged" || event.contributionRole === "merger"));
+      if (!ownerOpened && !ownerMerged) continue;
       const merged = group.find((event) => event.verb === "merged");
       const closed = group.find((event) => event.verb === "closed");
       const opened = group.find((event) => event.verb === "opened" && event.actorGithubAccountId === ownerGithubAccountId);

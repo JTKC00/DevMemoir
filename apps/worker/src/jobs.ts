@@ -114,8 +114,34 @@ export async function processInstallationInventory(payload: SyncJobPayload, deps
     await ensureInstallationApiAvailable({ tenantId: payload.tenantId, installationGithubId: payload.installationGithubId, store: deps.store, now: observedAt });
     const github = guardInstallationGithub({ tenantId: payload.tenantId, installationGithubId: payload.installationGithubId, store: deps.store, github: deps.githubForInstallation(payload.installationGithubId), now: () => workerNow(deps) });
     const result = await refreshInstallationInventory({ tenantId: payload.tenantId, installationGithubId: payload.installationGithubId, now: observedAt }, github, deps.store);
+    const selected = (await deps.store.listRepositories(payload.tenantId))[0];
+    let projectionVersion: number | undefined;
+    if (selected) {
+      try {
+        const projection = await deps.store.reprojectRepository({
+          tenantId: payload.tenantId,
+          repositoryId: selected.id,
+          ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID,
+        });
+        projectionVersion = projection.projectionVersion;
+      } catch (error) {
+        deps.logger.error({
+          installation_id: String(payload.installationGithubId),
+          repository_id: selected.id,
+          state: "failed",
+          error_code: "projection_failed",
+        }, error);
+        throw error;
+      }
+    }
     await resumeHistoricalAfterInventory(payload, { ...deps, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
-    deps.logger.info({ installation_id: String(payload.installationGithubId), result: `${result.observed}/${result.added}/${result.updated}/${result.removed}` });
+    deps.logger.info({
+      installation_id: String(payload.installationGithubId),
+      ...(selected ? { repository_id: selected.id } : {}),
+      result: `${result.observed}/${result.added}/${result.updated}/${result.removed}`,
+      changed_count: result.projectionRelevantRepositoryIds.length,
+      ...(projectionVersion === undefined ? {} : { projection_version: projectionVersion, state: "projected" }),
+    });
   } catch (error) {
     if (error instanceof GithubRateLimitPauseError) {
       await deps.store.pauseInstallationApi({ tenantId: payload.tenantId, installationId: installation.id, pausedUntil: error.resumeAt, reason: `github_${error.code}` });

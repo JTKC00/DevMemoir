@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
 import { createPool, PostgresM1Store } from "@devmemoir/db";
+import { defaultTimelineEvents } from "@devmemoir/domain";
 import type { GithubClient, GithubRepository } from "@devmemoir/github";
 import { InMemoryJobPort, installationInventoryLogicalKey, PgBossJobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
@@ -29,6 +30,7 @@ type Scope = {
   admin: ReturnType<typeof createPool>;
   store: PostgresM1Store;
   github: GithubClient;
+  githubRepository: GithubRepository;
 };
 
 async function createScope(): Promise<Scope> {
@@ -41,24 +43,26 @@ async function createScope(): Promise<Scope> {
   const store = new PostgresM1Store(pool);
   await store.upsertUser({ userId: randomUUID(), tenantId, githubAccountId: accountGithubId, login: "owner-" + tenantId.slice(0, 8), displayName: "test owner" });
   await store.saveInstallation({ id: installationId, tenantId, githubInstallationId, accountGithubAccountId: accountGithubId });
-  const repository: GithubRepository = { id: 9001, name: "restart-repo", full_name: "owner/restart-repo", private: true, visibility: "private", default_branch: "main", owner: { login: "owner" } };
+  const githubRepository: GithubRepository = { id: 9001, name: "restart-repo", full_name: "owner/restart-repo", private: true, visibility: "private", default_branch: "main", owner: { login: "owner" }, created_at: "2026-01-01T00:00:00.000Z" };
   const github: GithubClient = {
     ...emptyHistoricalGithubMethods,
     getUser: async () => ({ id: accountGithubId, login: "owner", type: "User" }),
     exchangeOAuthCode: async () => ({ accessToken: "unused" }),
     getInstallation: async () => ({ id: githubInstallationId, account: { id: accountGithubId, login: "owner", type: "User" }, permissions: { Metadata: "read" }, repository_selection: "selected" }),
-    listInstallationRepositories: async () => ({ repositories: [repository] }),
-    getRepository: async () => repository,
+    listInstallationRepositories: async () => ({ repositories: [githubRepository] }),
+    getRepository: async () => githubRepository,
     listCommits: async () => ({ commits: [] }),
     getCommit: async () => ({ repositoryId: "", sha: "a".repeat(40), message: "", parents: [] }),
     getRefHead: async () => "a".repeat(40),
   };
-  return { tenantId, accountGithubId, githubInstallationId, installationId, pool, admin, store, github };
+  return { tenantId, accountGithubId, githubInstallationId, installationId, pool, admin, store, github, githubRepository };
 }
 
 async function cleanup(scope: Scope): Promise<void> {
   await scope.admin.query("delete from sync_jobs where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from webhook_deliveries where tenant_id=$1", [scope.tenantId]);
+  await scope.admin.query("delete from development_events where tenant_id=$1", [scope.tenantId]);
+  await scope.admin.query("delete from commits where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repository_name_history where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repository_access where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repositories where tenant_id=$1", [scope.tenantId]);
@@ -154,5 +158,116 @@ describeIntegration("M2 installation inventory worker restart", () => {
 
     await expect(scope.store.getInstallation(scope.githubInstallationId)).resolves.toMatchObject({ status: "active", permissions: { Metadata: "read" }, repositorySelection: "selected" });
     await expect(scope.store.getRepositoryByGithubId(scope.tenantId, 9001)).resolves.toMatchObject({ accessStatus: "accessible", selected: true });
+  });
+});
+
+describeIntegration("authoritative inventory reprojects selected repository metadata", () => {
+  const scopes: Scope[] = [];
+
+  afterEach(async () => {
+    const scope = scopes.pop();
+    if (scope) await cleanup(scope);
+  });
+
+  async function seedSelected(scope: Scope, at = new Date("2026-08-24T10:00:00Z")): Promise<string> {
+    const jobs = new InMemoryJobPort();
+    const dependencies: QueueDependencies = { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => at };
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, dependencies);
+    const repository = await scope.store.getRepositoryByGithubId(scope.tenantId, 9001);
+    await scope.store.selectRepository(scope.tenantId, repository?.id ?? "");
+    await scope.store.saveCommit(scope.tenantId, repository?.id ?? "", {
+      repositoryId: repository?.id ?? "",
+      sha: "d".repeat(40),
+      author: { githubAccountId: 7, actorKind: "user" },
+      committer: { githubAccountId: 7, actorKind: "user" },
+      message: "owner commit",
+      authoredAt: new Date("2026-01-02T00:00:00Z"),
+      committedAt: new Date("2026-01-02T00:00:00Z"),
+      parents: [],
+    }, "https://github.example/private/commit");
+    await scope.store.reprojectRepository({ tenantId: scope.tenantId, repositoryId: repository?.id ?? "", ownerGithubAccountId: 7 });
+    return repository?.id ?? "";
+  }
+
+  it("records rename history and a deterministic repository.renamed event", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const repositoryId = await seedSelected(scope);
+    const renamedAt = new Date("2026-08-24T12:00:00Z");
+    scope.githubRepository.name = "new-name";
+    scope.githubRepository.full_name = "owner/new-name";
+    const jobs = new InMemoryJobPort();
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => renamedAt });
+    const row = await scope.store.getRepositoryByGithubId(scope.tenantId, 9001);
+    expect(row).toMatchObject({ id: repositoryId, githubRepositoryId: 9001, name: "new-name", fullName: "owner/new-name" });
+    const history = await scope.admin.query<{ name: string; full_name: string }>("select name,full_name from repository_name_history where tenant_id=$1 and repository_id=$2", [scope.tenantId, repositoryId]);
+    expect(history.rows).toEqual([{ name: "restart-repo", full_name: "owner/restart-repo" }]);
+    const events = await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true });
+    const renamed = events.filter((event) => event.verb === "renamed");
+    expect(renamed).toHaveLength(1);
+    expect(renamed[0]).toMatchObject({ sourceKind: "repository", actorKind: "unknown", occurredAt: renamedAt, logicalEventKey: `${scope.tenantId}:${repositoryId}:repository:9001:rename:${renamedAt.toISOString()}:repository:renamed:unknown_action` });
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => new Date(renamedAt.getTime() + 1000) });
+    expect((await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).filter((event) => event.verb === "renamed")).toHaveLength(1);
+    expect(defaultTimelineEvents(await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true }), 7).filter((event) => event.sourceKind === "repository")).toHaveLength(0);
+  });
+
+  it("reprojects visibility from public to private and back without duplicating source facts", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    scope.githubRepository.private = false;
+    scope.githubRepository.visibility = "public";
+    const repositoryId = await seedSelected(scope);
+    expect((await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).every((event) => event.visibility === "public")).toBe(true);
+    scope.githubRepository.private = true;
+    scope.githubRepository.visibility = "private";
+    const jobs = new InMemoryJobPort();
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => new Date("2026-08-24T13:00:00Z") });
+    const privateEvents = await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true });
+    expect(await scope.store.getRepositoryByGithubId(scope.tenantId, 9001)).toMatchObject({ id: repositoryId, private: true, visibility: "private" });
+    expect(privateEvents.every((event) => event.visibility === "private")).toBe(true);
+    expect(privateEvents.some((event) => event.sourceUrl === "https://github.example/private/commit")).toBe(true);
+    expect((await scope.admin.query<{ count: string }>("select count(*) from commits where tenant_id=$1 and repository_id=$2", [scope.tenantId, repositoryId])).rows[0]?.count).toBe("1");
+    scope.githubRepository.private = false;
+    scope.githubRepository.visibility = "public";
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => new Date("2026-08-24T13:01:00Z") });
+    expect((await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).every((event) => event.visibility === "public")).toBe(true);
+  });
+
+  it("emits repository.archived from observation time and does not duplicate on replay", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const repositoryId = await seedSelected(scope);
+    scope.githubRepository.archived = true;
+    const archivedAt = new Date("2026-08-24T14:00:00Z");
+    const jobs = new InMemoryJobPort();
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => archivedAt });
+    expect(await scope.store.getRepositoryByGithubId(scope.tenantId, 9001)).toMatchObject({ archived: true, archivedAt });
+    expect((await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).filter((event) => event.verb === "archived")).toMatchObject([{ sourceKind: "repository", actorKind: "unknown", occurredAt: archivedAt }]);
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => new Date(archivedAt.getTime() + 1000) });
+    expect((await scope.store.getRepositoryByGithubId(scope.tenantId, 9001))?.archivedAt).toEqual(archivedAt);
+    expect((await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).filter((event) => event.verb === "archived")).toHaveLength(1);
+  });
+
+  it("does not corrupt inventory facts when projection fails after reconciliation", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const repositoryId = await seedSelected(scope);
+    const before = await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true });
+    const original = scope.store.reprojectRepository.bind(scope.store);
+    let shouldFail = true;
+    scope.store.reprojectRepository = async (input) => {
+      if (shouldFail) throw new Error("projection_injected_failure");
+      return original(input);
+    };
+    scope.githubRepository.name = "new-name";
+    scope.githubRepository.full_name = "owner/new-name";
+    const renamedAt = new Date("2026-08-24T15:00:00Z");
+    const jobs = new InMemoryJobPort();
+    await expect(processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => renamedAt })).rejects.toThrow("projection_injected_failure");
+    expect(await scope.store.getRepositoryByGithubId(scope.tenantId, 9001)).toMatchObject({ id: repositoryId, name: "new-name", fullName: "owner/new-name" });
+    expect(await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).toEqual(before);
+    shouldFail = false;
+    await processInstallationInventory({ tenantId: scope.tenantId, installationGithubId: scope.githubInstallationId }, { config, store: scope.store, jobs, githubForInstallation: () => scope.github, logger: createLogger(), now: () => new Date(renamedAt.getTime() + 1000) });
+    expect((await scope.store.listActivity(scope.tenantId, repositoryId, { context: "default", includeBots: true })).filter((event) => event.verb === "renamed")).toHaveLength(1);
   });
 });
