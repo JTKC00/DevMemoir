@@ -20,7 +20,7 @@ describeIntegration("M4 PostgreSQL canonical projection", () => {
   const installationId = randomUUID();
 
   beforeAll(async () => {
-    for (const file of ["0001_initial.sql", "0002_m2_repository_inventory.sql", "0003_m3_historical_backfill.sql", "0004_m4_canonical_projection.sql"]) {
+    for (const file of ["0001_initial.sql", "0002_m2_repository_inventory.sql", "0003_m3_historical_backfill.sql", "0004_m4_canonical_projection.sql", "0005_m5_reconciliation_generations.sql"]) {
       await pool.query(await readFile(resolve(migrationsDir, file), "utf8"));
     }
     await store.upsertUser({ userId, tenantId, githubAccountId: 7001, login: "owner", displayName: "owner" });
@@ -41,6 +41,7 @@ describeIntegration("M4 PostgreSQL canonical projection", () => {
   afterAll(async () => {
     await pool.query("delete from development_events where tenant_id=$1", [tenantId]);
     await pool.query("delete from commits where tenant_id=$1", [tenantId]);
+    await pool.query("delete from reconciliation_generations where tenant_id=$1", [tenantId]);
     await pool.query("delete from repository_access where tenant_id=$1", [tenantId]);
     await pool.query("delete from repositories where tenant_id=$1", [tenantId]);
     await pool.query("delete from installation_routes where tenant_id=$1", [tenantId]);

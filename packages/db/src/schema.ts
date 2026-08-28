@@ -407,6 +407,22 @@ export const syncCursors = pgTable("sync_cursors", {
   schemaVersion: integer("schema_version").notNull().default(1),
 }, (table) => [uniqueIndex("sync_cursors_resource_unique").on(table.tenantId, table.repositoryId, table.resourceType, table.refName)]);
 
+export const reconciliationGenerations = pgTable("reconciliation_generations", {
+  id: id(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  reconciliationRunId: uuid("reconciliation_run_id").notNull(),
+  generation: bigint("generation", { mode: "number" }).notNull(),
+  current: boolean("current").notNull().default(false),
+  startedAt: time("started_at"),
+  supersededAt: nullableTime("superseded_at"),
+}, (table) => [
+  uniqueIndex("reconciliation_generations_run_unique").on(table.tenantId, table.repositoryId, table.reconciliationRunId),
+  uniqueIndex("reconciliation_generations_generation_unique").on(table.tenantId, table.repositoryId, table.generation),
+  uniqueIndex("reconciliation_generations_current_unique").on(table.tenantId, table.repositoryId).where(sql`current = true`),
+  uniqueIndex("reconciliation_generations_tenant_id_unique").on(table.tenantId, table.id),
+]);
+
 export const outbox = pgTable("outbox", {
   id: id(),
   tenantId: uuid("tenant_id").references(() => tenants.id),
@@ -443,9 +459,10 @@ export const schema = {
   unroutedWebhookDeliveries,
   syncJobs,
   syncCursors,
+  reconciliationGenerations,
   outbox,
 };
 
-export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, repositoryNameHistory, branches, commits, developmentEvents, commitRefs, tags, pullRequests, issues, releases, webhookDeliveries, syncJobs, syncCursors, outbox] as const;
+export const tenantTables = [tenants, users, tenantMembers, githubIdentities, authTransactions, applicationSessions, githubInstallations, repositories, repositoryAccess, repositoryNameHistory, branches, commits, developmentEvents, commitRefs, tags, pullRequests, issues, releases, webhookDeliveries, syncJobs, syncCursors, reconciliationGenerations, outbox] as const;
 
 export const now = sql`now()`;

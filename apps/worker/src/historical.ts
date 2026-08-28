@@ -181,6 +181,10 @@ function sanitizedAccessCode(error: GithubAccessError): string {
   return `github_${error.code}`;
 }
 
+function expectedRun(progress: HistoricalProgress): { expectedReconciliationRunId?: string } {
+  return typeof progress.cursor.reconciliationRunId === "string" ? { expectedReconciliationRunId: progress.cursor.reconciliationRunId } : {};
+}
+
 async function pauseForAccess(
   input: { tenantId: string; installationId: number; repository: RepositoryRecord; progress: ActivePosition },
   error: GithubAccessError,
@@ -193,6 +197,7 @@ async function pauseForAccess(
     stage: input.progress.stage,
     ...(refFor(input.progress.stage, input.repository) ? { refName: input.repository.defaultBranch } : {}),
     errorCode,
+    ...expectedRun(input.progress),
   });
   const operationId = `backfill-access:${input.repository.id}:${input.progress.stage}:${input.progress.cursor.nextPage}`;
   const logicalKey = installationInventoryLogicalKey(input.installationId, operationId);
@@ -223,7 +228,9 @@ async function pauseForRateLimit(
     ...(refFor(input.progress.stage, input.repository) ? { refName: input.repository.defaultBranch } : {}),
     pausedUntil: error.resumeAt,
     errorCode,
+    ...expectedRun(input.progress),
   });
+  if (typeof input.progress.cursor.reconciliationRunId === "string" && !paused) return;
   await enqueuePosition(
     { tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.installationId },
     (paused ?? input.progress) as ActivePosition,
@@ -262,6 +269,7 @@ async function commitDefaultBranchPage(
       refName: input.repository.defaultBranch,
       anchorHeadSha: currentHead,
       now: input.observedAt,
+      ...expectedRun(progress),
     });
     if (!reset) return { applied: false, reason: "gated", progress: input.progress };
     progress = reset as ActivePosition;
@@ -328,6 +336,10 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
   const scoped = await gate(payload, deps);
   if (!scoped) return;
   const observedAt = (deps.now ?? (() => new Date()))();
+  if (payload.reconciliationRunId) {
+    const generation = await deps.store.getRepositoryReconciliationGeneration(scoped.tenantId, scoped.repository.id, payload.reconciliationRunId);
+    if (generation && !generation.current) return;
+  }
 
   // Check the installation pause before reading/creating a cursor and before
   // obtaining a client. A replacement worker therefore emits only one
@@ -357,7 +369,7 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
     }
     if (!progress.pausedUntil) return;
     await deps.store.resumeInstallationApi({ tenantId: scoped.tenantId, installationId: scoped.repository.installationId, now: observedAt });
-    progress = (await deps.store.resumeHistoricalStage({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, stage: progress.stage, ...(refFor(progress.stage, scoped.repository) ? { refName: scoped.repository.defaultBranch } : {}), now: observedAt })) as ActivePosition | undefined;
+    progress = (await deps.store.resumeHistoricalStage({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, stage: progress.stage, ...(refFor(progress.stage, scoped.repository) ? { refName: scoped.repository.defaultBranch } : {}), now: observedAt, ...expectedRun(progress) })) as ActivePosition | undefined;
     if (!progress || progress.status === "paused") return;
   }
   const github = guardInstallationGithub({ tenantId: scoped.tenantId, installationGithubId: scoped.installationId, store: deps.store, github: deps.githubForInstallation(scoped.installationId), now: deps.now ?? (() => new Date()) });

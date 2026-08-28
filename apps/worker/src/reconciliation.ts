@@ -40,9 +40,11 @@ async function processCoordinator(payload: SyncJobPayload, deps: ReconciliationD
   if (!installation || installation.tenantId !== payload.tenantId || (installation.status && installation.status !== "active")) return;
   const repository = await deps.store.getRepositoryById(payload.tenantId, payload.repositoryId);
   if (!repository || repository.installationId !== installation.id || repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) return;
+  const generation = await deps.store.getRepositoryReconciliationGeneration(payload.tenantId, payload.repositoryId, payload.reconciliationRunId);
+  if (generation && !generation.current) return;
   const existing = (await deps.store.listHistoricalProgress(payload.tenantId, payload.repositoryId)).filter((progress) => progress.cursor.reconciliationRunId === payload.reconciliationRunId);
   if (existing.some((progress) => progress.stage === "completed" && progress.status === "completed")) return;
-  if (existing.length > 0) {
+  if (generation?.current || existing.length > 0) {
     const active = existing.find((progress) => progress.status === "in_progress" || progress.status === "paused");
     if (active?.status === "paused" && !active.pausedUntil) return;
     await enqueueCurrentHistoricalPosition({ tenantId: payload.tenantId, repositoryId: payload.repositoryId, installationId: payload.installationId }, deps);

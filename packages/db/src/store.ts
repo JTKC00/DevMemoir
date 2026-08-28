@@ -332,6 +332,16 @@ export type HistoricalSourceCounts = {
   releases: number;
 };
 
+export type ReconciliationGeneration = {
+  tenantId: string;
+  repositoryId: string;
+  reconciliationRunId: string;
+  generation: number;
+  current: boolean;
+  startedAt: Date;
+  supersededAt?: Date;
+};
+
 function branchName(ref: string): string {
   if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
   if (ref.startsWith("heads/")) return ref.slice("heads/".length);
@@ -393,12 +403,14 @@ export interface M1Store {
   startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress>;
   /** Atomically begin or resume one opaque full-reconciliation generation. */
   startRepositoryReconciliation(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; reconciliationRunId: string; now: Date }): Promise<HistoricalProgress | undefined>;
+  getRepositoryReconciliationGeneration(tenantId: string, repositoryId: string, reconciliationRunId: string): Promise<ReconciliationGeneration | undefined>;
+  getCurrentRepositoryReconciliationGeneration(tenantId: string, repositoryId: string): Promise<ReconciliationGeneration | undefined>;
   getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName?: string): Promise<HistoricalProgress | undefined>;
   listHistoricalProgress(tenantId: string, repositoryId: string): Promise<HistoricalProgress[]>;
-  resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined>;
+  resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date; expectedReconciliationRunId?: string }): Promise<HistoricalProgress | undefined>;
   commitHistoricalPage(input: HistoricalPageCommit): Promise<HistoricalPageCommitResult>;
-  pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string }): Promise<HistoricalProgress | undefined>;
-  resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date }): Promise<HistoricalProgress | undefined>;
+  pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string; expectedReconciliationRunId?: string }): Promise<HistoricalProgress | undefined>;
+  resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date; expectedReconciliationRunId?: string }): Promise<HistoricalProgress | undefined>;
   pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void>;
   resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void>;
   getHistoricalSourceCounts(tenantId: string, repositoryId: string): Promise<HistoricalSourceCounts>;
@@ -426,6 +438,7 @@ export class InMemoryM1Store implements M1Store {
   readonly historicalPullRequests = new Map<string, HistoricalPullRequestFact>();
   readonly historicalIssues = new Map<string, HistoricalIssueFact>();
   readonly historicalReleases = new Map<string, HistoricalReleaseFact>();
+  readonly reconciliationGenerations = new Map<string, ReconciliationGeneration>();
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
 
@@ -760,6 +773,39 @@ export class InMemoryM1Store implements M1Store {
     return Boolean(repository?.selected && (!repository.accessStatus || repositoryAccessIsAvailable(repository.accessStatus)));
   }
 
+  private reconciliationGenerationKey(tenantId: string, repositoryId: string, reconciliationRunId: string): string {
+    return `${tenantId}:${repositoryId}:${reconciliationRunId}`;
+  }
+
+  private cloneReconciliationGeneration(generation: ReconciliationGeneration | undefined): ReconciliationGeneration | undefined {
+    return generation ? { ...generation } : undefined;
+  }
+
+  private reconciliationGeneration(tenantId: string, repositoryId: string, reconciliationRunId: string): ReconciliationGeneration | undefined {
+    return this.reconciliationGenerations.get(this.reconciliationGenerationKey(tenantId, repositoryId, reconciliationRunId));
+  }
+
+  private currentReconciliationGeneration(tenantId: string, repositoryId: string): ReconciliationGeneration | undefined {
+    return [...this.reconciliationGenerations.values()].find((value) => value.tenantId === tenantId && value.repositoryId === repositoryId && value.current);
+  }
+
+  private isCurrentReconciliationRun(tenantId: string, repositoryId: string, reconciliationRunId: string): boolean {
+    return this.currentReconciliationGeneration(tenantId, repositoryId)?.reconciliationRunId === reconciliationRunId;
+  }
+
+  private nextReconciliationGenerationNumber(tenantId: string, repositoryId: string): number {
+    let maximum = 0;
+    for (const generation of this.reconciliationGenerations.values()) {
+      if (generation.tenantId === tenantId && generation.repositoryId === repositoryId && generation.generation > maximum) maximum = generation.generation;
+    }
+    return maximum + 1;
+  }
+
+  private generationAllowsMutation(tenantId: string, repositoryId: string, cursor: HistoricalCursor, expectedReconciliationRunId?: string): boolean {
+    if (!expectedReconciliationRunId) return true;
+    return cursor.reconciliationRunId === expectedReconciliationRunId && this.isCurrentReconciliationRun(tenantId, repositoryId, expectedReconciliationRunId);
+  }
+
   async startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress> {
     if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) throw new Error("historical_backfill_gated");
     for (const stage of HISTORICAL_STAGES) {
@@ -786,11 +832,25 @@ export class InMemoryM1Store implements M1Store {
 
   async startRepositoryReconciliation(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; reconciliationRunId: string; now: Date }): Promise<HistoricalProgress | undefined> {
     if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
-    const existing = [...this.historicalProgress.values()].find((progress) => progress.tenantId === input.tenantId && progress.repositoryId === input.repositoryId && progress.cursor.reconciliationRunId === input.reconciliationRunId);
-    if (existing) {
+    const known = this.reconciliationGeneration(input.tenantId, input.repositoryId, input.reconciliationRunId);
+    if (known && !known.current) return undefined;
+    if (known?.current) {
       const active = (await this.listHistoricalProgress(input.tenantId, input.repositoryId)).find((progress) => progress.status === "in_progress" || progress.status === "paused");
       return active ?? await this.getHistoricalProgress(input.tenantId, input.repositoryId, "completed");
     }
+    const previous = this.currentReconciliationGeneration(input.tenantId, input.repositoryId);
+    if (previous) {
+      previous.current = false;
+      previous.supersededAt = input.now;
+    }
+    this.reconciliationGenerations.set(this.reconciliationGenerationKey(input.tenantId, input.repositoryId, input.reconciliationRunId), {
+      tenantId: input.tenantId,
+      repositoryId: input.repositoryId,
+      reconciliationRunId: input.reconciliationRunId,
+      generation: this.nextReconciliationGenerationNumber(input.tenantId, input.repositoryId),
+      current: true,
+      startedAt: input.now,
+    });
     for (const [key, progress] of this.historicalProgress) {
       if (progress.tenantId === input.tenantId && progress.repositoryId === input.repositoryId && progress.stage === "default_branch_commits") this.historicalProgress.delete(key);
     }
@@ -812,6 +872,14 @@ export class InMemoryM1Store implements M1Store {
     return this.getHistoricalProgress(input.tenantId, input.repositoryId, "default_branch_commits", input.defaultBranch);
   }
 
+  async getRepositoryReconciliationGeneration(tenantId: string, repositoryId: string, reconciliationRunId: string): Promise<ReconciliationGeneration | undefined> {
+    return this.cloneReconciliationGeneration(this.reconciliationGeneration(tenantId, repositoryId, reconciliationRunId));
+  }
+
+  async getCurrentRepositoryReconciliationGeneration(tenantId: string, repositoryId: string): Promise<ReconciliationGeneration | undefined> {
+    return this.cloneReconciliationGeneration(this.currentReconciliationGeneration(tenantId, repositoryId));
+  }
+
   async getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): Promise<HistoricalProgress | undefined> {
     const normalizedRef = stage === "default_branch_commits" ? branchName(refName) : refName;
     const progress = this.historicalProgress.get(this.historicalKey(tenantId, repositoryId, stage, normalizedRef));
@@ -825,10 +893,11 @@ export class InMemoryM1Store implements M1Store {
       .map((value) => ({ ...value, cursor: { ...value.cursor } }));
   }
 
-  async resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined> {
+  async resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date; expectedReconciliationRunId?: string }): Promise<HistoricalProgress | undefined> {
     if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
     const previousHead = await this.getBranchHead(input.tenantId, input.repositoryId, input.refName);
     const currentProgress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, "default_branch_commits", branchName(input.refName)));
+    if (!this.generationAllowsMutation(input.tenantId, input.repositoryId, currentProgress?.cursor ?? { nextPage: 1 }, input.expectedReconciliationRunId)) return undefined;
     const reconciliationRunId = typeof currentProgress?.cursor.reconciliationRunId === "string" ? currentProgress.cursor.reconciliationRunId : undefined;
     await this.markBranchCommitsUnreachable(input.tenantId, input.repositoryId, input.refName);
     const progress: HistoricalProgress = {
@@ -854,6 +923,8 @@ export class InMemoryM1Store implements M1Store {
     const progress = this.historicalProgress.get(key);
     if (!progress) throw new Error("historical_progress_missing");
     if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.observedAt)) return { applied: false, reason: "gated", progress: { ...progress, cursor: { ...progress.cursor } } };
+    const expectedRunId = typeof input.expectedCursor.reconciliationRunId === "string" ? input.expectedCursor.reconciliationRunId : undefined;
+    if (!this.generationAllowsMutation(input.tenantId, input.repositoryId, progress.cursor, expectedRunId)) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
     if (JSON.stringify(progress.cursor) !== JSON.stringify(input.expectedCursor)) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
     if (input.stage === "default_branch_commits") {
       if (progress.anchorHeadSha && progress.anchorHeadSha !== input.anchorHeadSha) return { applied: false, reason: "checkpoint_mismatch", progress: { ...progress, cursor: { ...progress.cursor } } };
@@ -932,20 +1003,23 @@ export class InMemoryM1Store implements M1Store {
     return { applied: true, progress: { ...progress, cursor: { ...progress.cursor } } };
   }
 
-  async pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string }): Promise<HistoricalProgress | undefined> {
+  async pauseHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; pausedUntil?: Date; errorCode: string; expectedReconciliationRunId?: string }): Promise<HistoricalProgress | undefined> {
     const refName = input.stage === "default_branch_commits" ? branchName(input.refName ?? "") : input.refName ?? "";
     const progress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, input.stage, refName));
     if (!progress || progress.status === "completed") return progress;
+    if (!this.generationAllowsMutation(input.tenantId, input.repositoryId, progress.cursor, input.expectedReconciliationRunId)) return undefined;
     progress.status = "paused";
     progress.errorCode = input.errorCode;
     if (input.pausedUntil) progress.pausedUntil = input.pausedUntil; else delete progress.pausedUntil;
     return { ...progress, cursor: { ...progress.cursor } };
   }
 
-  async resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date }): Promise<HistoricalProgress | undefined> {
+  async resumeHistoricalStage(input: { tenantId: string; repositoryId: string; stage: HistoricalSourceStage; refName?: string; now: Date; expectedReconciliationRunId?: string }): Promise<HistoricalProgress | undefined> {
     const refName = input.stage === "default_branch_commits" ? branchName(input.refName ?? "") : input.refName ?? "";
     const progress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, input.stage, refName));
-    if (!progress || progress.status === "completed" || (progress.pausedUntil && progress.pausedUntil > input.now)) return progress ? { ...progress, cursor: { ...progress.cursor } } : undefined;
+    if (!progress) return undefined;
+    if (!this.generationAllowsMutation(input.tenantId, input.repositoryId, progress.cursor, input.expectedReconciliationRunId)) return undefined;
+    if (progress.status === "completed" || (progress.pausedUntil && progress.pausedUntil > input.now)) return { ...progress, cursor: { ...progress.cursor } };
     progress.status = "in_progress";
     delete progress.pausedUntil;
     delete progress.errorCode;

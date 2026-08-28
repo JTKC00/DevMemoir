@@ -176,4 +176,57 @@ describe("M5.1 active repository reconciliation", () => {
       expect(await scope.store.listHistoricalProgress(tenantId, repositoryId)).toEqual([]);
     }
   });
+
+  it("does not let a delayed older coordinator or page job reset a newer generation", async () => {
+    const runA = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    const runB = "00000000-0000-4000-8000-0000000000bb";
+    expect(runA > runB).toBe(true);
+    let inventoryRequests = 0;
+    let commitPageRequests = 0;
+    const client = authoritativeGithub({
+      listInstallationRepositories: async () => {
+        inventoryRequests += 1;
+        return {
+          repositories: [{ id: 991, name: privateRepository, full_name: `${privateOwner}/${privateRepository}`, private: true, default_branch: "main", owner: { id: 7, login: privateOwner, type: "User" } }],
+        };
+      },
+      listCommits: async () => {
+        commitPageRequests += 1;
+        return { commits: [{ repositoryId, sha: `head-${commitPageRequests}`, message: "PRIVATE_COMMIT_CANARY", committedAt: new Date("2026-08-28T01:00:00Z"), parents: [] }], nextPage: 2 };
+      },
+    });
+    const scope = await setup(client);
+    const coordinatorA = { ...scope.coordinator, reconciliationRunId: runA };
+    const coordinatorB = { ...scope.coordinator, reconciliationRunId: runB };
+
+    await processRepositoryReconciliation(coordinatorA, scope.deps);
+    await processRepositoryReconciliation({ ...coordinatorA, stage: "default_branch_commits" }, scope.deps);
+    expect((await scope.store.getCurrentRepositoryReconciliationGeneration(tenantId, repositoryId))?.reconciliationRunId).toBe(runA);
+
+    await processRepositoryReconciliation(coordinatorB, scope.deps);
+    await processRepositoryReconciliation({ ...coordinatorB, stage: "default_branch_commits" }, scope.deps);
+    const currentB = await scope.store.getHistoricalProgress(tenantId, repositoryId, "default_branch_commits", "main");
+    const countsB = await scope.store.getHistoricalSourceCounts(tenantId, repositoryId);
+    const eventKeysB = scope.store.events.map((event) => event.logicalEventKey);
+    const generationB = await scope.store.getCurrentRepositoryReconciliationGeneration(tenantId, repositoryId);
+    expect(generationB).toMatchObject({ reconciliationRunId: runB, current: true, generation: 2 });
+    const inventoryAfterB = inventoryRequests;
+    const pagesAfterB = commitPageRequests;
+
+    await processRepositoryReconciliation(coordinatorA, scope.deps);
+    await processRepositoryReconciliation({ ...coordinatorA, stage: "default_branch_commits" }, scope.deps);
+    expect(inventoryRequests).toBe(inventoryAfterB);
+    expect(commitPageRequests).toBe(pagesAfterB);
+    expect(await scope.store.getCurrentRepositoryReconciliationGeneration(tenantId, repositoryId)).toMatchObject({ reconciliationRunId: runB, current: true, generation: 2 });
+    expect(await scope.store.getHistoricalProgress(tenantId, repositoryId, "default_branch_commits", "main")).toEqual(currentB);
+    expect(await scope.store.getHistoricalSourceCounts(tenantId, repositoryId)).toEqual(countsB);
+    expect(scope.store.events.map((event) => event.logicalEventKey)).toEqual(eventKeysB);
+    expect(new Set(eventKeysB).size).toBe(eventKeysB.length);
+
+    await processRepositoryReconciliation(coordinatorB, scope.deps);
+    expect(await scope.store.getHistoricalProgress(tenantId, repositoryId, "default_branch_commits", "main")).toEqual(currentB);
+    expect(await scope.store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runB, now: new Date("2026-08-28T02:10:00Z") })).toMatchObject({ cursor: { nextPage: currentB?.nextPage, reconciliationRunId: runB } });
+    expect(await scope.store.getHistoricalSourceCounts(tenantId, repositoryId)).toEqual(countsB);
+    expect(new Set(scope.store.events.map((event) => event.logicalEventKey)).size).toBe(scope.store.events.length);
+  });
 });

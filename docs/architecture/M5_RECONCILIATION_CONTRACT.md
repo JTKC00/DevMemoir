@@ -20,7 +20,11 @@ The logical run identity is:
 reconcile:{repository_id}:{reconciliation_run_id}
 ```
 
-The run ID is an opaque caller-generated identifier. Replaying the same run ID resumes or observes the same durable generation. A different run ID may begin only by atomically resetting the selected repository's ordered `sync_cursors` after the authoritative inventory gate succeeds. The cursor JSON records the run ID so delayed jobs from an older generation cannot advance the newer generation.
+The run ID is an opaque caller-generated identifier. Replaying the same run ID resumes or observes the same durable generation. Each selected repository has a durable current-generation identity: a monotonic generation number assigned when a run ID first starts. Ordering is that assignment sequence, never a lexical comparison of run IDs.
+
+A different run ID may begin only after the authoritative inventory gate succeeds, by atomically claiming the next generation, superseding the previous current generation, and resetting the selected repository's ordered `sync_cursors`. Same-run replay does not refresh inventory and does not reset checkpoints.
+
+A coordinator or stage/page job whose run ID is known but not current is a no-op: it must not refresh inventory, and it must not reset, replace, advance, pause, or otherwise mutate the newer generation. The cursor JSON still records the run ID so a delayed job whose expected generation/cursor no longer matches cannot commit.
 
 M5.1 reuses the ordered M3 stages:
 
@@ -41,7 +45,7 @@ Within a generation, stage state remains `pending | in_progress | paused | compl
 3. It checks the durable installation rate-limit pause before every outbound request.
 4. It refreshes the complete paginated installation inventory and installation snapshot. Webhook payload data is not an input.
 5. It re-reads the repository/access rows. If selection or access was lost, the run stops without resetting or advancing source cursors.
-6. It atomically begins or resumes the requested reconciliation generation in `sync_cursors`.
+6. It atomically begins or resumes the requested reconciliation generation using the durable current-generation identity and `sync_cursors`.
 7. Each subsequent physical reconciliation job fetches at most one authoritative source page and uses the existing M3 atomic page rule: gate and lock, compare the stored generation/cursor with the expected generation/cursor, idempotently upsert normalized facts, update reachability/inventory observations, advance the cursor/stage, and commit.
 8. After each accepted source-page transaction, M4 reprojection reads only normalized PostgreSQL facts and atomically replaces the repository's canonical event slice.
 9. The final stage records successful completion and `last_full_reconcile_at`. Queue acknowledgement may occur later without affecting source truth.
@@ -70,6 +74,7 @@ Automated tests must prove:
 
 - an intentionally missed supported webhook change is imported from authoritative API state;
 - replay of the same reconciliation generation creates no duplicate source or canonical event rows;
+- a delayed coordinator or stage/page job from an older generation cannot reset, replace, advance, pause, or mutate a newer generation;
 - interruption before and after a page commit resumes from the durable cursor;
 - a rate-limit pause advances neither source facts nor cursor and performs no request before the durable pause expires;
 - inactive, inaccessible, or unselected scope is gated before GitHub access;
