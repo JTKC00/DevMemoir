@@ -50,6 +50,7 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     }
     await admin.query(await readFile(resolve(migrationsDir, "0003_m3_historical_backfill.sql"), "utf8"));
     await admin.query(await readFile(resolve(migrationsDir, "0004_m4_canonical_projection.sql"), "utf8"));
+    await admin.query(await readFile(resolve(migrationsDir, "0005_m5_reconciliation_generations.sql"), "utf8"));
     for (const [capability, roleName] of Object.entries(runtimeRoleNames)) {
       const capabilityRole = capability === "api" ? "devmemoir_api" : capability === "worker" ? "devmemoir_worker" : "devmemoir_web";
       await admin.query(`create role "${roleName}" login password '${rolePassword}'`);
@@ -68,11 +69,13 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await admin.query("insert into issues (id,tenant_id,repository_id,github_issue_id,number,title,state,github_created_at,github_updated_at,first_seen_at,last_seen_at) values ($1,$2,$3,4001,2,'private-issue-a','open',now(),now(),now(),now()),($4,$5,$6,4002,2,'private-issue-b','open',now(),now(),now(),now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
     await admin.query("insert into releases (id,tenant_id,repository_id,github_release_id,tag_name,name,github_created_at,github_updated_at,first_seen_at,last_seen_at) values ($1,$2,$3,5001,'v1','private-release-a',now(),now(),now(),now()),($4,$5,$6,5002,'v1','private-release-b',now(),now(),now(),now())", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
     await admin.query("insert into sync_cursors (id,tenant_id,repository_id,resource_type,ref_name,cursor) values ($1,$2,$3,'pull_requests','', '{\"nextPage\":1}'),($4,$5,$6,'pull_requests','', '{\"nextPage\":1}')", [randomUUID(), tenantA, repoA, randomUUID(), tenantB, repoB]);
+    await admin.query("insert into reconciliation_generations (id,tenant_id,repository_id,reconciliation_run_id,generation,current,started_at) values ($1,$2,$3,$4,1,true,now()),($5,$6,$7,$8,1,true,now())", [randomUUID(), tenantA, repoA, randomUUID(), randomUUID(), tenantB, repoB, randomUUID()]);
   });
 
   afterAll(async () => {
     await Promise.all(runtimeClients.map((client) => client.end().catch(() => undefined)));
     await admin.query("delete from development_events where repository_id in ($1,$2)", [repoA, repoB]);
+    await admin.query("delete from reconciliation_generations where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from sync_cursors where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from releases where repository_id in ($1,$2)", [repoA, repoB]);
     await admin.query("delete from issues where repository_id in ($1,$2)", [repoA, repoB]);
@@ -122,7 +125,7 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await admin.query("begin");
     await admin.query("set local role devmemoir_worker");
     await admin.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
-    for (const table of ["tags", "pull_requests", "issues", "releases", "sync_cursors", "development_events"]) {
+    for (const table of ["tags", "pull_requests", "issues", "releases", "sync_cursors", "reconciliation_generations", "development_events"]) {
       const visible = await admin.query<{ tenant_id: string }>(`select tenant_id from ${table}`);
       expect(visible.rows.map((row) => row.tenant_id)).toEqual([tenantA]);
       expect((await admin.query(`update ${table} set tenant_id=tenant_id where tenant_id=$1`, [tenantB])).rowCount).toBe(0);
@@ -183,6 +186,7 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     expect((await api.query("update repositories set name='api-cross-tenant' where id=$1", [repoB])).rowCount).toBe(0);
     await expect(api.query("update pull_requests set title='api-must-not-normalize' where repository_id=$1", [repoA])).rejects.toThrow();
     await expect(api.query("update sync_cursors set status='completed' where repository_id=$1", [repoA])).rejects.toThrow();
+    await expect(api.query("update reconciliation_generations set current=false where repository_id=$1", [repoA])).rejects.toThrow();
     await expect(api.query("create table rls_api_ddl_forbidden (id integer)")).rejects.toThrow();
     await api.query("rollback");
 

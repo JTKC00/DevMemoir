@@ -51,6 +51,7 @@ async function cleanup(scope: Scope): Promise<void> {
   await scope.admin.query("delete from commits where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from branches where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from sync_cursors where tenant_id=$1", [scope.tenantId]);
+  await scope.admin.query("delete from reconciliation_generations where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from sync_jobs where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repository_access where tenant_id=$1", [scope.tenantId]);
   await scope.admin.query("delete from repositories where tenant_id=$1", [scope.tenantId]);

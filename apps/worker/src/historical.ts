@@ -16,6 +16,8 @@ import {
 import {
   historicalBackfillLogicalKey,
   installationInventoryLogicalKey,
+  repositoryReconciliationLogicalKey,
+  type JobKind,
   type JobPort,
   type SyncJobPayload,
 } from "@devmemoir/jobs";
@@ -68,16 +70,33 @@ function jobPayload(
   input: { tenantId: string; repositoryId: string; installationId: number },
   progress: ActivePosition,
 ): SyncJobPayload {
+  const reconciliationRunId = typeof progress.cursor.reconciliationRunId === "string" ? progress.cursor.reconciliationRunId : undefined;
   return {
-    kind: "repository_backfill",
+    kind: reconciliationRunId ? "repository_reconciliation" : "repository_backfill",
     tenantId: input.tenantId,
     repositoryId: input.repositoryId,
     installationId: input.installationId,
     stage: progress.stage,
     page: progress.cursor.nextPage,
-    ...(progress.anchorHeadSha ? { anchorHeadSha: progress.anchorHeadSha } : {}),
+    ...(!reconciliationRunId && progress.anchorHeadSha ? { anchorHeadSha: progress.anchorHeadSha } : {}),
     ...(progress.observationStartedAt ? { observationStartedAt: progress.observationStartedAt.toISOString() } : {}),
+    ...(reconciliationRunId ? { reconciliationRunId } : {}),
   };
+}
+
+function positionIdentity(repositoryId: string, progress: ActivePosition): { kind: JobKind; logicalKey: string } {
+  const reconciliationRunId = typeof progress.cursor.reconciliationRunId === "string" ? progress.cursor.reconciliationRunId : undefined;
+  if (reconciliationRunId) return {
+    kind: "repository_reconciliation",
+    logicalKey: repositoryReconciliationLogicalKey(repositoryId, reconciliationRunId, progress.stage, progress.cursor.nextPage),
+  };
+  const canonicalPositionKey = historicalBackfillLogicalKey(
+    repositoryId,
+    progress.stage,
+    progress.cursor.nextPage,
+    progress.stage === "default_branch_commits" ? progress.anchorHeadSha : undefined,
+  );
+  return { kind: "repository_backfill", logicalKey: mutableStage(progress.stage) ? `${canonicalPositionKey}:mode:${cursorMode(progress)}` : canonicalPositionKey };
 }
 
 async function enqueuePosition(
@@ -88,18 +107,12 @@ async function enqueuePosition(
   wakeIdentity?: string,
 ): Promise<void> {
   const payload = jobPayload(input, progress);
-  const canonicalPositionKey = historicalBackfillLogicalKey(
-    input.repositoryId,
-    progress.stage,
-    progress.cursor.nextPage,
-    progress.stage === "default_branch_commits" ? progress.anchorHeadSha : undefined,
-  );
-  const positionKey = mutableStage(progress.stage) ? `${canonicalPositionKey}:mode:${cursorMode(progress)}` : canonicalPositionKey;
+  const identity = positionIdentity(input.repositoryId, progress);
   // A delayed wake is execution infrastructure, not a second canonical cursor.
   // Its suffix avoids colliding with the currently-active stately pg-boss job.
-  const logicalKey = wakeIdentity ? `${positionKey}:wake:${wakeIdentity}` : positionKey;
+  const logicalKey = wakeIdentity ? `${identity.logicalKey}:wake:${wakeIdentity}` : identity.logicalKey;
   await deps.store.ensureJob(logicalKey, payload as Record<string, unknown>);
-  await deps.jobs.enqueue("repository_backfill", logicalKey, payload, startAfter ? { startAfter } : undefined);
+  await deps.jobs.enqueue(identity.kind, logicalKey, payload, startAfter ? { startAfter } : undefined);
 }
 
 async function enqueueCurrent(
@@ -111,6 +124,13 @@ async function enqueueCurrent(
   const progress = activePosition(await deps.store.listHistoricalProgress(input.tenantId, input.repositoryId));
   if (!progress) return;
   await enqueuePosition(input, progress, deps, startAfter ?? (progress.status === "paused" ? progress.pausedUntil : undefined), wakeIdentity);
+}
+
+export async function enqueueCurrentHistoricalPosition(
+  input: { tenantId: string; repositoryId: string; installationId: number },
+  deps: HistoricalDependencies,
+): Promise<void> {
+  await enqueueCurrent(input, deps);
 }
 
 async function enqueueHistoricalWake(
@@ -128,16 +148,21 @@ async function enqueueHistoricalWake(
 
   // A paused coordinator may not have created cursors yet. Keep the durable
   // cursor absent and schedule one timestamped wake for the same coordinator.
-  const logicalKey = `${historicalBackfillLogicalKey(scope.repository.id, "coordinator")}:wake:${resumeAt.getTime()}`;
+  const reconciliationRunId = payload.reconciliationRunId;
+  const coordinatorKey = reconciliationRunId
+    ? repositoryReconciliationLogicalKey(scope.repository.id, reconciliationRunId)
+    : historicalBackfillLogicalKey(scope.repository.id, "coordinator");
+  const logicalKey = `${coordinatorKey}:wake:${resumeAt.getTime()}`;
+  const kind: JobKind = reconciliationRunId ? "repository_reconciliation" : "repository_backfill";
   const wakePayload: SyncJobPayload = {
     ...payload,
-    kind: "repository_backfill",
+    kind,
     tenantId: scope.tenantId,
     repositoryId: scope.repository.id,
     installationId: scope.installationId,
   };
   await deps.store.ensureJob(logicalKey, wakePayload as Record<string, unknown>);
-  await deps.jobs.enqueue("repository_backfill", logicalKey, wakePayload, { startAfter: resumeAt });
+  await deps.jobs.enqueue(kind, logicalKey, wakePayload, { startAfter: resumeAt });
 }
 
 async function gate(
@@ -156,6 +181,10 @@ function sanitizedAccessCode(error: GithubAccessError): string {
   return `github_${error.code}`;
 }
 
+function expectedRun(progress: HistoricalProgress): { expectedReconciliationRunId?: string } {
+  return typeof progress.cursor.reconciliationRunId === "string" ? { expectedReconciliationRunId: progress.cursor.reconciliationRunId } : {};
+}
+
 async function pauseForAccess(
   input: { tenantId: string; installationId: number; repository: RepositoryRecord; progress: ActivePosition },
   error: GithubAccessError,
@@ -168,6 +197,7 @@ async function pauseForAccess(
     stage: input.progress.stage,
     ...(refFor(input.progress.stage, input.repository) ? { refName: input.repository.defaultBranch } : {}),
     errorCode,
+    ...expectedRun(input.progress),
   });
   const operationId = `backfill-access:${input.repository.id}:${input.progress.stage}:${input.progress.cursor.nextPage}`;
   const logicalKey = installationInventoryLogicalKey(input.installationId, operationId);
@@ -198,7 +228,9 @@ async function pauseForRateLimit(
     ...(refFor(input.progress.stage, input.repository) ? { refName: input.repository.defaultBranch } : {}),
     pausedUntil: error.resumeAt,
     errorCode,
+    ...expectedRun(input.progress),
   });
+  if (typeof input.progress.cursor.reconciliationRunId === "string" && !paused) return;
   await enqueuePosition(
     { tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.installationId },
     (paused ?? input.progress) as ActivePosition,
@@ -217,7 +249,19 @@ async function commitDefaultBranchPage(
   const currentHead = await input.github.getRefHead({ owner: input.repository.ownerLogin, repo: input.repository.name, ref });
   if (!currentHead) throw new GithubAccessError("not_found", 404);
   let progress = input.progress;
-  if (!progress.anchorHeadSha || progress.anchorHeadSha !== currentHead) {
+  const headChanged = !progress.anchorHeadSha || progress.anchorHeadSha !== currentHead;
+  const page = headChanged ? 1 : progress.cursor.nextPage;
+  const response = await input.github.listCommits({ owner: input.repository.ownerLogin, repo: input.repository.name, sha: currentHead, page, perPage: HISTORICAL_PAGE_SIZE });
+  const finalPage = response.nextPage === undefined;
+  if (finalPage) {
+    const publishHead = await input.github.getRefHead({ owner: input.repository.ownerLogin, repo: input.repository.name, ref });
+    if (publishHead !== currentHead) return { applied: false, reason: "checkpoint_mismatch", progress };
+  }
+  // Do not reset reachability or the durable cursor until the first page for
+  // the new head (and the final-head confirmation when applicable) has been
+  // fetched successfully. A rate limit or interruption therefore changes no
+  // source/checkpoint state.
+  if (headChanged) {
     const reset = await deps.store.resetCommitTraversal({
       tenantId: input.tenantId,
       repositoryId: input.repository.id,
@@ -225,19 +269,10 @@ async function commitDefaultBranchPage(
       refName: input.repository.defaultBranch,
       anchorHeadSha: currentHead,
       now: input.observedAt,
+      ...expectedRun(progress),
     });
     if (!reset) return { applied: false, reason: "gated", progress: input.progress };
     progress = reset as ActivePosition;
-  }
-  const page = progress.cursor.nextPage;
-  const response = await input.github.listCommits({ owner: input.repository.ownerLogin, repo: input.repository.name, sha: currentHead, page, perPage: HISTORICAL_PAGE_SIZE });
-  const finalPage = response.nextPage === undefined;
-  if (finalPage) {
-    const publishHead = await input.github.getRefHead({ owner: input.repository.ownerLogin, repo: input.repository.name, ref });
-    if (publishHead !== currentHead) {
-      if (publishHead) await deps.store.resetCommitTraversal({ tenantId: input.tenantId, repositoryId: input.repository.id, installationId: input.repository.installationId, refName: input.repository.defaultBranch, anchorHeadSha: publishHead, now: input.observedAt });
-      return { applied: false, reason: "checkpoint_mismatch", progress };
-    }
   }
   return deps.store.commitHistoricalPage({
     tenantId: input.tenantId,
@@ -301,6 +336,10 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
   const scoped = await gate(payload, deps);
   if (!scoped) return;
   const observedAt = (deps.now ?? (() => new Date()))();
+  if (payload.reconciliationRunId) {
+    const generation = await deps.store.getRepositoryReconciliationGeneration(scoped.tenantId, scoped.repository.id, payload.reconciliationRunId);
+    if (generation && !generation.current) return;
+  }
 
   // Check the installation pause before reading/creating a cursor and before
   // obtaining a client. A replacement worker therefore emits only one
@@ -316,6 +355,7 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
   }
 
   let rows = await deps.store.listHistoricalProgress(scoped.tenantId, scoped.repository.id);
+  if (payload.reconciliationRunId && !rows.some((row) => row.cursor.reconciliationRunId === payload.reconciliationRunId)) return;
   if (rows.length === 0) {
     await deps.store.startHistoricalBackfill({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, installationId: scoped.repository.installationId, defaultBranch: scoped.repository.defaultBranch, now: observedAt });
     rows = await deps.store.listHistoricalProgress(scoped.tenantId, scoped.repository.id);
@@ -329,7 +369,7 @@ export async function processHistoricalBackfill(payload: SyncJobPayload, deps: H
     }
     if (!progress.pausedUntil) return;
     await deps.store.resumeInstallationApi({ tenantId: scoped.tenantId, installationId: scoped.repository.installationId, now: observedAt });
-    progress = (await deps.store.resumeHistoricalStage({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, stage: progress.stage, ...(refFor(progress.stage, scoped.repository) ? { refName: scoped.repository.defaultBranch } : {}), now: observedAt })) as ActivePosition | undefined;
+    progress = (await deps.store.resumeHistoricalStage({ tenantId: scoped.tenantId, repositoryId: scoped.repository.id, stage: progress.stage, ...(refFor(progress.stage, scoped.repository) ? { refName: scoped.repository.defaultBranch } : {}), now: observedAt, ...expectedRun(progress) })) as ActivePosition | undefined;
     if (!progress || progress.status === "paused") return;
   }
   const github = guardInstallationGithub({ tenantId: scoped.tenantId, installationGithubId: scoped.installationId, store: deps.store, github: deps.githubForInstallation(scoped.installationId), now: deps.now ?? (() => new Date()) });

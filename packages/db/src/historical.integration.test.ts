@@ -26,6 +26,8 @@ describeIntegration("M3 PostgreSQL historical page transactions", () => {
     await pool.query(migration);
     await pool.query(migration);
     await pool.query(await readFile(resolve(migrationsDir, "0004_m4_canonical_projection.sql"), "utf8"));
+    await pool.query(await readFile(resolve(migrationsDir, "0005_m5_reconciliation_generations.sql"), "utf8"));
+    await pool.query(await readFile(resolve(migrationsDir, "0005_m5_reconciliation_generations.sql"), "utf8"));
     await pool.query("insert into tenants (id,slug,created_at) values ($1,$2,now())", [tenantId, `m3-${tenantId}`]);
     await pool.query("insert into github_accounts (id,github_account_id,account_type,actor_kind) values ($1,$2,'User','user')", [accountId, Math.floor(Math.random() * 1_000_000_000) + 10_000]);
     await pool.query("insert into github_installations (id,tenant_id,github_installation_id,account_github_account_id,status,created_at,updated_at) values ($1,$2,$3,$4,'active',now(),now())", [installationId, tenantId, Math.floor(Math.random() * 1_000_000_000) + 10_000, accountId]);
@@ -43,6 +45,7 @@ describeIntegration("M3 PostgreSQL historical page transactions", () => {
     await pool.query("delete from commits where tenant_id=$1", [tenantId]);
     await pool.query("delete from branches where tenant_id=$1", [tenantId]);
     await pool.query("delete from sync_cursors where tenant_id=$1", [tenantId]);
+    await pool.query("delete from reconciliation_generations where tenant_id=$1", [tenantId]);
     await pool.query("delete from repository_access where tenant_id=$1", [tenantId]);
     await pool.query("delete from repositories where tenant_id=$1", [tenantId]);
     await pool.query("delete from github_installations where tenant_id=$1", [tenantId]);
@@ -95,5 +98,56 @@ describeIntegration("M3 PostgreSQL historical page transactions", () => {
     const releaseFirst = await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "releases", expectedCursor: releaseProgress.cursor, nextCursor: { nextPage: 2 }, observedAt: new Date("2026-01-01T00:21:00Z"), finalPage: false, facts: [release] });
     await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "releases", expectedCursor: releaseFirst.progress.cursor, nextCursor: { nextPage: 3 }, observedAt: new Date("2026-01-01T00:22:00Z"), finalPage: false, facts: [{ ...release, name: "equal-clock stale release" }] });
     expect((await pool.query("select name from releases where tenant_id=$1 and repository_id=$2 and github_release_id=8001", [tenantId, repositoryId])).rows[0]).toMatchObject({ name: "new release" });
+  });
+
+  it("persists and idempotently resumes an opaque reconciliation generation", async () => {
+    const runId = randomUUID();
+    const started = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runId, now: new Date("2026-01-02T00:00:00Z") });
+    expect(started?.cursor).toMatchObject({ nextPage: 1, reconciliationRunId: runId });
+    const traversal = await store.resetCommitTraversal({ tenantId, repositoryId, installationId, refName: "main", anchorHeadSha: "reconcile-head", now: new Date("2026-01-02T00:01:00Z") });
+    if (!traversal) throw new Error("reconciliation traversal missing");
+    expect(traversal.cursor.reconciliationRunId).toBe(runId);
+    await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "default_branch_commits", refName: "main", anchorHeadSha: "reconcile-head", expectedCursor: traversal.cursor, nextCursor: { nextPage: 2 }, observedAt: new Date("2026-01-02T00:02:00Z"), finalPage: false, facts: [] });
+
+    const replay = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runId, now: new Date("2026-01-02T00:03:00Z") });
+    expect(replay?.cursor).toMatchObject({ nextPage: 2, reconciliationRunId: runId });
+    const nextRunId = randomUUID();
+    const next = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: nextRunId, now: new Date("2026-01-02T00:04:00Z") });
+    expect(next?.cursor).toMatchObject({ nextPage: 1, reconciliationRunId: nextRunId });
+  });
+
+  it("does not let a delayed older reconciliation generation reset or mutate a newer one", async () => {
+    const runA = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    const runB = "00000000-0000-4000-8000-0000000000bb";
+    expect(runA > runB).toBe(true);
+    const startedA = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runA, now: new Date("2026-01-03T00:00:00Z") });
+    if (!startedA) throw new Error("run A missing");
+    const traversalA = await store.resetCommitTraversal({ tenantId, repositoryId, installationId, refName: "main", anchorHeadSha: "stale-head", now: new Date("2026-01-03T00:01:00Z"), expectedReconciliationRunId: runA });
+    if (!traversalA) throw new Error("run A traversal missing");
+    await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "default_branch_commits", refName: "main", anchorHeadSha: "stale-head", expectedCursor: traversalA.cursor, nextCursor: { nextPage: 2 }, observedAt: new Date("2026-01-03T00:02:00Z"), finalPage: false, facts: [{ commit: { repositoryId, sha: "sha-stale-a", message: "from-a", parents: [] } }] });
+
+    const startedB = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runB, now: new Date("2026-01-03T00:03:00Z") });
+    if (!startedB) throw new Error("run B missing");
+    const traversalB = await store.resetCommitTraversal({ tenantId, repositoryId, installationId, refName: "main", anchorHeadSha: "current-head", now: new Date("2026-01-03T00:04:00Z"), expectedReconciliationRunId: runB });
+    if (!traversalB) throw new Error("run B traversal missing");
+    await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "default_branch_commits", refName: "main", anchorHeadSha: "current-head", expectedCursor: traversalB.cursor, nextCursor: { nextPage: 2 }, observedAt: new Date("2026-01-03T00:05:00Z"), finalPage: false, facts: [{ commit: { repositoryId, sha: "sha-current-b", message: "from-b", parents: [] } }] });
+    const currentB = await store.getHistoricalProgress(tenantId, repositoryId, "default_branch_commits", "main");
+    const generationA = await store.getRepositoryReconciliationGeneration(tenantId, repositoryId, runA);
+    const generationB = await store.getCurrentRepositoryReconciliationGeneration(tenantId, repositoryId);
+    expect(generationB?.reconciliationRunId).toBe(runB);
+    expect(generationB?.current).toBe(true);
+    expect(generationA?.current).toBe(false);
+    expect(generationB && generationA ? generationB.generation > generationA.generation : false).toBe(true);
+
+    expect(await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runA, now: new Date("2026-01-03T00:06:00Z") })).toBeUndefined();
+    expect(await store.pauseHistoricalStage({ tenantId, repositoryId, stage: "default_branch_commits", refName: "main", errorCode: "stale_run_a", expectedReconciliationRunId: runA })).toBeUndefined();
+    expect(await store.resetCommitTraversal({ tenantId, repositoryId, installationId, refName: "main", anchorHeadSha: "stale-head", now: new Date("2026-01-03T00:07:00Z"), expectedReconciliationRunId: runA })).toBeUndefined();
+    expect(await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "default_branch_commits", refName: "main", anchorHeadSha: "stale-head", expectedCursor: traversalA.cursor, nextCursor: { nextPage: 3 }, observedAt: new Date("2026-01-03T00:08:00Z"), finalPage: false, facts: [{ commit: { repositoryId, sha: "must-not-apply", message: "stale", parents: [] } }] })).toMatchObject({ applied: false, reason: "checkpoint_mismatch" });
+
+    expect(await store.getHistoricalProgress(tenantId, repositoryId, "default_branch_commits", "main")).toEqual(currentB);
+    expect(await store.getCurrentRepositoryReconciliationGeneration(tenantId, repositoryId)).toMatchObject({ reconciliationRunId: runB, current: true });
+    const replay = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runB, now: new Date("2026-01-03T00:09:00Z") });
+    expect(replay?.cursor).toMatchObject({ nextPage: 2, reconciliationRunId: runB });
+    expect((await pool.query("select sha from commits where tenant_id=$1 and repository_id=$2 and sha=any($3::text[]) order by sha", [tenantId, repositoryId, ["sha-stale-a", "sha-current-b", "must-not-apply"]])).rows.map((row) => row.sha)).toEqual(["sha-current-b", "sha-stale-a"]);
   });
 });

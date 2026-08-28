@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getTableColumns } from "drizzle-orm";
-import { developmentEvents, githubIdentities, commits, issues, pullRequests, releases, repositoryNameHistory, syncCursors, tags, webhookDeliveries } from "./schema.js";
+import { developmentEvents, githubIdentities, commits, issues, pullRequests, releases, reconciliationGenerations, repositoryNameHistory, syncCursors, tags, webhookDeliveries } from "./schema.js";
 
 if (process.env.CI && !process.env.TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required in CI");
 
@@ -16,6 +16,9 @@ describe("M2 schema contract", () => {
     expect(tags).toBeDefined();
     expect(syncCursors.status).toBeDefined();
     expect(syncCursors.completenessState).toBeDefined();
+    expect(reconciliationGenerations.reconciliationRunId).toBeDefined();
+    expect(reconciliationGenerations.generation).toBeDefined();
+    expect(reconciliationGenerations.current).toBeDefined();
     for (const table of [pullRequests, issues, releases]) {
       const columns = Object.keys(getTableColumns(table));
       expect(columns).not.toContain("body");
