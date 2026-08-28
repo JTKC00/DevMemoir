@@ -7,6 +7,7 @@ import { synchronizeRefHead } from "./sync.js";
 import { refreshInstallationInventory } from "./inventory.js";
 import { processHistoricalBackfill, resumeHistoricalAfterInventory } from "./historical.js";
 import { ensureInstallationApiAvailable, guardInstallationGithub } from "./durable-github.js";
+import { processRepositoryReconciliation } from "./reconciliation.js";
 
 export type QueueDependencies = {
   store: M1Store;
@@ -174,6 +175,10 @@ export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): 
   }
   if (kind.kind === "repository_backfill") {
     await processHistoricalBackfill(kind.payload as SyncJobPayload, { ...deps, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
+    return;
+  }
+  if (kind.kind === "repository_reconciliation") {
+    await processRepositoryReconciliation(kind.payload as SyncJobPayload, { ...deps, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);

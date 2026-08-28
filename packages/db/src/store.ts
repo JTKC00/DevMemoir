@@ -391,6 +391,8 @@ export interface M1Store {
   listActivity(tenantId: string, repositoryId?: string, query?: ActivityQuery): Promise<ActivityRecord[]>;
   reprojectRepository(input: { tenantId: string; repositoryId: string; ownerGithubAccountId: number; projectionVersion?: number; failureAfterEvents?: number }): Promise<ProjectionResult>;
   startHistoricalBackfill(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; now: Date }): Promise<HistoricalProgress>;
+  /** Atomically begin or resume one opaque full-reconciliation generation. */
+  startRepositoryReconciliation(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; reconciliationRunId: string; now: Date }): Promise<HistoricalProgress | undefined>;
   getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName?: string): Promise<HistoricalProgress | undefined>;
   listHistoricalProgress(tenantId: string, repositoryId: string): Promise<HistoricalProgress[]>;
   resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined>;
@@ -782,6 +784,34 @@ export class InMemoryM1Store implements M1Store {
     return { ...progress, cursor: { ...progress.cursor } };
   }
 
+  async startRepositoryReconciliation(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; reconciliationRunId: string; now: Date }): Promise<HistoricalProgress | undefined> {
+    if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
+    const existing = [...this.historicalProgress.values()].find((progress) => progress.tenantId === input.tenantId && progress.repositoryId === input.repositoryId && progress.cursor.reconciliationRunId === input.reconciliationRunId);
+    if (existing) {
+      const active = (await this.listHistoricalProgress(input.tenantId, input.repositoryId)).find((progress) => progress.status === "in_progress" || progress.status === "paused");
+      return active ?? await this.getHistoricalProgress(input.tenantId, input.repositoryId, "completed");
+    }
+    for (const [key, progress] of this.historicalProgress) {
+      if (progress.tenantId === input.tenantId && progress.repositoryId === input.repositoryId && progress.stage === "default_branch_commits") this.historicalProgress.delete(key);
+    }
+    for (const stage of HISTORICAL_STAGES) {
+      const refName = stage === "default_branch_commits" ? branchName(input.defaultBranch) : "";
+      const first = stage === "default_branch_commits";
+      this.historicalProgress.set(this.historicalKey(input.tenantId, input.repositoryId, stage, refName), {
+        tenantId: input.tenantId,
+        repositoryId: input.repositoryId,
+        stage,
+        refName,
+        status: first ? "in_progress" : "pending",
+        cursor: { nextPage: 1, reconciliationRunId: input.reconciliationRunId },
+        nextPage: 1,
+        ...(first ? { startedAt: input.now, observationStartedAt: input.now } : {}),
+        completenessState: "known_unknown",
+      });
+    }
+    return this.getHistoricalProgress(input.tenantId, input.repositoryId, "default_branch_commits", input.defaultBranch);
+  }
+
   async getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): Promise<HistoricalProgress | undefined> {
     const normalizedRef = stage === "default_branch_commits" ? branchName(refName) : refName;
     const progress = this.historicalProgress.get(this.historicalKey(tenantId, repositoryId, stage, normalizedRef));
@@ -798,6 +828,8 @@ export class InMemoryM1Store implements M1Store {
   async resetCommitTraversal(input: { tenantId: string; repositoryId: string; installationId: string; refName: string; anchorHeadSha: string; now: Date }): Promise<HistoricalProgress | undefined> {
     if (!this.historicalGate(input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
     const previousHead = await this.getBranchHead(input.tenantId, input.repositoryId, input.refName);
+    const currentProgress = this.historicalProgress.get(this.historicalKey(input.tenantId, input.repositoryId, "default_branch_commits", branchName(input.refName)));
+    const reconciliationRunId = typeof currentProgress?.cursor.reconciliationRunId === "string" ? currentProgress.cursor.reconciliationRunId : undefined;
     await this.markBranchCommitsUnreachable(input.tenantId, input.repositoryId, input.refName);
     const progress: HistoricalProgress = {
       tenantId: input.tenantId,
@@ -805,7 +837,7 @@ export class InMemoryM1Store implements M1Store {
       stage: "default_branch_commits",
       refName: branchName(input.refName),
       status: "in_progress",
-      cursor: { nextPage: 1, previousHead },
+      cursor: { nextPage: 1, previousHead, ...(reconciliationRunId ? { reconciliationRunId } : {}) },
       nextPage: 1,
       anchorHeadSha: input.anchorHeadSha,
       startedAt: input.now,
@@ -873,7 +905,8 @@ export class InMemoryM1Store implements M1Store {
         if (!previous || fact.updatedAt > previous.updatedAt) this.historicalReleases.set(factKey, { ...fact });
       }
     }
-    progress.cursor = input.stage === "default_branch_commits" ? { ...input.nextCursor, previousHead: progress.cursor.previousHead } : { ...input.nextCursor };
+    const reconciliationRunId = typeof progress.cursor.reconciliationRunId === "string" ? progress.cursor.reconciliationRunId : undefined;
+    progress.cursor = input.stage === "default_branch_commits" ? { ...input.nextCursor, previousHead: progress.cursor.previousHead, ...(reconciliationRunId ? { reconciliationRunId } : {}) } : { ...input.nextCursor, ...(reconciliationRunId ? { reconciliationRunId } : {}) };
     progress.nextPage = input.nextCursor.nextPage;
     progress.status = input.finalPage ? "completed" : "in_progress";
     progress.lastSuccessAt = input.observedAt;
@@ -888,6 +921,7 @@ export class InMemoryM1Store implements M1Store {
         nextProgress.status = next === "completed" ? "completed" : "in_progress";
         nextProgress.startedAt = input.observedAt;
         nextProgress.observationStartedAt = input.observedAt;
+        if (reconciliationRunId) nextProgress.cursor = { ...nextProgress.cursor, reconciliationRunId };
         if (next === "completed") {
           nextProgress.completedAt = input.observedAt;
           nextProgress.lastSuccessAt = input.observedAt;

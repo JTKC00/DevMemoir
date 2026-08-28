@@ -96,4 +96,20 @@ describeIntegration("M3 PostgreSQL historical page transactions", () => {
     await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "releases", expectedCursor: releaseFirst.progress.cursor, nextCursor: { nextPage: 3 }, observedAt: new Date("2026-01-01T00:22:00Z"), finalPage: false, facts: [{ ...release, name: "equal-clock stale release" }] });
     expect((await pool.query("select name from releases where tenant_id=$1 and repository_id=$2 and github_release_id=8001", [tenantId, repositoryId])).rows[0]).toMatchObject({ name: "new release" });
   });
+
+  it("persists and idempotently resumes an opaque reconciliation generation", async () => {
+    const runId = randomUUID();
+    const started = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runId, now: new Date("2026-01-02T00:00:00Z") });
+    expect(started?.cursor).toMatchObject({ nextPage: 1, reconciliationRunId: runId });
+    const traversal = await store.resetCommitTraversal({ tenantId, repositoryId, installationId, refName: "main", anchorHeadSha: "reconcile-head", now: new Date("2026-01-02T00:01:00Z") });
+    if (!traversal) throw new Error("reconciliation traversal missing");
+    expect(traversal.cursor.reconciliationRunId).toBe(runId);
+    await store.commitHistoricalPage({ tenantId, repositoryId, installationId, stage: "default_branch_commits", refName: "main", anchorHeadSha: "reconcile-head", expectedCursor: traversal.cursor, nextCursor: { nextPage: 2 }, observedAt: new Date("2026-01-02T00:02:00Z"), finalPage: false, facts: [] });
+
+    const replay = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: runId, now: new Date("2026-01-02T00:03:00Z") });
+    expect(replay?.cursor).toMatchObject({ nextPage: 2, reconciliationRunId: runId });
+    const nextRunId = randomUUID();
+    const next = await store.startRepositoryReconciliation({ tenantId, repositoryId, installationId, defaultBranch: "main", reconciliationRunId: nextRunId, now: new Date("2026-01-02T00:04:00Z") });
+    expect(next?.cursor).toMatchObject({ nextPage: 1, reconciliationRunId: nextRunId });
+  });
 });

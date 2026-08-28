@@ -666,6 +666,36 @@ export class PostgresM1Store implements M1Store {
     });
   }
 
+  async startRepositoryReconciliation(input: { tenantId: string; repositoryId: string; installationId: string; defaultBranch: string; reconciliationRunId: string; now: Date }): Promise<HistoricalProgress | undefined> {
+    return this.tenantQuery(input.tenantId, async (client) => {
+      if (!await this.historicalGate(client, input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [`m5:${input.tenantId}:${input.repositoryId}`]);
+      const existing = await client.query<Row>(
+        "select * from sync_cursors where tenant_id=$1 and repository_id=$2 and cursor->>'reconciliationRunId'=$3 order by case status when 'in_progress' then 0 when 'paused' then 1 when 'completed' then 2 else 3 end,case resource_type when 'completed' then 0 else 1 end,started_at nulls last limit 1",
+        [input.tenantId, input.repositoryId, input.reconciliationRunId],
+      );
+      if (existing.rows[0]) return historicalProgressFromRow(existing.rows[0]);
+
+      const defaultBranch = branchName(input.defaultBranch);
+      await client.query("delete from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='default_branch_commits' and ref_name<>$3", [input.tenantId, input.repositoryId, defaultBranch]);
+      for (const stage of HISTORICAL_STAGES) {
+        const refName = stage === "default_branch_commits" ? defaultBranch : "";
+        const first = stage === "default_branch_commits";
+        await client.query(
+          `insert into sync_cursors (id,tenant_id,repository_id,resource_type,ref_name,cursor,status,started_at,completed_at,paused_until,error_code,high_water_at,last_success_at,last_full_reconcile_at,head_sha,completeness_state,schema_version)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,null,null,null,null,null,null,null,'known_unknown',3)
+           on conflict (tenant_id,repository_id,resource_type,ref_name) do update set
+             cursor=excluded.cursor,status=excluded.status,started_at=excluded.started_at,completed_at=null,
+             paused_until=null,error_code=null,high_water_at=null,last_success_at=null,head_sha=null,
+             completeness_state='known_unknown',schema_version=3`,
+          [createId(), input.tenantId, input.repositoryId, stage, refName, { nextPage: 1, reconciliationRunId: input.reconciliationRunId }, first ? "in_progress" : "pending", first ? input.now : null],
+        );
+      }
+      const result = await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='default_branch_commits' and ref_name=$3", [input.tenantId, input.repositoryId, defaultBranch]);
+      return historicalProgressFromRow(result.rows[0]);
+    });
+  }
+
   async getHistoricalProgress(tenantId: string, repositoryId: string, stage: HistoricalStage, refName = ""): Promise<HistoricalProgress | undefined> {
     return this.tenantQuery(tenantId, async (client) => historicalProgressFromRow((await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4", [tenantId, repositoryId, stage, stage === "default_branch_commits" ? branchName(refName) : refName])).rows[0]));
   }
@@ -682,6 +712,9 @@ export class PostgresM1Store implements M1Store {
     return this.tenantQuery(input.tenantId, async (client) => {
       if (!await this.historicalGate(client, input.tenantId, input.repositoryId, input.installationId, input.now)) return undefined;
       await client.query("select pg_advisory_xact_lock(hashtext($1))", [`m3:${input.tenantId}:${input.repositoryId}:${refName}`]);
+      const cursorRow = await client.query<Row>("select cursor from sync_cursors where tenant_id=$1 and repository_id=$2 and resource_type='default_branch_commits' and ref_name=$3", [input.tenantId, input.repositoryId, refName]);
+      const currentCursor = cursorRow.rows[0]?.cursor && typeof cursorRow.rows[0].cursor === "object" ? cursorRow.rows[0].cursor as Record<string, unknown> : {};
+      const reconciliationRunId = typeof currentCursor.reconciliationRunId === "string" ? currentCursor.reconciliationRunId : undefined;
       const branch = await client.query<Row>("select id,head_sha from branches where tenant_id=$1 and repository_id=$2 and name=$3 for update", [input.tenantId, input.repositoryId, refName]);
       const previousHead = branch.rows[0]?.head_sha ? String(branch.rows[0].head_sha) : null;
       if (branch.rows[0]?.id) await client.query("update commit_refs set reachable=false where tenant_id=$1 and branch_id=$2", [input.tenantId, branch.rows[0].id]);
@@ -693,7 +726,7 @@ export class PostgresM1Store implements M1Store {
            completed_at=null,paused_until=null,error_code=null,high_water_at=null,last_success_at=null,
            completeness_state='known_unknown',schema_version=3
          returning *`,
-        [createId(), input.tenantId, input.repositoryId, refName, input.anchorHeadSha, { nextPage: 1, previousHead }, input.now],
+        [createId(), input.tenantId, input.repositoryId, refName, input.anchorHeadSha, { nextPage: 1, previousHead, ...(reconciliationRunId ? { reconciliationRunId } : {}) }, input.now],
       );
       return historicalProgressFromRow(result.rows[0]);
     });
@@ -794,7 +827,8 @@ export class PostgresM1Store implements M1Store {
         }
       }
 
-      const nextCursor = input.stage === "default_branch_commits" ? { ...input.nextCursor, previousHead: progress.cursor.previousHead } : input.nextCursor;
+      const reconciliationRunId = typeof progress.cursor.reconciliationRunId === "string" ? progress.cursor.reconciliationRunId : undefined;
+      const nextCursor = input.stage === "default_branch_commits" ? { ...input.nextCursor, previousHead: progress.cursor.previousHead, ...(reconciliationRunId ? { reconciliationRunId } : {}) } : { ...input.nextCursor, ...(reconciliationRunId ? { reconciliationRunId } : {}) };
       const completeness = input.finalPage && (input.stage === "default_branch_commits" || input.stage === "branches" || input.stage === "tags") ? "reachable_at_sync" : input.finalPage ? "observed" : "known_unknown";
       const updatedResult = await client.query<Row>(
         `update sync_cursors set cursor=$5,status=$6,last_success_at=$7,completed_at=$8,
@@ -807,9 +841,9 @@ export class PostgresM1Store implements M1Store {
       if (input.finalPage) {
         const next = nextHistoricalStage(input.stage);
         await client.query(
-          `update sync_cursors set status=$5::varchar,started_at=coalesce(started_at,$6),completed_at=case when $5::varchar='completed' then $6 else completed_at end,last_success_at=case when $5::varchar='completed' then $6 else last_success_at end,completeness_state=case when $5::varchar='completed' then 'observed' else completeness_state end
+          `update sync_cursors set status=$5::varchar,started_at=coalesce(started_at,$6),completed_at=case when $5::varchar='completed' then $6 else completed_at end,last_success_at=case when $5::varchar='completed' then $6 else last_success_at end,last_full_reconcile_at=case when $5::varchar='completed' and $7::text is not null then $6 else last_full_reconcile_at end,completeness_state=case when $5::varchar='completed' then 'observed' else completeness_state end,cursor=case when $7::text is null then cursor else cursor || jsonb_build_object('reconciliationRunId',$7::text) end
            where tenant_id=$1 and repository_id=$2 and resource_type=$3 and ref_name=$4`,
-          [input.tenantId, input.repositoryId, next, "", next === "completed" ? "completed" : "in_progress", input.observedAt],
+          [input.tenantId, input.repositoryId, next, "", next === "completed" ? "completed" : "in_progress", input.observedAt, reconciliationRunId ?? null],
         );
       }
       return { applied: true, progress: updated };

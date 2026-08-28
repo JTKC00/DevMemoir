@@ -1,8 +1,8 @@
 import PgBoss from "pg-boss";
 import type { DeliveryState } from "@devmemoir/domain";
 
-export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory";
-export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory"];
+export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation"];
 
 export type SyncJobPayload = {
   kind?: JobKind;
@@ -28,6 +28,8 @@ export type SyncJobPayload = {
   page?: number;
   anchorHeadSha?: string;
   observationStartedAt?: string;
+  /** Opaque M5 reconciliation generation; never derived from repository content. */
+  reconciliationRunId?: string;
 };
 
 export type QueueJob<T = unknown> = {
@@ -182,6 +184,11 @@ export function historicalBackfillLogicalKey(
 
 export function installationInventoryLogicalKey(installationGithubId: number, operationId: string): string {
   return `inventory:${installationGithubId}:${operationId}`;
+}
+
+export function repositoryReconciliationLogicalKey(repositoryId: string, reconciliationRunId: string, stage = "coordinator", page?: number): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(reconciliationRunId)) throw new Error("Invalid opaque reconciliation run id");
+  return `reconcile:${repositoryId}:${reconciliationRunId}:${stage}${page === undefined ? "" : `:page:${page}`}`;
 }
 
 export function isRetryableDeliveryState(state: DeliveryState): boolean {
