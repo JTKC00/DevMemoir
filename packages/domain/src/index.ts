@@ -1,4 +1,4 @@
-import { v7 as uuidv7 } from "uuid";
+import { v5 as uuidv5, v7 as uuidv7 } from "uuid";
 import { z } from "zod";
 import { createCipheriv, createHash, createDecipheriv, randomBytes } from "node:crypto";
 
@@ -268,6 +268,31 @@ export function actorKindFromGithub(actor: {
 
 export function createId(): string {
   return uuidv7();
+}
+
+export const MAINTENANCE_TASKS = ["active_reconciliation", "authorized_reconciliation", "delivery_audit"] as const;
+export type MaintenanceTask = (typeof MAINTENANCE_TASKS)[number];
+export const MAINTENANCE_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_NAMESPACE = "3c0b1d0e-5f7a-4c2b-9e8d-1a2b3c4d5e6f";
+
+export function maintenanceSixHourBucket(now: Date): string {
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(now.getUTCDate()).padStart(2, "0");
+  const hour = String(Math.floor(now.getUTCHours() / 6) * 6).padStart(2, "0");
+  return `${year}${month}${day}T${hour}`;
+}
+
+export function maintenanceDayBucket(now: Date): string {
+  return now.toISOString().slice(0, 10);
+}
+
+export function maintenanceWindowBucket(task: MaintenanceTask, now: Date): string {
+  return task === "authorized_reconciliation" ? maintenanceDayBucket(now) : maintenanceSixHourBucket(now);
+}
+
+export function maintenanceReconciliationRunId(task: Exclude<MaintenanceTask, "delivery_audit">, repositoryId: string, now: Date): string {
+  return uuidv5(`${task}:${repositoryId}:${maintenanceWindowBucket(task, now)}`, MAINTENANCE_NAMESPACE);
 }
 
 export function truncatePrivateText(value: string | undefined, limit = 4000): string | undefined {

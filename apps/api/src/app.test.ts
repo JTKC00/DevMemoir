@@ -39,6 +39,8 @@ class NullEnqueueJobPort implements JobPort {
 
   async start(): Promise<void> { return this.delegate.start(); }
   async stop(): Promise<void> { return this.delegate.stop(); }
+  async schedule(name: JobKind, cron: string, payload: object, options?: { tz?: string }): Promise<void> { return this.delegate.schedule(name, cron, payload, options); }
+  async getSchedules(): Promise<Array<{ name: string; cron: string }>> { return this.delegate.getSchedules(); }
   async enqueue<T>(_kind: JobKind, _logicalKey: string, _payload: T): Promise<string | undefined> { return undefined; }
   async work<T extends object>(kind: JobKind, handler: (job: { id: string; kind: JobKind; logicalKey: string; payload: T }) => Promise<void>): Promise<void> { return this.delegate.work(kind, handler); }
   async has(jobId: string, kind: JobKind): Promise<boolean> { return this.delegate.has(jobId, kind); }

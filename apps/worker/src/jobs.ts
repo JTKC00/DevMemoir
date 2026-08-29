@@ -9,6 +9,7 @@ import { processHistoricalBackfill, resumeHistoricalAfterInventory } from "./his
 import { ensureInstallationApiAvailable, guardInstallationGithub } from "./durable-github.js";
 import { processRepositoryReconciliation } from "./reconciliation.js";
 import { processGithubDeliveryAudit } from "./delivery-audit.js";
+import { processMaintenanceTick } from "./maintenance.js";
 
 export type QueueDependencies = {
   store: M1Store;
@@ -186,6 +187,10 @@ export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): 
   if (kind.kind === "github_delivery_audit") {
     if (!deps.githubApp) throw new Error("App-JWT GitHub client is required for delivery audit");
     await processGithubDeliveryAudit(kind.payload as SyncJobPayload, { store: deps.store, jobs: deps.jobs, githubApp: deps.githubApp, logger: deps.logger, ...(deps.now ? { now: deps.now } : {}) });
+    return;
+  }
+  if (kind.kind === "maintenance_active" || kind.kind === "maintenance_authorized" || kind.kind === "maintenance_audit") {
+    await processMaintenanceTick(kind.payload as SyncJobPayload, deps, kind.id);
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);

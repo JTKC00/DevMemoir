@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
 import { emptyInventoryReconcileResult, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
@@ -14,6 +14,8 @@ import type {
   InventoryReconcileResult,
   InstallationRecord,
   InstallationLifecycleStatus,
+  MaintenanceTarget,
+  MaintenanceWindow,
   HistoricalActor,
   HistoricalCursor,
   HistoricalPageCommit,
@@ -439,6 +441,22 @@ export class PostgresM1Store implements M1Store {
       const result = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select ra.installation_id,ra.access_status,ra.selected,ra.revoked_at from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.repository_id=r.id and ra.tenant_id=r.tenant_id and gi.status='active' and ra.selected=true and ra.access_status='accessible' order by ra.selected_at desc limit 1) ra on true where r.tenant_id=$1 order by r.created_at asc", [tenantId]);
       return result.rows.map((row) => repositoryFromRow(row)).filter((row): row is RepositoryRecord => Boolean(row));
     });
+  }
+
+  async listMaintenanceTargets(input?: { activeSince?: Date }): Promise<MaintenanceTarget[]> {
+    const routes = await this.pool.query<Row>("select tenant_id, github_installation_id from installation_routes");
+    const targets: MaintenanceTarget[] = [];
+    for (const route of routes.rows) {
+      const installation = await this.getInstallation(Number(route.github_installation_id));
+      if (!installation || (installation.status && installation.status !== "active")) continue;
+      const repositories = await this.listRepositories(String(route.tenant_id));
+      for (const repository of repositories) {
+        const recent = repository.githubPushedAt ?? repository.lastAuthoritativeObservedAt ?? repository.lastSeenAt;
+        if (input?.activeSince && recent && recent < input.activeSince) continue;
+        targets.push({ tenantId: repository.tenantId, repositoryId: repository.id, installationGithubId: installation.githubInstallationId });
+      }
+    }
+    return targets;
   }
 
   async listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]> {
@@ -1339,5 +1357,41 @@ export class PostgresM1Store implements M1Store {
   async markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
     const result = await this.pool.query<Row>("update github_delivery_repairs set status=$2,sanitized_error_code=coalesce($3,sanitized_error_code),updated_at=$4 where github_delivery_guid=$1 returning *", [input.guid, input.status, input.errorCode ?? null, input.now]);
     return repairFromRow(result.rows[0]);
+  }
+
+  async claimMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobKind: string; jobId: string; now: Date }): Promise<boolean> {
+    const inserted = await this.pool.query<Row>(
+      "insert into maintenance_windows (task,bucket,job_kind,accepted_job_id,accepted_at,updated_at) values ($1,$2,$3,$4,$5,$5) on conflict (task, bucket) do nothing returning task",
+      [input.task, input.bucket, input.jobKind, input.jobId, input.now],
+    );
+    if (inserted.rows[0]) return true;
+    const existing = await this.getMaintenanceWindow(input.task, input.bucket);
+    if (existing?.completedAt) return false;
+    return existing?.acceptedJobId === input.jobId;
+  }
+
+  async completeMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobId: string; now: Date }): Promise<void> {
+    await this.pool.query("update maintenance_windows set completed_at=$3,updated_at=$3 where task=$1 and bucket=$2 and accepted_job_id=$4 and completed_at is null", [input.task, input.bucket, input.now, input.jobId]);
+  }
+
+  async recordMaintenanceWindowError(input: { task: MaintenanceTask; bucket: string; jobId: string; errorCode: string; now: Date }): Promise<void> {
+    await this.pool.query("update maintenance_windows set last_error_code=$3,updated_at=$4 where task=$1 and bucket=$2 and accepted_job_id=$5", [input.task, input.bucket, input.errorCode, input.now, input.jobId]);
+  }
+
+  async getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined> {
+    const result = await this.pool.query<Row>("select task,bucket,job_kind,accepted_job_id,accepted_at,completed_at,last_error_code,updated_at from maintenance_windows where task=$1 and bucket=$2", [task, bucket]);
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const completedAt = date(row.completed_at);
+    return {
+      task: String(row.task) as MaintenanceTask,
+      bucket: String(row.bucket),
+      jobKind: String(row.job_kind),
+      acceptedJobId: String(row.accepted_job_id),
+      acceptedAt: date(row.accepted_at) ?? new Date(0),
+      updatedAt: date(row.updated_at) ?? new Date(0),
+      ...(completedAt ? { completedAt } : {}),
+      ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}),
+    };
   }
 }

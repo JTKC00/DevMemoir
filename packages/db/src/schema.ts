@@ -446,6 +446,17 @@ export const githubDeliveryAudits = pgTable("github_delivery_audits", {
   uniqueIndex("github_delivery_audits_run_unique").on(table.githubAppId, table.currentRunId),
 ]);
 
+export const maintenanceWindows = pgTable("maintenance_windows", {
+  task: varchar("task", { length: 40 }).notNull(),
+  bucket: varchar("bucket", { length: 16 }).notNull(),
+  jobKind: varchar("job_kind", { length: 40 }).notNull(),
+  acceptedJobId: varchar("accepted_job_id", { length: 64 }).notNull(),
+  acceptedAt: time("accepted_at"),
+  completedAt: nullableTime("completed_at"),
+  lastErrorCode: varchar("last_error_code", { length: 120 }),
+  updatedAt: time("updated_at"),
+}, (table) => [primaryKey({ columns: [table.task, table.bucket] })]);
+
 export const githubDeliveryRepairs = pgTable("github_delivery_repairs", {
   id: id(),
   githubDeliveryGuid: varchar("github_delivery_guid", { length: 128 }).notNull(),
@@ -509,6 +520,7 @@ export const schema = {
   reconciliationGenerations,
   githubDeliveryAudits,
   githubDeliveryRepairs,
+  maintenanceWindows,
   outbox,
 };
 

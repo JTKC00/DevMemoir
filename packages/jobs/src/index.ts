@@ -1,8 +1,16 @@
 import PgBoss from "pg-boss";
-import type { DeliveryState } from "@devmemoir/domain";
+import type { DeliveryState, MaintenanceTask } from "@devmemoir/domain";
 
-export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit";
-export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit"];
+export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit" | "maintenance_active" | "maintenance_authorized" | "maintenance_audit";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit", "maintenance_active", "maintenance_authorized", "maintenance_audit"];
+export const MAINTENANCE_JOB_KINDS = ["maintenance_active", "maintenance_authorized", "maintenance_audit"] as const;
+export type MaintenanceJobKind = (typeof MAINTENANCE_JOB_KINDS)[number];
+
+export const MAINTENANCE_SCHEDULES: ReadonlyArray<{ kind: MaintenanceJobKind; cron: string; task: MaintenanceTask }> = [
+  { kind: "maintenance_active", cron: "0 */6 * * *", task: "active_reconciliation" },
+  { kind: "maintenance_authorized", cron: "0 0 * * *", task: "authorized_reconciliation" },
+  { kind: "maintenance_audit", cron: "30 */6 * * *", task: "delivery_audit" },
+];
 
 export type SyncJobPayload = {
   kind?: JobKind;
@@ -35,6 +43,7 @@ export type SyncJobPayload = {
   auditRunId?: string;
   cursor?: string;
   githubDeliveryId?: number;
+  maintenanceTask?: MaintenanceTask;
 };
 
 export type QueueJob<T = unknown> = {
@@ -44,9 +53,13 @@ export type QueueJob<T = unknown> = {
   payload: T;
 };
 
+export type JobSchedule = { name: string; cron: string };
+
 export interface JobPort {
   start(): Promise<void>;
   stop(): Promise<void>;
+  schedule(name: JobKind, cron: string, payload: object, options?: { tz?: string }): Promise<void>;
+  getSchedules(): Promise<JobSchedule[]>;
   /**
    * Returns a real pg-boss job UUID when this process accepted the enqueue.
    * `undefined` means another process already owns the durable singleton key;
@@ -62,15 +75,24 @@ export interface JobPort {
 
 export class InMemoryJobPort implements JobPort {
   readonly jobs = new Map<string, QueueJob>();
+  readonly schedules = new Map<string, JobSchedule>();
+  readonly schedulePayloads = new Map<string, object>();
   private sequence = 0;
 
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
+  async schedule(name: JobKind, cron: string, payload: object, _options?: { tz?: string }): Promise<void> {
+    this.schedules.set(name, { name, cron });
+    this.schedulePayloads.set(name, payload);
+  }
+  async getSchedules(): Promise<JobSchedule[]> {
+    return [...this.schedules.values()].map((schedule) => ({ ...schedule }));
+  }
   async work<T extends object>(_kind: JobKind, _handler: (job: QueueJob<T>) => Promise<void>): Promise<void> {}
   async has(jobId: string, kind: JobKind): Promise<boolean> { return this.jobs.get(jobId)?.kind === kind; }
 
-  async enqueue<T>(kind: JobKind, logicalKey: string, payload: T): Promise<string> {
-    const existing = [...this.jobs.values()].find((job) => job.logicalKey === logicalKey);
+  async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, _options?: { startAfter?: Date }): Promise<string> {
+    const existing = [...this.jobs.values()].find((job) => job.kind === kind && job.logicalKey === logicalKey);
     if (existing) return existing.id;
     const id = `job-${++this.sequence}`;
     this.jobs.set(id, { id, kind, logicalKey, payload });
@@ -102,6 +124,15 @@ export class PgBossJobPort implements JobPort {
 
   async stop(): Promise<void> {
     await this.boss.stop({ graceful: true, timeout: 30_000 });
+  }
+
+  async schedule(name: JobKind, cron: string, payload: object, options?: { tz?: string }): Promise<void> {
+    await this.boss.schedule(name, cron, payload, { tz: options?.tz ?? "UTC", singletonKey: name });
+  }
+
+  async getSchedules(): Promise<JobSchedule[]> {
+    const rows = await this.boss.getSchedules();
+    return rows.map((row) => ({ name: row.name, cron: row.cron }));
   }
 
   async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string | undefined> {
@@ -219,4 +250,9 @@ export function deliveryRepairWakeLogicalKey(githubAppId: number, deliveryGuid: 
   if (!Number.isInteger(githubAppId) || githubAppId <= 0) throw new Error("Invalid opaque GitHub App id");
   if (!OPAQUE_DELIVERY_GUID.test(deliveryGuid)) throw new Error("Invalid opaque GitHub delivery GUID");
   return `delivery-audit:${githubAppId}:repair:${deliveryGuid}:wake:${resumeAt.getTime()}`;
+}
+
+export function maintenanceTickLogicalKey(kind: MaintenanceJobKind, bucket: string): string {
+  if (!/^\d{8}T\d{2}$|^\d{4}-\d{2}-\d{2}$/.test(bucket)) throw new Error("Invalid opaque maintenance bucket");
+  return `maintenance:${kind}:${bucket}`;
 }
