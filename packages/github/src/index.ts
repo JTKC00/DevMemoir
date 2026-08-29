@@ -371,6 +371,16 @@ export class GithubAccessError extends Error {
   }
 }
 
+export class GithubTransientError extends Error {
+  constructor(readonly status: number) {
+    super("GitHub request failed");
+    this.name = "GithubTransientError";
+  }
+  toJSON(): { class: string; status: number } {
+    return { class: this.name, status: this.status };
+  }
+}
+
 function pauseFromMetadata(input: { status?: number | undefined; headers?: GithubResponseHeaders | undefined; message?: string | undefined }, now: number): GithubRateLimitPauseError | undefined {
   const retryAt = retryAfterResumeAt(headerValue(input.headers, "retry-after"), now);
   const remaining = Number(headerValue(input.headers, "x-ratelimit-remaining"));
@@ -385,16 +395,16 @@ function pauseFromMetadata(input: { status?: number | undefined; headers?: Githu
 }
 
 function classifyRequestError(error: unknown, now: number): Error {
-  if (error instanceof GithubRateLimitPauseError || error instanceof GithubAccessError) return error;
+  if (error instanceof GithubRateLimitPauseError || error instanceof GithubAccessError || error instanceof GithubTransientError) return error;
   const status = errorStatus(error);
   const pause = pauseFromMetadata({ status, headers: errorHeaders(error), message: errorMessage(error) }, now);
   if (pause) return pause;
   if (status === 401) return new GithubAccessError("unauthorized", status);
   if (status === 403) return new GithubAccessError("forbidden", status);
-  if (status === 404) return new GithubAccessError("not_found", status);
+  if (status === 404 || status === 410) return new GithubAccessError("not_found", status);
   // Never let an upstream response message cross the client boundary: GitHub
   // errors can echo repository names, paths, or content supplied by fixtures.
-  return new Error("GitHub installation request failed");
+  return new GithubTransientError(status ?? 0);
 }
 
 type LaneTask = { installationId: number; request: () => Promise<GithubRequestResponse>; resolve: (response: GithubRequestResponse) => void; reject: (error: unknown) => void; persistRateLimit: boolean };

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryM1Store } from "@devmemoir/db";
-import { GithubRateLimitPauseError, type AppWebhookDelivery, type GithubAppClient, type GithubClient } from "@devmemoir/github";
+import { GithubRateLimitPauseError, GithubTransientError, type AppWebhookDelivery, type GithubAppClient, type GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
-import { enqueueGithubDeliveryAudit, processGithubDeliveryAudit, type DeliveryAuditDependencies } from "./delivery-audit.js";
+import { enqueueGithubDeliveryAudit, processGithubDeliveryAudit, resumeGithubDeliveryRepairs, type DeliveryAuditDependencies } from "./delivery-audit.js";
 import { processQueueJob } from "./jobs.js";
 import { processDelivery } from "./processor.js";
 import { emptyHistoricalGithubMethods } from "./test-github.js";
@@ -42,7 +42,7 @@ function failedDelivery(overrides: Partial<AppWebhookDelivery> = {}): AppWebhook
   };
 }
 
-function appClient(input: { deliveries?: AppWebhookDelivery[]; nextCursor?: string; onList?: () => void; onRedeliver?: (id: number) => void; listError?: Error }): GithubAppClient & { redelivered: number[]; listed: number } {
+function appClient(input: { deliveries?: AppWebhookDelivery[]; nextCursor?: string; onList?: () => void; onRedeliver?: (id: number) => void; listError?: Error; redeliverErrors?: Error[] }): GithubAppClient & { redelivered: number[]; listed: number } {
   const client = {
     redelivered: [] as number[],
     listed: 0,
@@ -53,6 +53,8 @@ function appClient(input: { deliveries?: AppWebhookDelivery[]; nextCursor?: stri
       return { deliveries: input.deliveries ?? [failedDelivery()], ...(input.nextCursor ? { nextCursor: input.nextCursor } : {}) };
     },
     redeliverAppWebhookDelivery: async (id: number) => {
+      const nextError = input.redeliverErrors?.shift();
+      if (nextError) throw nextError;
       input.onRedeliver?.(id);
       client.redelivered.push(id);
     },
@@ -257,5 +259,101 @@ describe("M5.2 GitHub App failed-delivery audit", () => {
       expect(job.payload).not.toHaveProperty("repo");
       expect(job.payload).not.toHaveProperty("title");
     }
+  });
+
+  it("recovers a crash after durable claim and before GitHub POST", async () => {
+    const app = appClient({ redeliverErrors: [new Error("injected_worker_crash")] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await expect(processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps)).rejects.toThrow("injected_worker_crash");
+    expect(app.redelivered).toEqual([]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("requesting");
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(0);
+
+    const recoveredNow = () => new Date("2026-08-29T12:01:00Z");
+    const replacement: DeliveryAuditDependencies = { store: scope.store, jobs: new InMemoryJobPort(), githubApp: app, logger: createLogger(scope.capture.sink), now: recoveredNow };
+    await resumeGithubDeliveryRepairs(githubAppId, replacement);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, replacement);
+    expect(app.redelivered).toEqual([99]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("requested");
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(1);
+    expect(scope.store.deliveries.size).toBe(0);
+    expect(scope.store.commits.size).toBe(0);
+  });
+
+  it("keeps a GUID retry after a redelivery POST rate limit before accepted cooldown", async () => {
+    const resumeAt = new Date("2026-08-29T12:01:00Z");
+    const app = appClient({ redeliverErrors: [new GithubRateLimitPauseError("secondary_rate_limit", 403, resumeAt)] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    expect(app.redelivered).toEqual([]);
+    const repair = await scope.store.getGithubDeliveryRepair(guid);
+    expect(repair?.status).toBe("requesting");
+    expect(repair?.attemptCount).toBe(0);
+    expect(repair?.nextEligibleAt).toEqual(resumeAt);
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.status).toBe("paused");
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.highWaterDeliveredAt).toBeUndefined();
+
+    const replacement: DeliveryAuditDependencies = { ...scope.deps, now: () => resumeAt };
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, replacement);
+    expect(app.redelivered).toEqual([99]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("requested");
+  });
+
+  it("sanitizes a transient 5xx redelivery POST and retries later", async () => {
+    const app = appClient({ redeliverErrors: [new GithubTransientError(500)] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    expect(app.redelivered).toEqual([]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("requesting");
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(0);
+    expect(scope.capture.text()).not.toMatch(/PRIVATE|payload|ghp_/);
+    expect(JSON.stringify((await scope.store.getGithubDeliveryRepair(guid))?.sanitizedErrorCode)).not.toMatch(/PRIVATE|ghp_/);
+
+    const replacement: DeliveryAuditDependencies = { ...scope.deps, now: () => new Date("2026-08-29T12:01:00Z") };
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, replacement);
+    expect(app.redelivered).toEqual([99]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(1);
+  });
+
+  it("retries after a transport failure with no GitHub status", async () => {
+    const app = appClient({ redeliverErrors: [new GithubTransientError(0)] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("requesting");
+    const replacement: DeliveryAuditDependencies = { ...scope.deps, now: () => new Date("2026-08-29T12:01:00Z") };
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, replacement);
+    expect(app.redelivered).toEqual([99]);
+  });
+
+  it("records accepted redelivery metadata and still resumes the same GUID locally", async () => {
+    const app = appClient({});
+    const scope = await setup(app);
+    const first = await scope.store.insertDelivery({ tenantId, guid, eventName: "push", installationGithubId, payloadExpiresAt: new Date("2026-09-05T00:00:00Z"), now: now() });
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    const repair = await scope.store.getGithubDeliveryRepair(guid);
+    expect(repair?.status).toBe("requested");
+    expect(repair?.attemptCount).toBe(1);
+    expect(repair?.lastRedeliveryRequestedAt).toEqual(now());
+    const resumed = await scope.store.insertDelivery({ tenantId, guid, eventName: "push", installationGithubId, payloadExpiresAt: new Date("2026-09-05T00:00:00Z"), now: new Date("2026-08-29T12:01:00Z") });
+    expect(resumed.created).toBe(false);
+    expect(resumed.record.id).toBe(first.record.id);
+  });
+
+  it("re-checks terminal local state on a recovered retry and does not POST", async () => {
+    const app = appClient({ redeliverErrors: [new Error("injected_worker_crash")] });
+    const scope = await setup(app);
+    const delivery = await scope.store.insertDelivery({ tenantId, guid, eventName: "push", installationGithubId, payloadExpiresAt: new Date("2026-09-05T00:00:00Z"), now: now() });
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await expect(processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps)).rejects.toThrow("injected_worker_crash");
+    await scope.store.updateDelivery(delivery.record.id, { state: "processed" }, tenantId);
+    const replacement: DeliveryAuditDependencies = { ...scope.deps, now: () => new Date("2026-08-29T12:01:00Z") };
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, replacement);
+    expect(app.redelivered).toEqual([]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("skipped_terminal");
   });
 });

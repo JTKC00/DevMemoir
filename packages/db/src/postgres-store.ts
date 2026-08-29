@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
 import { emptyInventoryReconcileResult, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
@@ -1240,7 +1240,7 @@ export class PostgresM1Store implements M1Store {
         await client.query("commit");
         return existing;
       }
-      const status = githubDeliveryAttemptSucceeded(input.statusCode) ? "healthy" : "pending";
+      const status = githubDeliveryAttemptSucceeded(input.statusCode) ? "healthy" : existing?.status === "requesting" ? "requesting" : "pending";
       const saved = repairFromRow((await client.query<Row>(
         `insert into github_delivery_repairs (id,github_delivery_guid,github_delivery_id,github_app_id,audit_run_id,event_name,action,installation_github_id,repository_github_id,status,attempt_count,last_redelivery_requested_at,next_eligible_at,last_github_status_code,last_github_delivered_at,sanitized_error_code,created_at,updated_at)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
@@ -1287,8 +1287,7 @@ export class PostgresM1Store implements M1Store {
       if (localDelivery?.state === "processing") return deny("processing", "skipped_processing");
       if (repair.attemptCount >= input.maxAttempts) return deny("exhausted", "exhausted");
       if (repair.nextEligibleAt && repair.nextEligibleAt > input.now) return deny("cooldown");
-      const nextEligibleAt = nextRedeliveryEligibleAt(repair.attemptCount + 1, input.now);
-      const saved = repairFromRow((await client.query<Row>("update github_delivery_repairs set status='requested',github_delivery_id=$2,attempt_count=attempt_count+1,last_redelivery_requested_at=$3,next_eligible_at=$4,updated_at=$3 where github_delivery_guid=$1 returning *", [input.guid, input.githubDeliveryId, input.now, nextEligibleAt])).rows[0]);
+      const saved = repairFromRow((await client.query<Row>("update github_delivery_repairs set status='requesting',github_delivery_id=$2,next_eligible_at=$3,updated_at=$4 where github_delivery_guid=$1 returning *", [input.guid, input.githubDeliveryId, nextRedeliveryClaimLeaseAt(input.now), input.now])).rows[0]);
       await client.query("commit");
       if (!saved) throw new Error("Delivery repair claim failed");
       return { allowed: true, reason: "claimed", repair: saved, ...(localDelivery ? { localDelivery } : {}) };
@@ -1298,6 +1297,41 @@ export class PostgresM1Store implements M1Store {
     } finally {
       client.release();
     }
+  }
+
+  async acceptGithubDeliveryRedelivery(input: { guid: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const existing = repairFromRow((await client.query<Row>("select * from github_delivery_repairs where github_delivery_guid=$1 for update", [input.guid])).rows[0]);
+      if (!existing) {
+        await client.query("commit");
+        return undefined;
+      }
+      if (existing.status === "requested" && existing.lastRedeliveryRequestedAt) {
+        await client.query("commit");
+        return existing;
+      }
+      const attemptCount = existing.attemptCount + 1;
+      const saved = repairFromRow((await client.query<Row>("update github_delivery_repairs set status='requested',attempt_count=$2,last_redelivery_requested_at=$3,next_eligible_at=$4,updated_at=$3 where github_delivery_guid=$1 returning *", [input.guid, attemptCount, input.now, nextRedeliveryEligibleAt(attemptCount, input.now)])).rows[0]);
+      await client.query("commit");
+      return saved;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async deferGithubDeliveryRedelivery(input: { guid: string; resumeAt: Date; errorCode: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const result = await this.pool.query<Row>("update github_delivery_repairs set status='requesting',next_eligible_at=$2,sanitized_error_code=$3,updated_at=$4 where github_delivery_guid=$1 returning *", [input.guid, input.resumeAt, input.errorCode, input.now]);
+    return repairFromRow(result.rows[0]);
+  }
+
+  async listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]> {
+    const result = await this.pool.query<Row>("select * from github_delivery_repairs where github_app_id=$1 and status in ('pending','requesting','requested')", [githubAppId]);
+    return result.rows.map((row) => repairFromRow(row)).filter((row): row is GithubDeliveryRepair => Boolean(row));
   }
 
   async markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {

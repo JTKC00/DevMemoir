@@ -1,6 +1,6 @@
-import { createId, GITHUB_REDELIVERY_MAX_ATTEMPTS, githubDeliveryAttemptSucceeded, isRepairableWebhookEvent, nextRedeliveryEligibleAt } from "@devmemoir/domain";
+import { createId, GITHUB_REDELIVERY_CLAIM_LEASE_MS, GITHUB_REDELIVERY_MAX_ATTEMPTS, githubDeliveryAttemptSucceeded, isRepairableWebhookEvent, nextRedeliveryEligibleAt } from "@devmemoir/domain";
 import type { M1Store } from "@devmemoir/db";
-import { GithubAccessError, GithubRateLimitPauseError, type GithubAppClient } from "@devmemoir/github";
+import { GithubAccessError, GithubRateLimitPauseError, GithubTransientError, type GithubAppClient } from "@devmemoir/github";
 import { deliveryAuditLogicalKey, deliveryAuditWakeLogicalKey, deliveryRepairWakeLogicalKey, type JobPort, type SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 
@@ -23,6 +23,15 @@ async function ensureAuditAvailable(audit: NonNullable<Awaited<ReturnType<M1Stor
   }
 }
 
+async function enqueueRepairWake(input: { githubAppId: number; auditRunId: string; deliveryGuid: string; githubDeliveryId: number; resumeAt: Date }, deps: DeliveryAuditDependencies): Promise<void> {
+  await deps.jobs.enqueue(
+    "github_delivery_audit",
+    deliveryRepairWakeLogicalKey(input.githubAppId, input.deliveryGuid, input.resumeAt),
+    { kind: "github_delivery_audit", githubAppId: input.githubAppId, auditRunId: input.auditRunId, deliveryGuid: input.deliveryGuid, githubDeliveryId: input.githubDeliveryId },
+    { startAfter: input.resumeAt },
+  );
+}
+
 export async function enqueueGithubDeliveryAudit(
   input: { githubAppId: number; auditRunId?: string },
   deps: DeliveryAuditDependencies,
@@ -41,6 +50,24 @@ export async function enqueueGithubDeliveryAudit(
     : deliveryAuditLogicalKey(audit.githubAppId, audit.currentRunId, audit.pageNumber);
   await deps.jobs.enqueue("github_delivery_audit", logicalKey, payload, startAfter ? { startAfter } : undefined);
   return audit.currentRunId;
+}
+
+export async function resumeGithubDeliveryRepairs(githubAppId: number, deps: DeliveryAuditDependencies): Promise<number> {
+  const now = currentTime(deps);
+  const repairs = await deps.store.listRecoverableGithubDeliveryRepairs(githubAppId);
+  let enqueued = 0;
+  for (const repair of repairs) {
+    const resumeAt = repair.nextEligibleAt && repair.nextEligibleAt > now ? repair.nextEligibleAt : now;
+    await enqueueRepairWake({
+      githubAppId: repair.githubAppId,
+      auditRunId: repair.auditRunId ?? createId(),
+      deliveryGuid: repair.githubDeliveryGuid,
+      githubDeliveryId: repair.githubDeliveryId,
+      resumeAt,
+    }, deps);
+    enqueued += 1;
+  }
+  return enqueued;
 }
 
 async function pauseAndWake(payload: SyncJobPayload, error: GithubRateLimitPauseError, deps: DeliveryAuditDependencies): Promise<void> {
@@ -71,6 +98,14 @@ async function requestRedelivery(guid: string, githubDeliveryId: number, auditRu
     deps.logger.info({ delivery_guid: guid, audit_run_id: auditRunId, state: claim.repair.status, result: claim.reason, attempt: claim.repair.attemptCount });
     return "skipped";
   }
+  const leaseAt = claim.repair.nextEligibleAt ?? new Date(now.getTime() + GITHUB_REDELIVERY_CLAIM_LEASE_MS);
+  await enqueueRepairWake({
+    githubAppId: claim.repair.githubAppId,
+    auditRunId,
+    deliveryGuid: guid,
+    githubDeliveryId,
+    resumeAt: leaseAt,
+  }, deps);
   try {
     await deps.githubApp.redeliverAppWebhookDelivery(githubDeliveryId);
   } catch (error) {
@@ -79,16 +114,25 @@ async function requestRedelivery(guid: string, githubDeliveryId: number, auditRu
       deps.logger.warn({ delivery_guid: guid, audit_run_id: auditRunId, state: "expired", error_code: `github_${error.code}` });
       return "skipped";
     }
+    if (error instanceof GithubRateLimitPauseError) {
+      await deps.store.deferGithubDeliveryRedelivery({ guid, resumeAt: error.resumeAt, errorCode: `github_${error.code}`, now });
+      await enqueueRepairWake({ githubAppId: claim.repair.githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId, resumeAt: error.resumeAt }, deps);
+      deps.logger.warn({ delivery_guid: guid, audit_run_id: auditRunId, state: "requesting", error_code: `github_${error.code}`, rate_limit_bucket: error.code, retry_at: error.resumeAt.toISOString() });
+      throw error;
+    }
+    if (error instanceof GithubTransientError) {
+      const resumeAt = new Date(now.getTime() + GITHUB_REDELIVERY_CLAIM_LEASE_MS);
+      await deps.store.deferGithubDeliveryRedelivery({ guid, resumeAt, errorCode: "github_transient", now });
+      await enqueueRepairWake({ githubAppId: claim.repair.githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId, resumeAt }, deps);
+      deps.logger.warn({ delivery_guid: guid, audit_run_id: auditRunId, state: "requesting", error_code: "github_transient", retry_at: resumeAt.toISOString() });
+      return "skipped";
+    }
     throw error;
   }
-  const retryAt = claim.repair.nextEligibleAt ?? nextRedeliveryEligibleAt(claim.repair.attemptCount, now);
-  await deps.jobs.enqueue(
-    "github_delivery_audit",
-    deliveryRepairWakeLogicalKey(claim.repair.githubAppId, guid, retryAt),
-    { kind: "github_delivery_audit", githubAppId: claim.repair.githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId },
-    { startAfter: retryAt },
-  );
-  deps.logger.info({ delivery_guid: guid, audit_run_id: auditRunId, state: "requested", result: "redelivered", attempt: claim.repair.attemptCount, retry_at: retryAt.toISOString() });
+  const accepted = await deps.store.acceptGithubDeliveryRedelivery({ guid, now });
+  const retryAt = accepted?.nextEligibleAt ?? nextRedeliveryEligibleAt(accepted?.attemptCount ?? 1, now);
+  await enqueueRepairWake({ githubAppId: claim.repair.githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId, resumeAt: retryAt }, deps);
+  deps.logger.info({ delivery_guid: guid, audit_run_id: auditRunId, state: "requested", result: "redelivered", attempt: accepted?.attemptCount ?? 1, retry_at: retryAt.toISOString() });
   return "requested";
 }
 
@@ -138,7 +182,7 @@ async function processAuditPage(payload: SyncJobPayload, deps: DeliveryAuditDepe
       deliveredAt: delivery.deliveredAt,
       now,
     });
-    if (repair.status !== "pending" && repair.status !== "requested") continue;
+    if (repair.status !== "pending" && repair.status !== "requesting" && repair.status !== "requested") continue;
     if (githubDeliveryAttemptSucceeded(delivery.statusCode)) continue;
     await requestRedelivery(delivery.guid, delivery.id, payload.auditRunId, deps);
   }
@@ -185,6 +229,11 @@ export async function processGithubDeliveryAudit(payload: SyncJobPayload, deps: 
     }
     if (error instanceof GithubAccessError && (error.code === "unauthorized" || error.code === "forbidden")) {
       await pauseAndWake(payload, new GithubRateLimitPauseError("retry_after", error.status, new Date(currentTime(deps).getTime() + 15 * 60 * 1000)), deps);
+      return;
+    }
+    if (error instanceof GithubTransientError) {
+      const resumeAt = new Date(currentTime(deps).getTime() + GITHUB_REDELIVERY_CLAIM_LEASE_MS);
+      await pauseAndWake(payload, new GithubRateLimitPauseError("retry_after", error.status || 500, resumeAt), deps);
       return;
     }
     throw error;

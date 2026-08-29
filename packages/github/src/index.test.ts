@@ -4,6 +4,7 @@ import {
   GithubAccessError,
   GithubEndpointDeniedError,
   GithubRateLimitPauseError,
+  GithubTransientError,
   githubRefParameter,
   InstallationGithubClient,
   InstallationRequestLanes,
@@ -265,8 +266,23 @@ describe("installation request rate-limit lanes", () => {
     } catch (error) {
       caught = error;
     }
-    expect(String(caught)).toBe("Error: GitHub installation request failed");
+    expect(caught).toBeInstanceOf(GithubTransientError);
+    expect(JSON.parse(JSON.stringify(caught))).toEqual({ class: "GithubTransientError", status: 500 });
+    expect(String(caught)).toContain("GitHub request failed");
     expect(JSON.stringify(caught)).not.toMatch(/PRIVATE|private\/file|ghp_/);
+  });
+
+  it("classifies transport failures without a GitHub status as sanitized transients", async () => {
+    const lanes = new InstallationRequestLanes();
+    let caught: unknown;
+    try {
+      await lanes.run(1, async () => { throw new Error("connect ECONNRESET PRIVATE REPOSITORY ghp_PRIVATE"); });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(GithubTransientError);
+    expect(JSON.parse(JSON.stringify(caught))).toEqual({ class: "GithubTransientError", status: 0 });
+    expect(String(caught)).not.toMatch(/PRIVATE|ECONNRESET|ghp_/);
   });
 
   it("serializes pause errors to opaque operational fields only", async () => {

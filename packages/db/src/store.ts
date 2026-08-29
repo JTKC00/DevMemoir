@@ -5,6 +5,7 @@ import {
   githubDeliveryAttemptSucceeded,
   githubDeliveryIsExpired,
   isTerminalDeliveryState,
+  nextRedeliveryClaimLeaseAt,
   nextRedeliveryEligibleAt,
   projectCanonicalFacts,
   repositoryAccessIsAvailable,
@@ -376,7 +377,7 @@ export type GithubDeliveryRepair = {
   action?: string;
   installationGithubId?: number;
   repositoryGithubId?: number;
-  status: "healthy" | "pending" | "requested" | "skipped_terminal" | "skipped_processing" | "exhausted" | "expired";
+  status: "healthy" | "pending" | "requesting" | "requested" | "skipped_terminal" | "skipped_processing" | "exhausted" | "expired";
   attemptCount: number;
   lastRedeliveryRequestedAt?: Date;
   nextEligibleAt?: Date;
@@ -496,6 +497,9 @@ export interface M1Store {
   getGithubDeliveryRepair(guid: string): Promise<GithubDeliveryRepair | undefined>;
   observeGithubDeliveryAttempt(input: GithubDeliveryRepairObservation): Promise<GithubDeliveryRepair>;
   claimGithubDeliveryRedelivery(input: { guid: string; githubDeliveryId: number; now: Date; maxAttempts: number }): Promise<GithubDeliveryRedeliveryClaim>;
+  acceptGithubDeliveryRedelivery(input: { guid: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
+  deferGithubDeliveryRedelivery(input: { guid: string; resumeAt: Date; errorCode: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
+  listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]>;
   markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
 }
 
@@ -1233,6 +1237,7 @@ export class InMemoryM1Store implements M1Store {
     const existing = this.githubDeliveryRepairs.get(input.githubDeliveryGuid);
     if (existing?.lastGithubDeliveredAt && existing.lastGithubDeliveredAt >= input.deliveredAt) return { ...existing };
     const healthy = githubDeliveryAttemptSucceeded(input.statusCode);
+    const status: GithubDeliveryRepair["status"] = healthy ? "healthy" : existing?.status === "requesting" ? "requesting" : "pending";
     const repair: GithubDeliveryRepair = {
       id: existing?.id ?? createId(),
       githubDeliveryGuid: input.githubDeliveryGuid,
@@ -1243,7 +1248,7 @@ export class InMemoryM1Store implements M1Store {
       ...(input.action ? { action: input.action } : {}),
       ...(input.installationGithubId ? { installationGithubId: input.installationGithubId } : {}),
       ...(input.repositoryGithubId ? { repositoryGithubId: input.repositoryGithubId } : {}),
-      status: healthy ? "healthy" : "pending",
+      status,
       attemptCount: existing?.attemptCount ?? 0,
       ...(existing?.lastRedeliveryRequestedAt ? { lastRedeliveryRequestedAt: existing.lastRedeliveryRequestedAt } : {}),
       ...(existing?.nextEligibleAt ? { nextEligibleAt: existing.nextEligibleAt } : {}),
@@ -1269,12 +1274,36 @@ export class InMemoryM1Store implements M1Store {
     if (localDelivery?.state === "processing") return finish("processing", "skipped_processing");
     if (repair.attemptCount >= input.maxAttempts) return finish("exhausted", "exhausted");
     if (repair.nextEligibleAt && repair.nextEligibleAt > input.now) return finish("cooldown");
-    repair.status = "requested";
+    repair.status = "requesting";
     repair.githubDeliveryId = input.githubDeliveryId;
+    repair.nextEligibleAt = nextRedeliveryClaimLeaseAt(input.now);
+    return { allowed: true, reason: "claimed", repair: { ...repair }, ...(localDelivery ? { localDelivery: { ...localDelivery } } : {}) };
+  }
+
+  async acceptGithubDeliveryRedelivery(input: { guid: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const repair = this.githubDeliveryRepairs.get(input.guid);
+    if (!repair) return undefined;
+    if (repair.status === "requested" && repair.lastRedeliveryRequestedAt) return { ...repair };
+    repair.status = "requested";
     repair.attemptCount += 1;
     repair.lastRedeliveryRequestedAt = input.now;
     repair.nextEligibleAt = nextRedeliveryEligibleAt(repair.attemptCount, input.now);
-    return { allowed: true, reason: "claimed", repair: { ...repair }, ...(localDelivery ? { localDelivery: { ...localDelivery } } : {}) };
+    return { ...repair };
+  }
+
+  async deferGithubDeliveryRedelivery(input: { guid: string; resumeAt: Date; errorCode: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const repair = this.githubDeliveryRepairs.get(input.guid);
+    if (!repair) return undefined;
+    repair.status = "requesting";
+    repair.nextEligibleAt = input.resumeAt;
+    repair.sanitizedErrorCode = input.errorCode;
+    return { ...repair };
+  }
+
+  async listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]> {
+    return [...this.githubDeliveryRepairs.values()]
+      .filter((repair) => repair.githubAppId === githubAppId && (repair.status === "pending" || repair.status === "requesting" || repair.status === "requested"))
+      .map((repair) => ({ ...repair }));
   }
 
   async markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {

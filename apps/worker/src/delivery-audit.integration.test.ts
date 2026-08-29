@@ -4,7 +4,7 @@ import { createPool, PostgresM1Store } from "@devmemoir/db";
 import { GithubRateLimitPauseError, type AppWebhookDelivery, type GithubAppClient } from "@devmemoir/github";
 import { InMemoryJobPort } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
-import { enqueueGithubDeliveryAudit, processGithubDeliveryAudit, type DeliveryAuditDependencies } from "./delivery-audit.js";
+import { enqueueGithubDeliveryAudit, processGithubDeliveryAudit, resumeGithubDeliveryRepairs, type DeliveryAuditDependencies } from "./delivery-audit.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required for M5.2 PostgreSQL delivery-audit worker tests");
@@ -116,5 +116,36 @@ describeIntegration("M5.2 worker PostgreSQL audit restart and checkpoint", () =>
     expect(audit?.pageNumber).toBe(1);
     expect(audit?.highWaterDeliveredAt).toBeUndefined();
     expect(audit?.lastSuccessAt).toBeUndefined();
+  });
+
+  it("recovers a PostgreSQL requesting claim after worker replacement and accepts one POST", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const redelivered: number[] = [];
+    let failOnce = true;
+    const app: GithubAppClient = {
+      listAppWebhookDeliveries: async () => ({ deliveries: [delivery(scope)] }),
+      redeliverAppWebhookDelivery: async (id) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("injected_worker_crash");
+        }
+        redelivered.push(id);
+      },
+    };
+    const claimedAt = () => new Date("2026-08-29T12:00:00Z");
+    const jobs = new InMemoryJobPort();
+    const deps: DeliveryAuditDependencies = { store: scope.store, jobs, githubApp: app, logger: createLogger(() => undefined), now: claimedAt };
+    const runId = await enqueueGithubDeliveryAudit({ githubAppId: scope.githubAppId }, deps);
+    await expect(processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId: scope.githubAppId, auditRunId: runId, page: 1 }, deps)).rejects.toThrow("injected_worker_crash");
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.status).toBe("requesting");
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.attemptCount).toBe(0);
+
+    const recovered: DeliveryAuditDependencies = { store: scope.store, jobs: new InMemoryJobPort(), githubApp: app, logger: createLogger(() => undefined), now: () => new Date("2026-08-29T12:01:00Z") };
+    await resumeGithubDeliveryRepairs(scope.githubAppId, recovered);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId: scope.githubAppId, auditRunId: runId, deliveryGuid: scope.guid, githubDeliveryId: 55 }, recovered);
+    expect(redelivered).toEqual([55]);
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.status).toBe("requested");
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.attemptCount).toBe(1);
   });
 });

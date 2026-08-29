@@ -56,6 +56,7 @@ export const REPAIRABLE_WEBHOOK_EVENTS = new Set([
 export const GITHUB_DELIVERY_REPAIR_STATUSES = [
   "healthy",
   "pending",
+  "requesting",
   "requested",
   "skipped_terminal",
   "skipped_processing",
@@ -69,6 +70,8 @@ export type GithubDeliveryAuditStatus = (typeof GITHUB_DELIVERY_AUDIT_STATUSES)[
 
 export const GITHUB_REDELIVERY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 export const GITHUB_REDELIVERY_MAX_ATTEMPTS = 8;
+/** Lease while DevMemoir owns an in-flight POST that GitHub has not accepted. */
+export const GITHUB_REDELIVERY_CLAIM_LEASE_MS = 60_000;
 const GITHUB_REDELIVERY_BASE_MS = 15 * 60 * 1000;
 const GITHUB_REDELIVERY_CAP_MS = 6 * 60 * 60 * 1000;
 
@@ -88,6 +91,10 @@ export function nextRedeliveryEligibleAt(completedAttempts: number, now: Date): 
   const exponent = Math.max(0, completedAttempts - 1);
   const delay = Math.min(GITHUB_REDELIVERY_CAP_MS, GITHUB_REDELIVERY_BASE_MS * (2 ** exponent));
   return new Date(now.getTime() + delay);
+}
+
+export function nextRedeliveryClaimLeaseAt(now: Date): Date {
+  return new Date(now.getTime() + GITHUB_REDELIVERY_CLAIM_LEASE_MS);
 }
 
 export type ActorKind = "user" | "bot" | "unknown";

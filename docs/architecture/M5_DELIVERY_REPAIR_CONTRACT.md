@@ -112,26 +112,43 @@ Page commit is the atomic unit: after the page's repair decisions (and any redel
 
 `github_delivery_repairs` is keyed by GitHub delivery GUID. It stores retry/redelivery metadata, not source content.
 
-Statuses: `healthy`, `pending`, `requested`, `skipped_terminal`, `skipped_processing`, `exhausted`, `expired`.
+Statuses:
 
-Retry metadata:
+| Status | Meaning |
+| --- | --- |
+| `pending` | Failed GitHub attempt observed; no worker currently owns the POST |
+| `requesting` | DevMemoir owns an in-flight redelivery POST that GitHub has not accepted |
+| `requested` | GitHub returned `202` for a redelivery POST |
+| `healthy` | Newest GitHub attempt succeeded |
+| `skipped_terminal` / `skipped_processing` | Local delivery re-check forbade redelivery |
+| `exhausted` / `expired` | Retry budget or three-day window exhausted |
 
-- `github_delivery_id` — newest failed attempt id used for `POST .../attempts`
-- `attempt_count` — successful DevMemoir redelivery claims
-- `last_redelivery_requested_at`
-- `next_eligible_at`
-- `last_github_status_code` / `last_github_delivered_at`
-- `sanitized_error_code`
+`attempt_count` is the number of GitHub redelivery POSTs **accepted with 202**. Claiming ownership (`requesting`) does not increment it.
+
+Ownership vs acceptance:
+
+```text
+pending
+  → requesting   (durable claim + 60s lease + repair wake, then POST)
+  → requested    (only after GitHub 202)
+```
+
+`requesting` is restartable. `next_eligible_at` is the claim lease (or a later rate-limit/transient resume). After the lease expires, a replacement worker may reclaim the same GUID and POST again. Concurrent workers that see a live lease receive `cooldown` and must not POST.
+
+After `202`:
+
+- `last_redelivery_requested_at` is set;
+- `next_eligible_at` becomes now plus `min(6h, 15m * 2^(attempt_count-1))`;
+- a GUID wake is scheduled at that cooldown.
+
+Crash, rate-limit, or transient failure **before** `202` leaves the row `requesting` with a future `next_eligible_at` and a reconstructable GUID wake. Worker boot scans `pending | requesting | requested` rows and enqueues those wakes from PostgreSQL, so pg-boss is not recovery truth.
 
 Policy:
 
-- maximum 8 redelivery claims per GUID;
-- after each successful claim, `next_eligible_at` is now plus `min(6h, 15m * 2^(attempt-1))`;
-- GitHub deliveries older than three days are `expired` and are not redelivered;
-- claiming redelivery is conditional on eligibility so overlapping auditors cannot storm;
-- a delayed GUID wake may re-evaluate a `requested` / `pending` row after `next_eligible_at` without re-scanning the whole list.
-
-Repeated audit of an identical page/run is idempotent: one repair row per GUID, no extra claim while `next_eligible_at` is in the future.
+- maximum 8 **accepted** redelivery POSTs per GUID;
+- GitHub deliveries older than three days are `expired`;
+- terminal local `processed` / `ignored` and `processing` still win on every claim, including recovered retries;
+- identical page/run replay is idempotent: one repair row per GUID, no extra POST while a lease or accepted cooldown is live.
 
 ## Queue and scheduling
 
@@ -147,7 +164,7 @@ delivery-audit:{githubAppId}:{auditRunId}:wake:{resumeAtMs}
 delivery-audit:{githubAppId}:repair:{deliveryGuid}:wake:{resumeAtMs}
 ```
 
-`JobPort` has enqueue-with-`startAfter` but no general scheduler. M5.2 therefore keeps the audit **callable and durable** and does not add a pg-boss cron/scheduler layer. A later scheduler may invoke `enqueueGithubDeliveryAudit` every six hours. The worker resumes an `in_progress` or `paused` generation on boot so a queue retry is not the only recovery path.
+`JobPort` has enqueue-with-`startAfter` but no general scheduler. M5.2 therefore keeps the audit **callable and durable** and does not add a pg-boss cron/scheduler layer. A later scheduler may invoke `enqueueGithubDeliveryAudit` every six hours. The worker resumes an `in_progress` or `paused` generation on boot and requeues recoverable GUID repairs from `github_delivery_repairs`, so a queue retry is not the only recovery path.
 
 Audit jobs are not written to tenant-scoped `sync_jobs`. Recovery truth is `github_delivery_audits` / `github_delivery_repairs`.
 
@@ -155,11 +172,13 @@ Audit jobs are not written to tenant-scoped `sync_jobs`. Recovery truth is `gith
 
 | Failure | Behaviour |
 | --- | --- |
-| Primary / secondary / Retry-After | Persist opaque pause on the current audit generation, leave cursor unchanged, enqueue one delayed wake for that generation and page. No worker sleep. |
-| Transient 5xx / network | Same as pause with bounded backoff; cursor unchanged. |
+| Primary / secondary / Retry-After on list | Persist opaque pause on the current audit generation, leave cursor unchanged, enqueue one delayed wake for that generation and page. No worker sleep. |
+| Primary / secondary / Retry-After on redelivery POST | Keep the GUID `requesting`, set `next_eligible_at` to `resumeAt`, enqueue a GUID wake, and pause the audit generation. Do not increment `attempt_count`. |
+| Transient 5xx / network on list | Pause the audit generation with bounded backoff; cursor unchanged. |
+| Transient 5xx / network on redelivery POST | Keep the GUID `requesting`, bounded backoff, enqueue a GUID wake. Do not increment `attempt_count`. The page may still commit because the GUID record independently guarantees retry. |
 | 401 / 403 | Pause the audit generation. Do not retry hot. Do not advance the checkpoint. |
 | 404 / 410 on redelivery | Mark that GUID `expired`. Continue the page. |
-| Successful page | Advance cursor only after durable repair/claim state for considered deliveries is committed. |
+| Successful page | Advance cursor only after durable repair decisions for considered deliveries are committed. A GUID left `requesting` still has its own wake/lease. |
 
 ## Tenant isolation and privacy
 
@@ -185,7 +204,8 @@ Automated tests must prove:
 - a processing/processed race between list and claim prevents duplicate redelivery;
 - identical audit page/run replay is idempotent;
 - interruption after durable repair commit and replacement-worker resume creates no duplicate local delivery, source, or event rows;
-- rate-limit during list or redelivery does not advance the success checkpoint and preserves the same logical work on wake;
+- crash after `requesting` claim and before GitHub `202` recovers the same GUID and eventually POSTs;
+- rate-limit or transient 5xx/network during redelivery POST does not count as an accepted attempt and leaves a durable GUID retry;
 - the audit/redelivery path does not call user-token methods;
 - private canaries are absent from queue payloads, logical keys, logs, serialized errors, and audit checkpoint records;
 - PostgreSQL evidence covers same-GUID reuse, terminal protection, retry metadata, checkpoint/restart, and concurrent claim safety.

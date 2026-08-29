@@ -73,7 +73,7 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN
   ALTER TABLE github_delivery_repairs ADD CONSTRAINT github_delivery_repairs_status_check
-    CHECK (status IN ('healthy','pending','requested','skipped_terminal','skipped_processing','exhausted','expired'));
+    CHECK (status IN ('healthy','pending','requesting','requested','skipped_terminal','skipped_processing','exhausted','expired'));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 GRANT SELECT ON github_delivery_audits, github_delivery_repairs TO devmemoir_api;

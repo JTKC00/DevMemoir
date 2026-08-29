@@ -85,14 +85,18 @@ describeIntegration("M5.2 PostgreSQL delivery audit and repair", () => {
     expect(observed.status).toBe("pending");
     const claimed = await scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 99, now, maxAttempts: 8 });
     expect(claimed.allowed).toBe(true);
+    expect(claimed.repair.status).toBe("requesting");
     expect(claimed.localDelivery?.id).toBe(delivery.record.id);
-    expect(claimed.repair.attemptCount).toBe(1);
+    expect(claimed.repair.attemptCount).toBe(0);
     expect(claimed.repair.nextEligibleAt).toBeTruthy();
 
     const replay = await scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 99, now, maxAttempts: 8 });
     expect(replay.allowed).toBe(false);
     expect(replay.reason).toBe("cooldown");
-    expect(replay.repair.attemptCount).toBe(1);
+    expect(replay.repair.attemptCount).toBe(0);
+    const accepted = await scope.store.acceptGithubDeliveryRedelivery({ guid: scope.guid, now });
+    expect(accepted?.status).toBe("requested");
+    expect(accepted?.attemptCount).toBe(1);
 
     await scope.store.updateDelivery(delivery.record.id, { state: "processed" }, scope.tenantId);
     const later = new Date(now.getTime() + 24 * 60 * 60 * 1000);
@@ -158,6 +162,40 @@ describeIntegration("M5.2 PostgreSQL delivery audit and repair", () => {
     ]);
     const allowed = [first, second].filter((claim) => claim.allowed);
     expect(allowed).toHaveLength(1);
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.status).toBe("requesting");
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.attemptCount).toBe(0);
+  });
+
+  it("recovers a stranded requesting claim after process replacement without dual ownership", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const claimedAt = new Date("2026-08-29T12:00:00Z");
+    const recoveredAt = new Date("2026-08-29T12:01:00Z");
+    const runId = randomUUID();
+    await scope.store.observeGithubDeliveryAttempt({
+      githubDeliveryGuid: scope.guid,
+      githubDeliveryId: 88,
+      githubAppId: scope.githubAppId,
+      auditRunId: runId,
+      eventName: "push",
+      installationGithubId: scope.installationGithubId,
+      statusCode: 502,
+      deliveredAt: claimedAt,
+      now: claimedAt,
+    });
+    const first = await scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 88, now: claimedAt, maxAttempts: 8 });
+    expect(first.allowed).toBe(true);
+    expect(first.repair.status).toBe("requesting");
+    expect(first.repair.attemptCount).toBe(0);
+
+    const [replacement, rival] = await Promise.all([
+      scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 88, now: recoveredAt, maxAttempts: 8 }),
+      scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 88, now: recoveredAt, maxAttempts: 8 }),
+    ]);
+    expect([replacement, rival].filter((claim) => claim.allowed)).toHaveLength(1);
+    await scope.store.acceptGithubDeliveryRedelivery({ guid: scope.guid, now: recoveredAt });
+    await scope.store.acceptGithubDeliveryRedelivery({ guid: scope.guid, now: recoveredAt });
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.status).toBe("requested");
     expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.attemptCount).toBe(1);
   });
 });
