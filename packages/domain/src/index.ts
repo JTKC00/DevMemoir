@@ -65,6 +65,17 @@ export const GITHUB_DELIVERY_REPAIR_STATUSES = [
 ] as const;
 export type GithubDeliveryRepairStatus = (typeof GITHUB_DELIVERY_REPAIR_STATUSES)[number];
 
+export const TERMINAL_GITHUB_DELIVERY_REPAIR_STATUSES = new Set<GithubDeliveryRepairStatus>([
+  "healthy",
+  "expired",
+  "exhausted",
+  "skipped_terminal",
+]);
+
+export function isTerminalGithubDeliveryRepairStatus(status: GithubDeliveryRepairStatus): boolean {
+  return TERMINAL_GITHUB_DELIVERY_REPAIR_STATUSES.has(status);
+}
+
 export const GITHUB_DELIVERY_AUDIT_STATUSES = ["pending", "in_progress", "paused", "completed"] as const;
 export type GithubDeliveryAuditStatus = (typeof GITHUB_DELIVERY_AUDIT_STATUSES)[number];
 

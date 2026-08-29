@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryM1Store } from "@devmemoir/db";
-import { GithubRateLimitPauseError, GithubTransientError, type AppWebhookDelivery, type GithubAppClient, type GithubClient } from "@devmemoir/github";
+import { GithubAccessError, GithubRateLimitPauseError, GithubTransientError, type AppWebhookDelivery, type GithubAppClient, type GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit, processGithubDeliveryAudit, resumeGithubDeliveryRepairs, type DeliveryAuditDependencies } from "./delivery-audit.js";
@@ -42,10 +42,11 @@ function failedDelivery(overrides: Partial<AppWebhookDelivery> = {}): AppWebhook
   };
 }
 
-function appClient(input: { deliveries?: AppWebhookDelivery[]; nextCursor?: string; onList?: () => void; onRedeliver?: (id: number) => void; listError?: Error; redeliverErrors?: Error[] }): GithubAppClient & { redelivered: number[]; listed: number } {
+function appClient(input: { deliveries?: AppWebhookDelivery[]; nextCursor?: string; onList?: () => void; onRedeliver?: (id: number) => void; listError?: Error; redeliverErrors?: Error[] }): GithubAppClient & { redelivered: number[]; listed: number; redeliverAttempts: number } {
   const client = {
     redelivered: [] as number[],
     listed: 0,
+    redeliverAttempts: 0,
     listAppWebhookDeliveries: async () => {
       client.listed += 1;
       input.onList?.();
@@ -53,6 +54,7 @@ function appClient(input: { deliveries?: AppWebhookDelivery[]; nextCursor?: stri
       return { deliveries: input.deliveries ?? [failedDelivery()], ...(input.nextCursor ? { nextCursor: input.nextCursor } : {}) };
     },
     redeliverAppWebhookDelivery: async (id: number) => {
+      client.redeliverAttempts += 1;
       const nextError = input.redeliverErrors?.shift();
       if (nextError) throw nextError;
       input.onRedeliver?.(id);
@@ -355,5 +357,68 @@ describe("M5.2 GitHub App failed-delivery audit", () => {
     await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, replacement);
     expect(app.redelivered).toEqual([]);
     expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("skipped_terminal");
+  });
+
+  it.each([404, 410] as const)("treats GitHub %s as expired and ignores a later stale repair wake", async (status) => {
+    const app = appClient({ redeliverErrors: [new GithubAccessError("not_found", status)] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    expect(app.redeliverAttempts).toBe(1);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("expired");
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(0);
+
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, { ...scope.deps, now: () => new Date("2026-08-29T12:01:00Z") });
+    expect(app.redeliverAttempts).toBe(1);
+    expect(app.redelivered).toEqual([]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("expired");
+    expect(scope.store.githubDeliveryRepairs.size).toBe(1);
+  });
+
+  it("does not requeue expired repairs on worker boot", async () => {
+    const app = appClient({});
+    const scope = await setup(app);
+    await scope.store.observeGithubDeliveryAttempt({
+      githubDeliveryGuid: guid, githubDeliveryId: 99, githubAppId, auditRunId, eventName: "push",
+      installationGithubId, statusCode: 502, deliveredAt: now(), now: now(),
+    });
+    await scope.store.markGithubDeliveryRepair({ guid, status: "expired", errorCode: "github_not_found", now: now() });
+    const jobs = new InMemoryJobPort();
+    const enqueued = await resumeGithubDeliveryRepairs(githubAppId, { ...scope.deps, jobs });
+    expect(enqueued).toBe(0);
+    expect(jobs.jobs.size).toBe(0);
+  });
+
+  it.each(["unauthorized", "forbidden"] as const)("defers GUID eligibility on GitHub %s and ignores the 60s pre-POST wake", async (code) => {
+    const app = appClient({ redeliverErrors: [new GithubAccessError(code, code === "unauthorized" ? 401 : 403)] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    const resumeAt = new Date("2026-08-29T12:15:00Z");
+    const repair = await scope.store.getGithubDeliveryRepair(guid);
+    expect(repair?.status).toBe("requesting");
+    expect(repair?.nextEligibleAt).toEqual(resumeAt);
+    expect(repair?.attemptCount).toBe(0);
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.status).toBe("paused");
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.pausedUntil).toEqual(resumeAt);
+    expect(app.redeliverAttempts).toBe(1);
+
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, { ...scope.deps, now: () => new Date("2026-08-29T12:01:00Z") });
+    expect(app.redeliverAttempts).toBe(1);
+    expect(app.redelivered).toEqual([]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(0);
+  });
+
+  it.each(["unauthorized", "forbidden"] as const)("retries once after GitHub %s backoff and accepts the POST", async (code) => {
+    const app = appClient({ redeliverErrors: [new GithubAccessError(code, code === "unauthorized" ? 401 : 403)] });
+    const scope = await setup(app);
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    const later: DeliveryAuditDependencies = { ...scope.deps, now: () => new Date("2026-08-29T12:15:00Z") };
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, deliveryGuid: guid, githubDeliveryId: 99 }, later);
+    expect(app.redeliverAttempts).toBe(2);
+    expect(app.redelivered).toEqual([99]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("requested");
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.attemptCount).toBe(1);
   });
 });

@@ -119,9 +119,10 @@ Statuses:
 | `pending` | Failed GitHub attempt observed; no worker currently owns the POST |
 | `requesting` | DevMemoir owns an in-flight redelivery POST that GitHub has not accepted |
 | `requested` | GitHub returned `202` for a redelivery POST |
-| `healthy` | Newest GitHub attempt succeeded |
-| `skipped_terminal` / `skipped_processing` | Local delivery re-check forbade redelivery |
-| `exhausted` / `expired` | Retry budget or three-day window exhausted |
+| `healthy` | Newest GitHub attempt succeeded. **Terminal.** |
+| `skipped_terminal` | Local delivery is `processed` or `ignored`. **Terminal.** Stale wakes must not reclaim. |
+| `skipped_processing` | Local delivery was `processing` at claim time. **Recoverable:** a later wake re-checks local state. If it is still processing, deny again; if it became terminal, become `skipped_terminal`; if it is retryable, a new `requesting` claim is allowed. |
+| `exhausted` / `expired` | Retry budget exhausted, GitHub 404/410, or the three-day window elapsed. **Terminal.** `expired` cannot be reclaimed even if the original `delivered_at` is still inside three days. |
 
 `attempt_count` is the number of GitHub redelivery POSTs **accepted with 202**. Claiming ownership (`requesting`) does not increment it.
 
@@ -141,7 +142,9 @@ After `202`:
 - `next_eligible_at` becomes now plus `min(6h, 15m * 2^(attempt_count-1))`;
 - a GUID wake is scheduled at that cooldown.
 
-Crash, rate-limit, or transient failure **before** `202` leaves the row `requesting` with a future `next_eligible_at` and a reconstructable GUID wake. Worker boot scans `pending | requesting | requested` rows and enqueues those wakes from PostgreSQL, so pg-boss is not recovery truth.
+Crash, rate-limit, or transient failure **before** `202` leaves the row `requesting` with a future `next_eligible_at` and a reconstructable GUID wake. Worker boot scans recoverable rows (`pending | requesting | requested | skipped_processing`) from PostgreSQL and enqueues those wakes. It does not requeue terminal rows (`healthy`, `expired`, `exhausted`, `skipped_terminal`). pg-boss is not recovery truth.
+
+Stale or duplicate GUID wakes may run. Durable status and `next_eligible_at` must make them harmless: they must not POST, must not increment `attempt_count`, and must not move a terminal row back to `requesting`. Queue jobs are advisory. Durable repair state always wins.
 
 Policy:
 
@@ -176,8 +179,8 @@ Audit jobs are not written to tenant-scoped `sync_jobs`. Recovery truth is `gith
 | Primary / secondary / Retry-After on redelivery POST | Keep the GUID `requesting`, set `next_eligible_at` to `resumeAt`, enqueue a GUID wake, and pause the audit generation. Do not increment `attempt_count`. |
 | Transient 5xx / network on list | Pause the audit generation with bounded backoff; cursor unchanged. |
 | Transient 5xx / network on redelivery POST | Keep the GUID `requesting`, bounded backoff, enqueue a GUID wake. Do not increment `attempt_count`. The page may still commit because the GUID record independently guarantees retry. |
-| 401 / 403 | Pause the audit generation. Do not retry hot. Do not advance the checkpoint. |
-| 404 / 410 on redelivery | Mark that GUID `expired`. Continue the page. |
+| 401 / 403 | Pause the audit generation until `now + 15m`. Defer the GUID to the same `resumeAt` while remaining `requesting` (recoverable). Enqueue a GUID wake at `resumeAt`. A pre-existing 60s wake may fire earlier; claim must see cooldown and must not POST. Do not increment `attempt_count`. Do not retry hot. |
+| 404 / 410 on redelivery | Mark that GUID `expired` (terminal). Continue the page. Later stale wakes no-op. |
 | Successful page | Advance cursor only after durable repair decisions for considered deliveries are committed. A GUID left `requesting` still has its own wake/lease. |
 
 ## Tenant isolation and privacy

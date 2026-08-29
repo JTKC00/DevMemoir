@@ -5,6 +5,7 @@ import {
   githubDeliveryAttemptSucceeded,
   githubDeliveryIsExpired,
   isTerminalDeliveryState,
+  isTerminalGithubDeliveryRepairStatus,
   nextRedeliveryClaimLeaseAt,
   nextRedeliveryEligibleAt,
   projectCanonicalFacts,
@@ -1268,7 +1269,9 @@ export class InMemoryM1Store implements M1Store {
       if (status) repair.status = status;
       return { allowed: false, reason, repair: { ...repair }, ...(localDelivery ? { localDelivery: { ...localDelivery } } : {}) };
     };
-    if (repair.status === "healthy") return finish("healthy");
+    if (isTerminalGithubDeliveryRepairStatus(repair.status)) {
+      return finish(repair.status === "skipped_terminal" ? "terminal" : repair.status === "exhausted" ? "exhausted" : repair.status === "expired" ? "expired" : "healthy");
+    }
     if (repair.lastGithubDeliveredAt && githubDeliveryIsExpired(repair.lastGithubDeliveredAt, input.now)) return finish("expired", "expired");
     if (localDelivery && isTerminalDeliveryState(localDelivery.state)) return finish("terminal", "skipped_terminal");
     if (localDelivery?.state === "processing") return finish("processing", "skipped_processing");
@@ -1302,7 +1305,7 @@ export class InMemoryM1Store implements M1Store {
 
   async listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]> {
     return [...this.githubDeliveryRepairs.values()]
-      .filter((repair) => repair.githubAppId === githubAppId && (repair.status === "pending" || repair.status === "requesting" || repair.status === "requested"))
+      .filter((repair) => repair.githubAppId === githubAppId && (repair.status === "pending" || repair.status === "requesting" || repair.status === "requested" || repair.status === "skipped_processing"))
       .map((repair) => ({ ...repair }));
   }
 

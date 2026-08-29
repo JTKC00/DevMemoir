@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
 import { emptyInventoryReconcileResult, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
@@ -1281,7 +1281,9 @@ export class PostgresM1Store implements M1Store {
         await client.query("commit");
         return { allowed: false, reason, repair: saved, ...(localDelivery ? { localDelivery } : {}) };
       };
-      if (repair.status === "healthy") return deny("healthy");
+      if (isTerminalGithubDeliveryRepairStatus(repair.status)) {
+        return deny(repair.status === "skipped_terminal" ? "terminal" : repair.status === "exhausted" ? "exhausted" : repair.status === "expired" ? "expired" : "healthy");
+      }
       if (repair.lastGithubDeliveredAt && githubDeliveryIsExpired(repair.lastGithubDeliveredAt, input.now)) return deny("expired", "expired");
       if (localDelivery && isTerminalDeliveryState(localDelivery.state)) return deny("terminal", "skipped_terminal");
       if (localDelivery?.state === "processing") return deny("processing", "skipped_processing");
@@ -1330,7 +1332,7 @@ export class PostgresM1Store implements M1Store {
   }
 
   async listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]> {
-    const result = await this.pool.query<Row>("select * from github_delivery_repairs where github_app_id=$1 and status in ('pending','requesting','requested')", [githubAppId]);
+    const result = await this.pool.query<Row>("select * from github_delivery_repairs where github_app_id=$1 and status in ('pending','requesting','requested','skipped_processing')", [githubAppId]);
     return result.rows.map((row) => repairFromRow(row)).filter((row): row is GithubDeliveryRepair => Boolean(row));
   }
 

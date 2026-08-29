@@ -6,6 +6,7 @@ import {
   githubDeliveryAttemptSucceeded,
   githubDeliveryIsExpired,
   isRepairableWebhookEvent,
+  isTerminalGithubDeliveryRepairStatus,
   nextRedeliveryEligibleAt,
   parseWebhook,
   projectCanonicalFacts,
@@ -51,6 +52,10 @@ describe("webhook contracts", () => {
     expect(githubDeliveryIsExpired(new Date("2026-01-01T00:00:00Z"), new Date("2026-01-05T00:00:01Z"))).toBe(true);
     expect(nextRedeliveryEligibleAt(1, new Date("2026-01-01T00:00:00Z"))).toEqual(new Date("2026-01-01T00:15:00Z"));
     expect(nextRedeliveryEligibleAt(3, new Date("2026-01-01T00:00:00Z"))).toEqual(new Date("2026-01-01T01:00:00Z"));
+    expect(isTerminalGithubDeliveryRepairStatus("expired")).toBe(true);
+    expect(isTerminalGithubDeliveryRepairStatus("skipped_terminal")).toBe(true);
+    expect(isTerminalGithubDeliveryRepairStatus("skipped_processing")).toBe(false);
+    expect(isTerminalGithubDeliveryRepairStatus("requesting")).toBe(false);
   });
 });
 

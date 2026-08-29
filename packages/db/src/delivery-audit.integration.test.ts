@@ -198,4 +198,60 @@ describeIntegration("M5.2 PostgreSQL delivery audit and repair", () => {
     expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.status).toBe("requested");
     expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.attemptCount).toBe(1);
   });
+
+  it("denies stale claims against an expired repair row", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const now = new Date("2026-08-29T12:00:00Z");
+    const runId = randomUUID();
+    await scope.store.observeGithubDeliveryAttempt({
+      githubDeliveryGuid: scope.guid,
+      githubDeliveryId: 44,
+      githubAppId: scope.githubAppId,
+      auditRunId: runId,
+      eventName: "push",
+      installationGithubId: scope.installationGithubId,
+      statusCode: 502,
+      deliveredAt: now,
+      now,
+    });
+    await scope.store.markGithubDeliveryRepair({ guid: scope.guid, status: "expired", errorCode: "github_not_found", now });
+    const later = new Date("2026-08-29T12:01:00Z");
+    const [first, second] = await Promise.all([
+      scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 44, now: later, maxAttempts: 8 }),
+      scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 44, now: later, maxAttempts: 8 }),
+    ]);
+    expect(first.allowed).toBe(false);
+    expect(second.allowed).toBe(false);
+    expect(first.reason).toBe("expired");
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.status).toBe("expired");
+    expect((await scope.store.getGithubDeliveryRepair(scope.guid))?.attemptCount).toBe(0);
+    expect((await scope.store.listRecoverableGithubDeliveryRepairs(scope.githubAppId))).toEqual([]);
+  });
+
+  it("holds a requesting claim until auth backoff and then allows reclaim", async () => {
+    const scope = await createScope();
+    scopes.push(scope);
+    const now = new Date("2026-08-29T12:00:00Z");
+    const resumeAt = new Date("2026-08-29T12:15:00Z");
+    const runId = randomUUID();
+    await scope.store.observeGithubDeliveryAttempt({
+      githubDeliveryGuid: scope.guid,
+      githubDeliveryId: 55,
+      githubAppId: scope.githubAppId,
+      auditRunId: runId,
+      eventName: "push",
+      installationGithubId: scope.installationGithubId,
+      statusCode: 502,
+      deliveredAt: now,
+      now,
+    });
+    expect((await scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 55, now, maxAttempts: 8 })).allowed).toBe(true);
+    await scope.store.deferGithubDeliveryRedelivery({ guid: scope.guid, resumeAt, errorCode: "github_unauthorized", now });
+    expect((await scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 55, now: new Date("2026-08-29T12:01:00Z"), maxAttempts: 8 })).allowed).toBe(false);
+    const recovered = await scope.store.claimGithubDeliveryRedelivery({ guid: scope.guid, githubDeliveryId: 55, now: resumeAt, maxAttempts: 8 });
+    expect(recovered.allowed).toBe(true);
+    expect(recovered.repair.status).toBe("requesting");
+    expect(recovered.repair.attemptCount).toBe(0);
+  });
 });
