@@ -17,6 +17,8 @@ export function githubRefParameter(ref: string): string {
 const ALLOWED_ENDPOINTS = new Set([
   "GET /installation/repositories",
   "GET /app/installations/{installation_id}",
+  "GET /app/hook/deliveries",
+  "POST /app/hook/deliveries/{delivery_id}/attempts",
   "GET /repos/{owner}/{repo}",
   "GET /repos/{owner}/{repo}/languages",
   "GET /repos/{owner}/{repo}/topics",
@@ -31,6 +33,9 @@ const ALLOWED_ENDPOINTS = new Set([
   "GET /user",
   "POST /login/oauth/access_token",
 ]);
+
+/** Process-local lane key for App JWT requests. Not an installation id. */
+export const APP_JWT_RATE_LIMIT_LANE = 0;
 
 export class GithubEndpointDeniedError extends Error {
   constructor(endpoint: string) {
@@ -91,6 +96,17 @@ const releaseSchema = z.object({
   author: nullableActorSchema, html_url: z.string().optional(), created_at: z.string(), published_at: z.string().nullable().optional(),
 }).strip();
 const unknownRecordSchema = z.record(z.unknown());
+const appWebhookDeliverySchema = z.object({
+  id: z.number().int().positive(),
+  guid: z.string().min(1),
+  delivered_at: z.string(),
+  redelivery: z.boolean(),
+  status_code: z.number().int(),
+  event: z.string(),
+  action: z.string().nullable().optional(),
+  installation_id: z.number().int().nullable().optional(),
+  repository_id: z.number().int().nullable().optional(),
+}).strip();
 
 export type GithubResponseHeaders = Record<string, string | number | undefined>;
 export type GithubRequestResponse<T = unknown> = { data: T; status?: number; headers?: GithubResponseHeaders };
@@ -129,12 +145,47 @@ export type ListCommitsInput = GithubPageInput & { sha?: string; since?: string 
 export type ListPullRequestsInput = GithubPageInput & { sort?: "created" | "updated" | "popularity" | "long-running"; direction?: "asc" | "desc" };
 export type ListIssuesInput = GithubPageInput & { since?: string; sort?: "created" | "updated" | "comments"; direction?: "asc" | "desc" };
 
+export type AppWebhookDelivery = {
+  id: number;
+  guid: string;
+  deliveredAt: Date;
+  redelivery: boolean;
+  statusCode: number;
+  eventName: string;
+  action?: string;
+  installationGithubId?: number;
+  repositoryGithubId?: number;
+};
+
+export type AppWebhookDeliveryPage = { deliveries: AppWebhookDelivery[]; nextCursor?: string };
+export type ListAppWebhookDeliveriesInput = { perPage?: number; cursor?: string };
+
+export interface GithubAppClient {
+  listAppWebhookDeliveries(input?: ListAppWebhookDeliveriesInput): Promise<AppWebhookDeliveryPage>;
+  redeliverAppWebhookDelivery(deliveryId: number): Promise<void>;
+}
+
 export function nextPageFromLink(link: unknown): number | undefined {
   const value = typeof link === "string" ? link : "";
   for (const part of value.split(",")) {
     if (!/rel="next"/.test(part)) continue;
     const page = /[?&]page=(\d+)/.exec(part)?.[1];
     if (page) return Number(page);
+  }
+  return undefined;
+}
+
+export function nextCursorFromLink(link: unknown): string | undefined {
+  const value = typeof link === "string" ? link : "";
+  for (const part of value.split(",")) {
+    if (!/rel="next"/.test(part)) continue;
+    const encoded = /[?&]cursor=([^&>]+)/.exec(part)?.[1];
+    if (!encoded) continue;
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
   }
   return undefined;
 }
@@ -211,6 +262,22 @@ function toIssue(input: unknown): GithubIssue {
     id: raw.id, number: raw.number, title: raw.title, state: raw.state, ...(raw.state_reason ? { stateReason: raw.state_reason } : {}),
     ...(author ? { author } : {}), ...(raw.html_url ? { htmlUrl: raw.html_url } : {}),
     createdAt: requiredDate(raw.created_at), updatedAt: requiredDate(raw.updated_at), ...(closedAt ? { closedAt } : {}),
+  };
+}
+
+function toAppWebhookDelivery(input: unknown): AppWebhookDelivery {
+  const raw = appWebhookDeliverySchema.parse(input);
+  const deliveredAt = requiredDate(raw.delivered_at);
+  return {
+    id: raw.id,
+    guid: raw.guid,
+    deliveredAt,
+    redelivery: raw.redelivery,
+    statusCode: raw.status_code,
+    eventName: raw.event,
+    ...(raw.action ? { action: raw.action } : {}),
+    ...(raw.installation_id ? { installationGithubId: raw.installation_id } : {}),
+    ...(raw.repository_id ? { repositoryGithubId: raw.repository_id } : {}),
   };
 }
 
@@ -411,7 +478,7 @@ export class InstallationRequestLanes {
   }
 }
 
-export class OctokitGithubClient implements GithubClient {
+export class OctokitGithubClient implements GithubClient, GithubAppClient {
   private readonly app: App;
   private readonly apiVersion: string;
   private readonly installationClients = new Map<number, Promise<Requester>>();
@@ -460,6 +527,35 @@ export class OctokitGithubClient implements GithubClient {
       headers: { "X-GitHub-Api-Version": this.apiVersion },
     }), { persistRateLimit: false });
     return installationSchema.parse(response.data);
+  }
+
+  async listAppWebhookDeliveries(input: ListAppWebhookDeliveriesInput = {}): Promise<AppWebhookDeliveryPage> {
+    assertGithubEndpointAllowed("GET /app/hook/deliveries");
+    const perPage = input.perPage ?? DEFAULT_PER_PAGE;
+    if (!Number.isInteger(perPage) || perPage < 1 || perPage > DEFAULT_PER_PAGE) {
+      throw new RangeError("GitHub pagination must use page >= 1 and perPage from 1 through 100");
+    }
+    const response = await this.requestApp("GET /app/hook/deliveries", {
+      per_page: perPage,
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    });
+    const deliveries = z.array(appWebhookDeliverySchema).parse(response.data).map((delivery) => toAppWebhookDelivery(delivery));
+    const nextCursor = nextCursorFromLink(headerValue(response.headers, "link"));
+    return { deliveries, ...(nextCursor ? { nextCursor } : {}) };
+  }
+
+  async redeliverAppWebhookDelivery(deliveryId: number): Promise<void> {
+    if (!Number.isInteger(deliveryId) || deliveryId <= 0) throw new RangeError("GitHub delivery id must be a positive integer");
+    assertGithubEndpointAllowed("POST /app/hook/deliveries/{delivery_id}/attempts");
+    await this.requestApp("POST /app/hook/deliveries/{delivery_id}/attempts", { delivery_id: deliveryId });
+  }
+
+  protected async requestApp(route: string, parameters?: Record<string, unknown>): Promise<GithubRequestResponse> {
+    assertGithubEndpointAllowed(route);
+    return this.installationRequestLanes.run(APP_JWT_RATE_LIMIT_LANE, () => this.app.octokit.request(route, {
+      ...parameters,
+      headers: { ...(parameters?.headers as Record<string, string> | undefined), "X-GitHub-Api-Version": this.apiVersion },
+    }), { persistRateLimit: false });
   }
 
   async listInstallationRepositories(page: number, perPage = DEFAULT_PER_PAGE): Promise<InstallationRepositoryPage> { void page; void perPage; throw new Error("Installation repository listing requires an installation client"); }

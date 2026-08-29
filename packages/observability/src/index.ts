@@ -15,6 +15,8 @@ export const ALLOWED_LOG_KEYS = new Set([
   "rate_limit_bucket",
   "error_code",
   "error_name",
+  "audit_run_id",
+  "retry_at",
 ]);
 
 export type SafeLogValue = string | number | boolean | null;

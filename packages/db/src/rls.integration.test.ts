@@ -51,6 +51,7 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await admin.query(await readFile(resolve(migrationsDir, "0003_m3_historical_backfill.sql"), "utf8"));
     await admin.query(await readFile(resolve(migrationsDir, "0004_m4_canonical_projection.sql"), "utf8"));
     await admin.query(await readFile(resolve(migrationsDir, "0005_m5_reconciliation_generations.sql"), "utf8"));
+    await admin.query(await readFile(resolve(migrationsDir, "0006_m5_delivery_repair.sql"), "utf8"));
     for (const [capability, roleName] of Object.entries(runtimeRoleNames)) {
       const capabilityRole = capability === "api" ? "devmemoir_api" : capability === "worker" ? "devmemoir_worker" : "devmemoir_web";
       await admin.query(`create role "${roleName}" login password '${rolePassword}'`);
@@ -201,5 +202,25 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await web.query("select set_config('app.tenant_id',$1,true)", [tenantA]);
     await expect(web.query("insert into commits (id,tenant_id,repository_id,sha,message,first_seen_at,last_seen_at) values ($1,$2,$3,'login-web-canary','message',now(),now())", [randomUUID(), tenantA, repoA])).rejects.toThrow();
     await web.query("rollback");
+  });
+
+  it("keeps App delivery-audit tables worker-writable and free of web mutation", async () => {
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_worker");
+    await admin.query("insert into github_delivery_audits (id,github_app_id,current_run_id,generation,status,page_number,started_at,updated_at) values ($1,1,$2,1,'in_progress',1,now(),now()) on conflict (github_app_id) do nothing", [randomUUID(), randomUUID()]);
+    await admin.query("insert into github_delivery_repairs (id,github_delivery_guid,github_delivery_id,github_app_id,event_name,status,attempt_count,created_at,updated_at) values ($1,$2,99,1,'push','pending',0,now(),now()) on conflict (github_delivery_guid) do nothing", [randomUUID(), randomUUID()]);
+    expect((await admin.query("select count(*)::int as n from github_delivery_audits")).rows[0]?.n).toBeGreaterThan(0);
+    await admin.query("rollback");
+
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_web");
+    await expect(admin.query("insert into github_delivery_audits (id,github_app_id,current_run_id,generation,status,page_number,started_at,updated_at) values ($1,9,$2,1,'in_progress',1,now(),now())", [randomUUID(), randomUUID()])).rejects.toThrow();
+    await expect(admin.query("insert into github_delivery_repairs (id,github_delivery_guid,github_delivery_id,github_app_id,event_name,status,attempt_count,created_at,updated_at) values ($1,$2,1,9,'push','pending',0,now(),now())", [randomUUID(), randomUUID()])).rejects.toThrow();
+    await admin.query("rollback");
+
+    await admin.query("begin");
+    await admin.query("set local role devmemoir_api");
+    await expect(admin.query("insert into github_delivery_repairs (id,github_delivery_guid,github_delivery_id,github_app_id,event_name,status,attempt_count,created_at,updated_at) values ($1,$2,1,9,'push','pending',0,now(),now())", [randomUUID(), randomUUID()])).rejects.toThrow();
+    await admin.query("rollback");
   });
 });

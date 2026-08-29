@@ -39,6 +39,57 @@ export function isTerminalDeliveryState(state: DeliveryState): boolean {
   return TERMINAL_DELIVERY_STATES.has(state);
 }
 
+export const REPAIRABLE_WEBHOOK_EVENTS = new Set([
+  "push",
+  "ping",
+  "github_app_authorization",
+  "installation",
+  "installation_repositories",
+  "repository",
+  "create",
+  "delete",
+  "pull_request",
+  "issues",
+  "release",
+]);
+
+export const GITHUB_DELIVERY_REPAIR_STATUSES = [
+  "healthy",
+  "pending",
+  "requested",
+  "skipped_terminal",
+  "skipped_processing",
+  "exhausted",
+  "expired",
+] as const;
+export type GithubDeliveryRepairStatus = (typeof GITHUB_DELIVERY_REPAIR_STATUSES)[number];
+
+export const GITHUB_DELIVERY_AUDIT_STATUSES = ["pending", "in_progress", "paused", "completed"] as const;
+export type GithubDeliveryAuditStatus = (typeof GITHUB_DELIVERY_AUDIT_STATUSES)[number];
+
+export const GITHUB_REDELIVERY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+export const GITHUB_REDELIVERY_MAX_ATTEMPTS = 8;
+const GITHUB_REDELIVERY_BASE_MS = 15 * 60 * 1000;
+const GITHUB_REDELIVERY_CAP_MS = 6 * 60 * 60 * 1000;
+
+export function isRepairableWebhookEvent(eventName: string): boolean {
+  return REPAIRABLE_WEBHOOK_EVENTS.has(eventName);
+}
+
+export function githubDeliveryAttemptSucceeded(statusCode: number): boolean {
+  return statusCode >= 200 && statusCode < 400;
+}
+
+export function githubDeliveryIsExpired(deliveredAt: Date, now: Date): boolean {
+  return now.getTime() - deliveredAt.getTime() > GITHUB_REDELIVERY_WINDOW_MS;
+}
+
+export function nextRedeliveryEligibleAt(completedAttempts: number, now: Date): Date {
+  const exponent = Math.max(0, completedAttempts - 1);
+  const delay = Math.min(GITHUB_REDELIVERY_CAP_MS, GITHUB_REDELIVERY_BASE_MS * (2 ** exponent));
+  return new Date(now.getTime() + delay);
+}
+
 export type ActorKind = "user" | "bot" | "unknown";
 export type ContextKind = "personal" | "project" | "unknown";
 export type AttributionConfidence = "exact_github_actor" | "unknown";

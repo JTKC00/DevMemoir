@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type RepositoryAccessStatus } from "@devmemoir/domain";
 import { emptyInventoryReconcileResult, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
@@ -7,6 +7,10 @@ import type {
   AuthTransactionRecord,
   DeliveryInsertResult,
   DeliveryRecord,
+  GithubDeliveryAudit,
+  GithubDeliveryRedeliveryClaim,
+  GithubDeliveryRepair,
+  GithubDeliveryRepairObservation,
   InventoryReconcileResult,
   InstallationRecord,
   InstallationLifecycleStatus,
@@ -155,6 +159,64 @@ function repositoryFromRow(row: Row | undefined): RepositoryRecord | undefined {
     ...(githubCreatedAt ? { githubCreatedAt } : {}),
     ...(githubUpdatedAt ? { githubUpdatedAt } : {}),
     ...(githubPushedAt ? { githubPushedAt } : {}),
+  };
+}
+
+function auditFromRow(row: Row | undefined): GithubDeliveryAudit | undefined {
+  if (!row) return undefined;
+  const startedAt = date(row.started_at);
+  const updatedAt = date(row.updated_at);
+  if (!startedAt || !updatedAt) return undefined;
+  const listCursor = row.list_cursor ? String(row.list_cursor) : undefined;
+  const stopBeforeDeliveredAt = date(row.stop_before_delivered_at);
+  const newestDeliveredAtSeen = date(row.newest_delivered_at_seen);
+  const highWaterDeliveredAt = date(row.high_water_delivered_at);
+  const pausedUntil = date(row.paused_until);
+  const lastSuccessAt = date(row.last_success_at);
+  const completedAt = date(row.completed_at);
+  return {
+    id: String(row.id),
+    githubAppId: Number(row.github_app_id),
+    currentRunId: String(row.current_run_id),
+    generation: Number(row.generation),
+    status: row.status as GithubDeliveryAudit["status"],
+    ...(listCursor ? { listCursor } : {}),
+    pageNumber: Number(row.page_number),
+    ...(stopBeforeDeliveredAt ? { stopBeforeDeliveredAt } : {}),
+    ...(newestDeliveredAtSeen ? { newestDeliveredAtSeen } : {}),
+    ...(highWaterDeliveredAt ? { highWaterDeliveredAt } : {}),
+    ...(pausedUntil ? { pausedUntil } : {}),
+    ...(row.pause_reason ? { pauseReason: String(row.pause_reason) } : {}),
+    ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}),
+    ...(lastSuccessAt ? { lastSuccessAt } : {}),
+    startedAt,
+    ...(completedAt ? { completedAt } : {}),
+    updatedAt,
+  };
+}
+
+function repairFromRow(row: Row | undefined): GithubDeliveryRepair | undefined {
+  if (!row) return undefined;
+  const lastRedeliveryRequestedAt = date(row.last_redelivery_requested_at);
+  const nextEligibleAt = date(row.next_eligible_at);
+  const lastGithubDeliveredAt = date(row.last_github_delivered_at);
+  return {
+    id: String(row.id),
+    githubDeliveryGuid: String(row.github_delivery_guid),
+    githubDeliveryId: Number(row.github_delivery_id),
+    githubAppId: Number(row.github_app_id),
+    ...(row.audit_run_id ? { auditRunId: String(row.audit_run_id) } : {}),
+    eventName: String(row.event_name),
+    ...(row.action ? { action: String(row.action) } : {}),
+    ...(row.installation_github_id ? { installationGithubId: Number(row.installation_github_id) } : {}),
+    ...(row.repository_github_id ? { repositoryGithubId: Number(row.repository_github_id) } : {}),
+    status: row.status as GithubDeliveryRepair["status"],
+    attemptCount: Number(row.attempt_count),
+    ...(lastRedeliveryRequestedAt ? { lastRedeliveryRequestedAt } : {}),
+    ...(nextEligibleAt ? { nextEligibleAt } : {}),
+    ...(row.last_github_status_code !== null && row.last_github_status_code !== undefined ? { lastGithubStatusCode: Number(row.last_github_status_code) } : {}),
+    ...(lastGithubDeliveredAt ? { lastGithubDeliveredAt } : {}),
+    ...(row.sanitized_error_code ? { sanitizedErrorCode: String(row.sanitized_error_code) } : {}),
   };
 }
 
@@ -518,6 +580,10 @@ export class PostgresM1Store implements M1Store {
     if (tenantId) return this.tenantQuery(tenantId, async (client) => deliveryFromRow((await client.query<Row>("select * from webhook_deliveries where id=$1", [id])).rows[0]));
     const result = await this.pool.query<Row>("select * from webhook_deliveries where id=$1", [id]);
     return deliveryFromRow(result.rows[0]);
+  }
+
+  async getDeliveryByGuid(guid: string, tenantId: string): Promise<DeliveryRecord | undefined> {
+    return this.tenantQuery(tenantId, async (client) => deliveryFromRow((await client.query<Row>("select * from webhook_deliveries where github_delivery_guid=$1", [guid])).rows[0]));
   }
 
   async claimDeliveryForProcessing(id: string, tenantId?: string): Promise<DeliveryRecord | undefined> {
@@ -1056,5 +1122,186 @@ export class PostgresM1Store implements M1Store {
 
   async assertReachable(): Promise<void> {
     await this.pool.query("select 1");
+  }
+
+  async getGithubDeliveryAudit(githubAppId: number): Promise<GithubDeliveryAudit | undefined> {
+    const result = await this.pool.query<Row>("select * from github_delivery_audits where github_app_id=$1", [githubAppId]);
+    return auditFromRow(result.rows[0]);
+  }
+
+  async startGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; now: Date }): Promise<GithubDeliveryAudit> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const existing = auditFromRow((await client.query<Row>("select * from github_delivery_audits where github_app_id=$1 for update", [input.githubAppId])).rows[0]);
+      if (existing && existing.status !== "completed") {
+        if (existing.currentRunId === input.auditRunId && existing.status === "paused" && (!existing.pausedUntil || existing.pausedUntil <= input.now)) {
+          const resumed = auditFromRow((await client.query<Row>("update github_delivery_audits set status='in_progress',paused_until=null,pause_reason=null,updated_at=$2 where github_app_id=$1 returning *", [input.githubAppId, input.now])).rows[0]);
+          await client.query("commit");
+          if (!resumed) throw new Error("Delivery audit disappeared during resume");
+          return resumed;
+        }
+        await client.query("commit");
+        return existing;
+      }
+      const stopBefore = existing?.highWaterDeliveredAt ?? new Date(input.now.getTime() - 3 * 24 * 60 * 60 * 1000);
+      const generation = (existing?.generation ?? 0) + 1;
+      const saved = auditFromRow((await client.query<Row>(
+        `insert into github_delivery_audits (id,github_app_id,current_run_id,generation,status,list_cursor,page_number,stop_before_delivered_at,newest_delivered_at_seen,high_water_delivered_at,paused_until,pause_reason,last_error_code,started_at,completed_at,updated_at)
+         values ($1,$2,$3,$4,'in_progress',null,1,$5,null,$6,null,null,null,$7,null,$7)
+         on conflict (github_app_id) do update set current_run_id=excluded.current_run_id,generation=excluded.generation,status='in_progress',list_cursor=null,page_number=1,stop_before_delivered_at=excluded.stop_before_delivered_at,newest_delivered_at_seen=null,paused_until=null,pause_reason=null,last_error_code=null,started_at=excluded.started_at,completed_at=null,updated_at=excluded.updated_at,high_water_delivered_at=github_delivery_audits.high_water_delivered_at
+         returning *`,
+        [existing?.id ?? createId(), input.githubAppId, input.auditRunId, generation, stopBefore, existing?.highWaterDeliveredAt ?? null, input.now],
+      )).rows[0]);
+      await client.query("commit");
+      if (!saved) throw new Error("Delivery audit was not created");
+      return saved;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async pauseGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; pausedUntil: Date; errorCode: string }): Promise<GithubDeliveryAudit | undefined> {
+    const result = await this.pool.query<Row>("update github_delivery_audits set status='paused',paused_until=$3,pause_reason=$4,last_error_code=$4,updated_at=$3 where github_app_id=$1 and current_run_id=$2 returning *", [input.githubAppId, input.auditRunId, input.pausedUntil, input.errorCode]);
+    return auditFromRow(result.rows[0]);
+  }
+
+  async resumeGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; now: Date }): Promise<GithubDeliveryAudit | undefined> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const existing = auditFromRow((await client.query<Row>("select * from github_delivery_audits where github_app_id=$1 and current_run_id=$2 for update", [input.githubAppId, input.auditRunId])).rows[0]);
+      if (!existing) {
+        await client.query("commit");
+        return undefined;
+      }
+      if (existing.pausedUntil && existing.pausedUntil > input.now) {
+        await client.query("commit");
+        return existing;
+      }
+      const resumed = auditFromRow((await client.query<Row>("update github_delivery_audits set status='in_progress',paused_until=null,pause_reason=null,updated_at=$3 where github_app_id=$1 and current_run_id=$2 returning *", [input.githubAppId, input.auditRunId, input.now])).rows[0]);
+      await client.query("commit");
+      return resumed;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async commitGithubDeliveryAuditPage(input: {
+    githubAppId: number;
+    auditRunId: string;
+    expectedPage: number;
+    expectedCursor?: string;
+    nextCursor?: string;
+    newestDeliveredAt?: Date;
+    reachedStop: boolean;
+    now: Date;
+  }): Promise<GithubDeliveryAudit | undefined> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const existing = auditFromRow((await client.query<Row>("select * from github_delivery_audits where github_app_id=$1 and current_run_id=$2 for update", [input.githubAppId, input.auditRunId])).rows[0]);
+      if (!existing || existing.pageNumber !== input.expectedPage || (existing.listCursor ?? undefined) !== input.expectedCursor) {
+        await client.query("commit");
+        return undefined;
+      }
+      const newest = input.newestDeliveredAt && (!existing.newestDeliveredAtSeen || input.newestDeliveredAt > existing.newestDeliveredAtSeen) ? input.newestDeliveredAt : existing.newestDeliveredAtSeen ?? null;
+      const complete = input.reachedStop || !input.nextCursor;
+      const saved = complete
+        ? auditFromRow((await client.query<Row>("update github_delivery_audits set status='completed',completed_at=$3,last_success_at=$3,high_water_delivered_at=coalesce($4,high_water_delivered_at),newest_delivered_at_seen=coalesce($4,newest_delivered_at_seen),list_cursor=null,updated_at=$3 where github_app_id=$1 and current_run_id=$2 returning *", [input.githubAppId, input.auditRunId, input.now, newest])).rows[0])
+        : auditFromRow((await client.query<Row>("update github_delivery_audits set status='in_progress',list_cursor=$3,page_number=$4,newest_delivered_at_seen=coalesce($5,newest_delivered_at_seen),updated_at=$6 where github_app_id=$1 and current_run_id=$2 returning *", [input.githubAppId, input.auditRunId, input.nextCursor, input.expectedPage + 1, newest, input.now])).rows[0]);
+      await client.query("commit");
+      return saved;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getGithubDeliveryRepair(guid: string): Promise<GithubDeliveryRepair | undefined> {
+    const result = await this.pool.query<Row>("select * from github_delivery_repairs where github_delivery_guid=$1", [guid]);
+    return repairFromRow(result.rows[0]);
+  }
+
+  async observeGithubDeliveryAttempt(input: GithubDeliveryRepairObservation): Promise<GithubDeliveryRepair> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const existing = repairFromRow((await client.query<Row>("select * from github_delivery_repairs where github_delivery_guid=$1 for update", [input.githubDeliveryGuid])).rows[0]);
+      if (existing?.lastGithubDeliveredAt && existing.lastGithubDeliveredAt >= input.deliveredAt) {
+        await client.query("commit");
+        return existing;
+      }
+      const status = githubDeliveryAttemptSucceeded(input.statusCode) ? "healthy" : "pending";
+      const saved = repairFromRow((await client.query<Row>(
+        `insert into github_delivery_repairs (id,github_delivery_guid,github_delivery_id,github_app_id,audit_run_id,event_name,action,installation_github_id,repository_github_id,status,attempt_count,last_redelivery_requested_at,next_eligible_at,last_github_status_code,last_github_delivered_at,sanitized_error_code,created_at,updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+         on conflict (github_delivery_guid) do update set github_delivery_id=excluded.github_delivery_id,audit_run_id=excluded.audit_run_id,event_name=excluded.event_name,action=excluded.action,installation_github_id=excluded.installation_github_id,repository_github_id=excluded.repository_github_id,status=excluded.status,last_github_status_code=excluded.last_github_status_code,last_github_delivered_at=excluded.last_github_delivered_at,updated_at=excluded.updated_at
+         returning *`,
+        [existing?.id ?? createId(), input.githubDeliveryGuid, input.githubDeliveryId, input.githubAppId, input.auditRunId, input.eventName, input.action ?? null, input.installationGithubId ?? null, input.repositoryGithubId ?? null, status, existing?.attemptCount ?? 0, existing?.lastRedeliveryRequestedAt ?? null, existing?.nextEligibleAt ?? null, input.statusCode, input.deliveredAt, existing?.sanitizedErrorCode ?? null, input.now],
+      )).rows[0]);
+      await client.query("commit");
+      if (!saved) throw new Error("Delivery repair was not stored");
+      return saved;
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimGithubDeliveryRedelivery(input: { guid: string; githubDeliveryId: number; now: Date; maxAttempts: number }): Promise<GithubDeliveryRedeliveryClaim> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const repair = repairFromRow((await client.query<Row>("select * from github_delivery_repairs where github_delivery_guid=$1 for update", [input.guid])).rows[0]);
+      if (!repair) throw new Error("Delivery repair not found");
+      let localDelivery: DeliveryRecord | undefined;
+      if (repair.installationGithubId) {
+        const route = await client.query<Row>("select tenant_id from installation_routes where github_installation_id=$1", [repair.installationGithubId]);
+        const tenantId = route.rows[0]?.tenant_id ? String(route.rows[0].tenant_id) : undefined;
+        if (tenantId) {
+          await client.query("select set_config('app.tenant_id', $1, true)", [tenantId]);
+          localDelivery = deliveryFromRow((await client.query<Row>("select * from webhook_deliveries where github_delivery_guid=$1 for update", [input.guid])).rows[0]);
+        }
+      }
+      const deny = async (reason: GithubDeliveryRedeliveryClaim["reason"], status?: GithubDeliveryRepair["status"]): Promise<GithubDeliveryRedeliveryClaim> => {
+        const saved = status
+          ? repairFromRow((await client.query<Row>("update github_delivery_repairs set status=$2,updated_at=$3 where github_delivery_guid=$1 returning *", [input.guid, status, input.now])).rows[0]) ?? repair
+          : repair;
+        await client.query("commit");
+        return { allowed: false, reason, repair: saved, ...(localDelivery ? { localDelivery } : {}) };
+      };
+      if (repair.status === "healthy") return deny("healthy");
+      if (repair.lastGithubDeliveredAt && githubDeliveryIsExpired(repair.lastGithubDeliveredAt, input.now)) return deny("expired", "expired");
+      if (localDelivery && isTerminalDeliveryState(localDelivery.state)) return deny("terminal", "skipped_terminal");
+      if (localDelivery?.state === "processing") return deny("processing", "skipped_processing");
+      if (repair.attemptCount >= input.maxAttempts) return deny("exhausted", "exhausted");
+      if (repair.nextEligibleAt && repair.nextEligibleAt > input.now) return deny("cooldown");
+      const nextEligibleAt = nextRedeliveryEligibleAt(repair.attemptCount + 1, input.now);
+      const saved = repairFromRow((await client.query<Row>("update github_delivery_repairs set status='requested',github_delivery_id=$2,attempt_count=attempt_count+1,last_redelivery_requested_at=$3,next_eligible_at=$4,updated_at=$3 where github_delivery_guid=$1 returning *", [input.guid, input.githubDeliveryId, input.now, nextEligibleAt])).rows[0]);
+      await client.query("commit");
+      if (!saved) throw new Error("Delivery repair claim failed");
+      return { allowed: true, reason: "claimed", repair: saved, ...(localDelivery ? { localDelivery } : {}) };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const result = await this.pool.query<Row>("update github_delivery_repairs set status=$2,sanitized_error_code=coalesce($3,sanitized_error_code),updated_at=$4 where github_delivery_guid=$1 returning *", [input.guid, input.status, input.errorCode ?? null, input.now]);
+    return repairFromRow(result.rows[0]);
   }
 }

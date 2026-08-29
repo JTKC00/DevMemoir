@@ -81,10 +81,13 @@ Automated tests must prove:
 - a repaired source fact triggers deterministic M4 reprojection from PostgreSQL facts;
 - queue payloads, logical keys, logs, and serialized errors contain no private source canaries.
 
-## Deferred to M5.2
+## Deferred from M5.1
 
-- App-JWT failed-delivery audit and redelivery;
-- six-hour scheduling and daily all-authorized-repository reconciliation;
+M5.2 App-JWT failed-delivery audit and redelivery is specified in [M5_DELIVERY_REPAIR_CONTRACT.md](./M5_DELIVERY_REPAIR_CONTRACT.md).
+
+Remaining later M5 work:
+
+- six-hour scheduler wiring and daily all-authorized-repository reconciliation;
 - owner health/backlog dashboard and manual retry controls;
 - queue rebuild procedure and tooling;
 - worker heartbeat, age metrics, alerts, and broader quota policy;

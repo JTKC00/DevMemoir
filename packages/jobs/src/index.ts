@@ -1,8 +1,8 @@
 import PgBoss from "pg-boss";
 import type { DeliveryState } from "@devmemoir/domain";
 
-export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation";
-export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation"];
+export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit"];
 
 export type SyncJobPayload = {
   kind?: JobKind;
@@ -30,6 +30,11 @@ export type SyncJobPayload = {
   observationStartedAt?: string;
   /** Opaque M5 reconciliation generation; never derived from repository content. */
   reconciliationRunId?: string;
+  /** Opaque M5.2 App-JWT delivery-audit generation. */
+  githubAppId?: number;
+  auditRunId?: string;
+  cursor?: string;
+  githubDeliveryId?: number;
 };
 
 export type QueueJob<T = unknown> = {
@@ -193,4 +198,25 @@ export function repositoryReconciliationLogicalKey(repositoryId: string, reconci
 
 export function isRetryableDeliveryState(state: DeliveryState): boolean {
   return state === "received" || state === "failed" || state === "dead_letter";
+}
+
+const OPAQUE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const OPAQUE_DELIVERY_GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function deliveryAuditLogicalKey(githubAppId: number, auditRunId: string, page?: number): string {
+  if (!Number.isInteger(githubAppId) || githubAppId <= 0) throw new Error("Invalid opaque GitHub App id");
+  if (!OPAQUE_UUID.test(auditRunId)) throw new Error("Invalid opaque delivery audit run id");
+  return `delivery-audit:${githubAppId}:${auditRunId}:page:${page ?? 1}`;
+}
+
+export function deliveryAuditWakeLogicalKey(githubAppId: number, auditRunId: string, resumeAt: Date): string {
+  if (!Number.isInteger(githubAppId) || githubAppId <= 0) throw new Error("Invalid opaque GitHub App id");
+  if (!OPAQUE_UUID.test(auditRunId)) throw new Error("Invalid opaque delivery audit run id");
+  return `delivery-audit:${githubAppId}:${auditRunId}:wake:${resumeAt.getTime()}`;
+}
+
+export function deliveryRepairWakeLogicalKey(githubAppId: number, deliveryGuid: string, resumeAt: Date): string {
+  if (!Number.isInteger(githubAppId) || githubAppId <= 0) throw new Error("Invalid opaque GitHub App id");
+  if (!OPAQUE_DELIVERY_GUID.test(deliveryGuid)) throw new Error("Invalid opaque GitHub delivery GUID");
+  return `delivery-audit:${githubAppId}:repair:${deliveryGuid}:wake:${resumeAt.getTime()}`;
 }

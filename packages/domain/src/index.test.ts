@@ -3,6 +3,10 @@ import {
   deliveryRedeliveryAction,
   defaultTimelineEvents,
   filterContextEvents,
+  githubDeliveryAttemptSucceeded,
+  githubDeliveryIsExpired,
+  isRepairableWebhookEvent,
+  nextRedeliveryEligibleAt,
   parseWebhook,
   projectCanonicalFacts,
   projectCommitFacts,
@@ -36,6 +40,17 @@ describe("webhook contracts", () => {
 
   it("ignores unknown event types", () => {
     expect(parseWebhook("future_event", { action: "new", private_value: "secret" }).kind).toBe("ignored");
+  });
+
+  it("repairs only the supported webhook event contract", () => {
+    expect(isRepairableWebhookEvent("push")).toBe(true);
+    expect(isRepairableWebhookEvent("pull_request")).toBe(true);
+    expect(isRepairableWebhookEvent("future_event")).toBe(false);
+    expect(githubDeliveryAttemptSucceeded(202)).toBe(true);
+    expect(githubDeliveryAttemptSucceeded(500)).toBe(false);
+    expect(githubDeliveryIsExpired(new Date("2026-01-01T00:00:00Z"), new Date("2026-01-05T00:00:01Z"))).toBe(true);
+    expect(nextRedeliveryEligibleAt(1, new Date("2026-01-01T00:00:00Z"))).toEqual(new Date("2026-01-01T00:15:00Z"));
+    expect(nextRedeliveryEligibleAt(3, new Date("2026-01-01T00:00:00Z"))).toEqual(new Date("2026-01-01T01:00:00Z"));
   });
 });
 
