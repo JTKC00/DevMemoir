@@ -17,6 +17,10 @@ export const ALLOWED_LOG_KEYS = new Set([
   "error_name",
   "audit_run_id",
   "retry_at",
+  "maintenance_task",
+  "eligible_count",
+  "enqueued_count",
+  "skipped_count",
 ]);
 
 export type SafeLogValue = string | number | boolean | null;

@@ -7,6 +7,9 @@ import {
   githubDeliveryIsExpired,
   isRepairableWebhookEvent,
   isTerminalGithubDeliveryRepairStatus,
+  maintenanceDayBucket,
+  maintenanceReconciliationRunId,
+  maintenanceSixHourBucket,
   nextRedeliveryEligibleAt,
   parseWebhook,
   projectCanonicalFacts,
@@ -56,6 +59,22 @@ describe("webhook contracts", () => {
     expect(isTerminalGithubDeliveryRepairStatus("skipped_terminal")).toBe(true);
     expect(isTerminalGithubDeliveryRepairStatus("skipped_processing")).toBe(false);
     expect(isTerminalGithubDeliveryRepairStatus("requesting")).toBe(false);
+  });
+});
+
+describe("maintenance buckets", () => {
+  it("uses UTC six-hour and day buckets and a deterministic opaque run id", () => {
+    const now = new Date("2026-08-29T07:15:00Z");
+    expect(maintenanceSixHourBucket(now)).toBe("20260829T06");
+    expect(maintenanceSixHourBucket(new Date("2026-08-29T00:00:00Z"))).toBe("20260829T00");
+    expect(maintenanceDayBucket(now)).toBe("2026-08-29");
+    const repositoryId = "00000000-0000-4000-8000-0000000000aa";
+    const first = maintenanceReconciliationRunId("active_reconciliation", repositoryId, now);
+    const second = maintenanceReconciliationRunId("active_reconciliation", repositoryId, now);
+    expect(first).toBe(second);
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    expect(maintenanceReconciliationRunId("authorized_reconciliation", repositoryId, now)).not.toBe(first);
+    expect(JSON.stringify({ first, bucket: maintenanceSixHourBucket(now) })).not.toMatch(/PRIVATE_REPO_CANARY|PRIVATE_COMMIT_CANARY|PRIVATE_PR_TITLE_CANARY/);
   });
 });
 

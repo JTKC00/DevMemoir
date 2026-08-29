@@ -5,6 +5,7 @@ import { PgBossJobPort } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit, resumeGithubDeliveryRepairs } from "./delivery-audit.js";
 import { processQueueJob, type QueueDependencies } from "./jobs.js";
+import { enqueueCurrentMaintenanceTicks, registerMaintenanceSchedules } from "./maintenance.js";
 
 const config = loadConfig();
 const pool = createPool(config.DATABASE_WORKER_URL, config.DATABASE_POOL_MAX);
@@ -23,6 +24,7 @@ const baseGithub = new OctokitGithubClient({
 const jobs = new PgBossJobPort(config.DATABASE_QUEUE_URL);
 const logger = createLogger();
 await jobs.start();
+await registerMaintenanceSchedules(jobs);
 const dependencies: QueueDependencies = { config, store, jobs, githubForInstallation: (installationId) => createInstallationGithubClient(baseGithub, installationId), githubApp: baseGithub, logger };
 await jobs.work("webhook_delivery", async (job) => processQueueJob(job, dependencies));
 await jobs.work("repository_backfill", async (job) => processQueueJob(job, dependencies));
@@ -30,6 +32,10 @@ await jobs.work("sync_commits", async (job) => processQueueJob(job, dependencies
 await jobs.work("installation_inventory", async (job) => processQueueJob(job, dependencies));
 await jobs.work("repository_reconciliation", async (job) => processQueueJob(job, dependencies));
 await jobs.work("github_delivery_audit", async (job) => processQueueJob(job, dependencies));
+await jobs.work("maintenance_active", async (job) => processQueueJob(job, dependencies));
+await jobs.work("maintenance_authorized", async (job) => processQueueJob(job, dependencies));
+await jobs.work("maintenance_audit", async (job) => processQueueJob(job, dependencies));
+await enqueueCurrentMaintenanceTicks(jobs);
 const existingAudit = await store.getGithubDeliveryAudit(config.GITHUB_APP_ID);
 const auditDeps = { store, jobs, githubApp: baseGithub, logger };
 if (existingAudit && (existingAudit.status === "in_progress" || existingAudit.status === "paused")) {

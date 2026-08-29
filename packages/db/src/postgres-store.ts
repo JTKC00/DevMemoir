@@ -14,6 +14,7 @@ import type {
   InventoryReconcileResult,
   InstallationRecord,
   InstallationLifecycleStatus,
+  MaintenanceTarget,
   HistoricalActor,
   HistoricalCursor,
   HistoricalPageCommit,
@@ -439,6 +440,22 @@ export class PostgresM1Store implements M1Store {
       const result = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join lateral (select ra.installation_id,ra.access_status,ra.selected,ra.revoked_at from repository_access ra join github_installations gi on gi.id=ra.installation_id and gi.tenant_id=ra.tenant_id where ra.repository_id=r.id and ra.tenant_id=r.tenant_id and gi.status='active' and ra.selected=true and ra.access_status='accessible' order by ra.selected_at desc limit 1) ra on true where r.tenant_id=$1 order by r.created_at asc", [tenantId]);
       return result.rows.map((row) => repositoryFromRow(row)).filter((row): row is RepositoryRecord => Boolean(row));
     });
+  }
+
+  async listMaintenanceTargets(input?: { activeSince?: Date }): Promise<MaintenanceTarget[]> {
+    const routes = await this.pool.query<Row>("select tenant_id, github_installation_id from installation_routes");
+    const targets: MaintenanceTarget[] = [];
+    for (const route of routes.rows) {
+      const installation = await this.getInstallation(Number(route.github_installation_id));
+      if (!installation || (installation.status && installation.status !== "active")) continue;
+      const repositories = await this.listRepositories(String(route.tenant_id));
+      for (const repository of repositories) {
+        const recent = repository.githubPushedAt ?? repository.lastAuthoritativeObservedAt ?? repository.lastSeenAt;
+        if (input?.activeSince && recent && recent < input.activeSince) continue;
+        targets.push({ tenantId: repository.tenantId, repositoryId: repository.id, installationGithubId: installation.githubInstallationId });
+      }
+    }
+    return targets;
   }
 
   async listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]> {

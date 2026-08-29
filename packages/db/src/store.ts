@@ -92,6 +92,12 @@ export type RepositoryRecord = {
   githubPushedAt?: Date;
 };
 
+export type MaintenanceTarget = {
+  tenantId: string;
+  repositoryId: string;
+  installationGithubId: number;
+};
+
 export type InventoryReconcileResult = {
   observed: number;
   added: number;
@@ -441,6 +447,7 @@ export interface M1Store {
   getRepositoryByFullName(tenantId: string, fullName: string): Promise<RepositoryRecord | undefined>;
   listRepositories(tenantId: string): Promise<RepositoryRecord[]>;
   listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]>;
+  listMaintenanceTargets(input?: { activeSince?: Date }): Promise<MaintenanceTarget[]>;
   selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult>;
@@ -621,6 +628,19 @@ export class InMemoryM1Store implements M1Store {
     return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && repository.installationId === installation.id && repository.selected === true && (!repository.accessStatus || repositoryAccessIsAvailable(repository.accessStatus))).map((repository) => ({ ...repository }));
   }
   async listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]> { return [...this.repositories.values()].filter((repository) => repository.tenantId === tenantId && (!installationId || repository.installationId === installationId)).map((repository) => ({ ...repository })).sort((a, b) => a.fullName.localeCompare(b.fullName)); }
+  async listMaintenanceTargets(input?: { activeSince?: Date }): Promise<MaintenanceTarget[]> {
+    const targets: MaintenanceTarget[] = [];
+    for (const installation of this.installations.values()) {
+      if (installation.status && installation.status !== "active") continue;
+      const repositories = await this.listRepositories(installation.tenantId);
+      for (const repository of repositories) {
+        const recent = repository.githubPushedAt ?? repository.lastAuthoritativeObservedAt ?? repository.lastSeenAt;
+        if (input?.activeSince && recent && recent < input.activeSince) continue;
+        targets.push({ tenantId: repository.tenantId, repositoryId: repository.id, installationGithubId: installation.githubInstallationId });
+      }
+    }
+    return targets;
+  }
   async selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
     const repository = await this.getRepositoryById(tenantId, repositoryId);
     if (!repository) return undefined;
