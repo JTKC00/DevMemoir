@@ -1,8 +1,8 @@
 import PgBoss from "pg-boss";
 import type { DeliveryState, MaintenanceTask } from "@devmemoir/domain";
 
-export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit" | "maintenance_active" | "maintenance_authorized" | "maintenance_audit";
-export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit", "maintenance_active", "maintenance_authorized", "maintenance_audit"];
+export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit" | "github_delivery_audit_recovery" | "maintenance_active" | "maintenance_authorized" | "maintenance_audit";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit", "github_delivery_audit_recovery", "maintenance_active", "maintenance_authorized", "maintenance_audit"];
 export const MAINTENANCE_JOB_KINDS = ["maintenance_active", "maintenance_authorized", "maintenance_audit"] as const;
 export type MaintenanceJobKind = (typeof MAINTENANCE_JOB_KINDS)[number];
 
@@ -244,6 +244,12 @@ export function deliveryAuditWakeLogicalKey(githubAppId: number, auditRunId: str
   if (!Number.isInteger(githubAppId) || githubAppId <= 0) throw new Error("Invalid opaque GitHub App id");
   if (!OPAQUE_UUID.test(auditRunId)) throw new Error("Invalid opaque delivery audit run id");
   return `delivery-audit:${githubAppId}:${auditRunId}:wake:${resumeAt.getTime()}`;
+}
+
+export function deliveryAuditRecoveryLogicalKey(githubAppId: number, auditRunId: string): string {
+  if (!Number.isInteger(githubAppId) || githubAppId <= 0) throw new Error("Invalid opaque GitHub App id");
+  if (!OPAQUE_UUID.test(auditRunId)) throw new Error("Invalid opaque delivery audit run id");
+  return `delivery-audit-recovery:${githubAppId}:${auditRunId}`;
 }
 
 export function deliveryRepairWakeLogicalKey(githubAppId: number, deliveryGuid: string, resumeAt: Date): string {

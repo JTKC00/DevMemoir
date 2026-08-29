@@ -80,6 +80,16 @@ function operationalText(scope: { jobs: InMemoryJobPort; capture: ReturnType<typ
 }
 
 describe("M5.2 GitHub App failed-delivery audit", () => {
+  it("turns duplicate owner recovery commands into one effective audit generation", async () => {
+    const app = appClient({ deliveries: [] });
+    const scope = await setup(app);
+    const command = { id: "recovery-job", kind: "github_delivery_audit_recovery" as const, logicalKey: "delivery-audit-recovery", payload: { kind: "github_delivery_audit_recovery" as const, githubAppId, auditRunId } };
+    const deps = { config, store: scope.store, jobs: scope.jobs, githubApp: app, githubForInstallation: () => { throw new Error("installation token path invoked"); }, logger: createLogger(scope.capture.sink), now };
+    await Promise.all([processQueueJob(command, deps), processQueueJob({ ...command, id: "recovery-job-duplicate" }, deps)]);
+    expect(await scope.store.getGithubDeliveryAudit(githubAppId)).toMatchObject({ currentRunId: auditRunId, generation: 1, status: "in_progress" });
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
+  });
+
   it("requests same-GUID redelivery for a retryable local delivery and resumes without duplicate facts", async () => {
     const app = appClient({});
     const scope = await setup(app);

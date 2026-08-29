@@ -32,6 +32,7 @@ await jobs.work("sync_commits", async (job) => processQueueJob(job, dependencies
 await jobs.work("installation_inventory", async (job) => processQueueJob(job, dependencies));
 await jobs.work("repository_reconciliation", async (job) => processQueueJob(job, dependencies));
 await jobs.work("github_delivery_audit", async (job) => processQueueJob(job, dependencies));
+await jobs.work("github_delivery_audit_recovery", async (job) => processQueueJob(job, dependencies));
 await jobs.work("maintenance_active", async (job) => processQueueJob(job, dependencies));
 await jobs.work("maintenance_authorized", async (job) => processQueueJob(job, dependencies));
 await jobs.work("maintenance_audit", async (job) => processQueueJob(job, dependencies));

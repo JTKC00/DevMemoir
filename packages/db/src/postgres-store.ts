@@ -1,6 +1,6 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
-import { emptyInventoryReconcileResult, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
+import { emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
   ActivityQuery,
@@ -16,6 +16,8 @@ import type {
   InstallationLifecycleStatus,
   MaintenanceTarget,
   MaintenanceWindow,
+  GithubDeliveryRepairStatusCounts,
+  RepositoryOperationalRecord,
   HistoricalActor,
   HistoricalCursor,
   HistoricalPageCommit,
@@ -1354,6 +1356,16 @@ export class PostgresM1Store implements M1Store {
     return result.rows.map((row) => repairFromRow(row)).filter((row): row is GithubDeliveryRepair => Boolean(row));
   }
 
+  async getDeliveryRepairStatusCounts(githubAppId: number): Promise<GithubDeliveryRepairStatusCounts> {
+    const counts = Object.fromEntries(GITHUB_DELIVERY_REPAIR_STATUSES.map((status) => [status, 0])) as GithubDeliveryRepairStatusCounts;
+    const result = await this.pool.query<Row>("select status,count(*)::integer as count from github_delivery_repairs where github_app_id=$1 group by status", [githubAppId]);
+    for (const row of result.rows) {
+      const status = String(row.status);
+      if (GITHUB_DELIVERY_REPAIR_STATUSES.includes(status as typeof GITHUB_DELIVERY_REPAIR_STATUSES[number])) counts[status as typeof GITHUB_DELIVERY_REPAIR_STATUSES[number]] = Number(row.count);
+    }
+    return counts;
+  }
+
   async markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
     const result = await this.pool.query<Row>("update github_delivery_repairs set status=$2,sanitized_error_code=coalesce($3,sanitized_error_code),updated_at=$4 where github_delivery_guid=$1 returning *", [input.guid, input.status, input.errorCode ?? null, input.now]);
     return repairFromRow(result.rows[0]);
@@ -1393,5 +1405,29 @@ export class PostgresM1Store implements M1Store {
       ...(completedAt ? { completedAt } : {}),
       ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}),
     };
+  }
+
+
+  async listMaintenanceOperationalHealth(): Promise<MaintenanceWindow[]> {
+    const result = await this.pool.query<Row>("select distinct on (task) task,bucket,job_kind,accepted_job_id,accepted_at,completed_at,last_error_code,updated_at from maintenance_windows order by task,accepted_at desc");
+    return result.rows.map((row) => {
+      const completedAt = date(row.completed_at);
+      return { task: String(row.task) as MaintenanceTask, bucket: String(row.bucket), jobKind: String(row.job_kind), acceptedJobId: String(row.accepted_job_id), acceptedAt: date(row.accepted_at) ?? new Date(0), updatedAt: date(row.updated_at) ?? new Date(0), ...(completedAt ? { completedAt } : {}), ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}) };
+    });
+  }
+
+  async listRepositoryOperationalHealth(tenantId: string): Promise<RepositoryOperationalRecord[]> {
+    return this.tenantQuery(tenantId, async (client) => {
+      const repositories = await client.query<Row>("select r.id as repository_id,gi.github_installation_id from repositories r join repository_access ra on ra.tenant_id=r.tenant_id and ra.repository_id=r.id join github_installations gi on gi.tenant_id=ra.tenant_id and gi.id=ra.installation_id where r.tenant_id=$1 and ra.selected=true and ra.access_status='accessible' and gi.status='active' order by r.id", [tenantId]);
+      const result: RepositoryOperationalRecord[] = [];
+      for (const row of repositories.rows) {
+        const repositoryId = String(row.repository_id);
+        const generationRow = (await client.query<Row>("select * from reconciliation_generations where tenant_id=$1 and repository_id=$2 and current=true", [tenantId, repositoryId])).rows[0];
+        const progressRows = await client.query<Row>("select * from sync_cursors where tenant_id=$1 and repository_id=$2 order by resource_type,ref_name", [tenantId, repositoryId]);
+        const generation = reconciliationGenerationFromRow(generationRow);
+        result.push({ repositoryId, installationGithubId: Number(row.github_installation_id), ...(generation ? { generation } : {}), progress: progressRows.rows.map((progress) => historicalProgressFromRow(progress)).filter((progress): progress is HistoricalProgress => Boolean(progress)) });
+      }
+      return result;
+    });
   }
 }

@@ -274,6 +274,8 @@ export const MAINTENANCE_TASKS = ["active_reconciliation", "authorized_reconcili
 export type MaintenanceTask = (typeof MAINTENANCE_TASKS)[number];
 export const MAINTENANCE_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_NAMESPACE = "3c0b1d0e-5f7a-4c2b-9e8d-1a2b3c4d5e6f";
+const MANUAL_RECONCILIATION_NAMESPACE = "6a4dc746-f4d2-4f58-81d6-38a8da40b732";
+const MANUAL_DELIVERY_AUDIT_NAMESPACE = "f34d7d21-6a3d-49a8-a772-277e6b31c746";
 
 export function maintenanceSixHourBucket(now: Date): string {
   const year = now.getUTCFullYear();
@@ -293,6 +295,18 @@ export function maintenanceWindowBucket(task: MaintenanceTask, now: Date): strin
 
 export function maintenanceReconciliationRunId(task: Exclude<MaintenanceTask, "delivery_audit">, repositoryId: string, now: Date): string {
   return uuidv5(`${task}:${repositoryId}:${maintenanceWindowBucket(task, now)}`, MAINTENANCE_NAMESPACE);
+}
+
+/** Opaque and stable for concurrent owner requests targeting the same next generation. */
+export function manualReconciliationRunId(repositoryId: string, nextGeneration: number): string {
+  if (!Number.isSafeInteger(nextGeneration) || nextGeneration <= 0) throw new Error("Invalid reconciliation generation");
+  return uuidv5(`${repositoryId}:${nextGeneration}`, MANUAL_RECONCILIATION_NAMESPACE);
+}
+
+/** Opaque and stable for concurrent owner requests targeting the same next audit generation. */
+export function manualDeliveryAuditRunId(githubAppId: number, nextGeneration: number): string {
+  if (!Number.isSafeInteger(githubAppId) || githubAppId <= 0 || !Number.isSafeInteger(nextGeneration) || nextGeneration <= 0) throw new Error("Invalid delivery audit generation");
+  return uuidv5(`${githubAppId}:${nextGeneration}`, MANUAL_DELIVERY_AUDIT_NAMESPACE);
 }
 
 export function truncatePrivateText(value: string | undefined, limit = 4000): string | undefined {

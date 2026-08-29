@@ -203,6 +203,12 @@ M3 restartable sync, M4 projection, GitHub App delivery APIs, scheduler/worker h
 
 Suppressed webhook repair, App-JWT-only failed-delivery audit, same-GUID recovery, queue wipe/rebuild, rate-limit exhaustion, and stale inventory/access repair.
 
+### M5.4 completion
+
+- [x] Owner-only `/ops` and `GET /api/ops/health` expose deterministic M5.1–M5.3 operational metadata without private content.
+- [x] Repository reconciliation, delivery-audit retry, and recoverable-repair resume reuse existing durable entrypoints and preserve pauses, cooldowns, attempts, and terminal states.
+- [x] Authorization, health derivation, concurrent idempotency, privacy canaries, and real PostgreSQL aggregation have regression coverage.
+
 ### Risks
 
 Audit/reconcile loops can amplify API load or use the wrong credential; installation lanes, explicit schedules, and endpoint/credential contract tests bound the blast radius.
