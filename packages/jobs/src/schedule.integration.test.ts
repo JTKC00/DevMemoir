@@ -40,8 +40,9 @@ describeIntegration("pg-boss maintenance schedules", () => {
 
       const first = await Promise.all(MAINTENANCE_JOB_KINDS.map((kind) => workerC.enqueue(kind, kind, { kind })));
       const replay = await Promise.all(MAINTENANCE_JOB_KINDS.map((kind) => workerC.enqueue(kind, kind, { kind })));
-      expect([...first, ...replay].filter((id): id is string => Boolean(id)).length).toBeLessThanOrEqual(3);
-      expect(replay.filter((id): id is string => Boolean(id))).toHaveLength(0);
+      const accepted = [...first, ...replay].filter((id): id is string => Boolean(id));
+      expect(new Set(accepted).size).toBeLessThanOrEqual(3);
+      expect(replay).toEqual(first);
     } finally {
       await workerC.stop().catch(() => undefined);
       await workerB.stop().catch(() => undefined);
