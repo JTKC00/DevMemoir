@@ -3,13 +3,15 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import rawBody from "fastify-raw-body";
 import type { AppConfig } from "@devmemoir/config";
-import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, parseWebhook } from "@devmemoir/domain";
+import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, manualDeliveryAuditRunId, manualReconciliationRunId, parseWebhook } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import type { JobPort } from "@devmemoir/jobs";
-import { deliveryLogicalKey, historicalBackfillLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
+import { deliveryAuditRecoveryLogicalKey, deliveryLogicalKey, historicalBackfillLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { RepositorySelectionError, type M1Store, type SessionRecord } from "@devmemoir/db";
+import { enqueueRepositoryReconciliation, resumeGithubDeliveryRepairs } from "@devmemoir/worker/recovery";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
+import { deriveOwnerOperationalHealth } from "./ops-health.js";
 import { verifyGithubSignature, webhookBodyLimit } from "./webhook.js";
 
 export type ApiDependencies = {
@@ -80,6 +82,17 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     return session;
   };
 
+  const requireOwner = async (request: RequestWithSession, reply: FastifyReply, csrf = false): Promise<SessionRecord | undefined> => {
+    const session = csrf ? await requireCsrf(request, reply) : await requireSession(request, reply);
+    if (!session) return undefined;
+    const user = await deps.store.getUserById(session.userId);
+    if (!user || user.githubAccountId !== deps.config.OWNER_GITHUB_USER_ID) {
+      await reply.code(403).send({ error: "owner_required" });
+      return undefined;
+    }
+    return session;
+  };
+
   const enqueueInventoryRefresh = async (tenantId: string, installationGithubId: number, operationId: string): Promise<void> => {
     const logicalKey = installationInventoryLogicalKey(installationGithubId, operationId);
     const payload = { kind: "installation_inventory", tenantId, installationGithubId, installationId: installationGithubId, inventoryOperationId: operationId };
@@ -117,6 +130,60 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   };
 
   app.get("/health", async () => ({ ok: true, service: "api", m1: true, m2: true, m3: true }));
+
+  app.get("/api/ops/health", async (request, reply) => {
+    const session = await requireOwner(request as RequestWithSession, reply);
+    if (!session) return;
+    const [maintenance, audit, repairCounts, repositories] = await Promise.all([
+      deps.store.listMaintenanceOperationalHealth(),
+      deps.store.getGithubDeliveryAudit(deps.config.GITHUB_APP_ID),
+      deps.store.getDeliveryRepairStatusCounts(deps.config.GITHUB_APP_ID),
+      deps.store.listRepositoryOperationalHealth(session.tenantId),
+    ]);
+    return deriveOwnerOperationalHealth({ now: now(), maintenance, ...(audit ? { audit } : {}), repairCounts, repositories });
+  });
+
+  app.post<{ Params: { repositoryId: string } }>("/api/ops/repositories/:repositoryId/reconcile", async (request, reply) => {
+    const session = await requireOwner(request as RequestWithSession, reply, true);
+    if (!session) return;
+    const repository = (await deps.store.listRepositoryInventory(session.tenantId)).find((candidate) => candidate.id === request.params.repositoryId);
+    if (!repository) return reply.code(404).send({ error: "repository_not_found" });
+    const installation = await deps.store.getActiveInstallationForTenant(session.tenantId);
+    if (!installation || repository.installationId !== installation.id || repository.selected !== true || (repository.accessStatus && repository.accessStatus !== "accessible")) return reply.code(200).send({ result: "not_eligible" });
+    const current = await deps.store.getCurrentRepositoryReconciliationGeneration(session.tenantId, repository.id);
+    const progress = current ? (await deps.store.listHistoricalProgress(session.tenantId, repository.id)).filter((row) => row.cursor.reconciliationRunId === current.reconciliationRunId) : [];
+    if (progress.some((row) => row.status === "in_progress")) return reply.code(200).send({ result: "already_in_progress" });
+    const paused = progress.find((row) => row.status === "paused" && row.pausedUntil && row.pausedUntil > now());
+    if (paused?.pausedUntil) return reply.code(200).send({ result: "paused", retryAfter: paused.pausedUntil.toISOString() });
+    const reconciliationRunId = current && !progress.some((row) => row.stage === "completed" && row.status === "completed") ? current.reconciliationRunId : manualReconciliationRunId(repository.id, (current?.generation ?? 0) + 1);
+    const enqueued = await enqueueRepositoryReconciliation({ tenantId: session.tenantId, repositoryId: repository.id, installationGithubId: installation.githubInstallationId, reconciliationRunId }, { store: deps.store, jobs: deps.jobs });
+    deps.logger.info({ event_type: "manual_reconciliation", result: enqueued ? "enqueued" : "not_eligible", repository_id: repository.id });
+    return reply.code(enqueued ? 202 : 200).send({ result: enqueued ? "enqueued" : "not_eligible" });
+  });
+
+  app.post("/api/ops/delivery-audit/retry", async (request, reply) => {
+    const session = await requireOwner(request as RequestWithSession, reply, true);
+    if (!session) return;
+    const audit = await deps.store.getGithubDeliveryAudit(deps.config.GITHUB_APP_ID);
+    if (audit?.status === "in_progress") return reply.code(200).send({ result: "already_in_progress" });
+    if (audit?.status === "paused" && audit.pausedUntil && audit.pausedUntil > now()) return reply.code(200).send({ result: "paused", retryAfter: audit.pausedUntil.toISOString() });
+    const auditRunId = audit && audit.status !== "completed" ? audit.currentRunId : manualDeliveryAuditRunId(deps.config.GITHUB_APP_ID, (audit?.generation ?? 0) + 1);
+    const payload = { kind: "github_delivery_audit_recovery" as const, githubAppId: deps.config.GITHUB_APP_ID, auditRunId };
+    await deps.jobs.enqueue("github_delivery_audit_recovery", deliveryAuditRecoveryLogicalKey(deps.config.GITHUB_APP_ID, auditRunId), payload);
+    deps.logger.info({ event_type: "manual_delivery_audit", result: "enqueued", audit_run_id: auditRunId });
+    return reply.code(202).send({ result: "enqueued" });
+  });
+
+  app.post("/api/ops/delivery-repairs/resume", async (request, reply) => {
+    const session = await requireOwner(request as RequestWithSession, reply, true);
+    if (!session) return;
+    const recoverableFound = (await deps.store.listRecoverableGithubDeliveryRepairs(deps.config.GITHUB_APP_ID)).length;
+    const enqueued = await resumeGithubDeliveryRepairs(deps.config.GITHUB_APP_ID, { store: deps.store, jobs: deps.jobs, now });
+    const skipped = Math.max(0, recoverableFound - enqueued);
+    const result = recoverableFound === 0 ? "nothing_to_resume" : "enqueued";
+    deps.logger.info({ event_type: "manual_delivery_repairs", result, enqueued_count: enqueued, skipped_count: skipped });
+    return reply.code(enqueued > 0 ? 202 : 200).send({ result, recoverableFound, enqueued, skipped });
+  });
 
   app.get<{ Querystring: { returnPath?: string } }>("/auth/github/start", async (request, reply) => {
     const started = await auth.startLogin(request.query.returnPath ?? "/");

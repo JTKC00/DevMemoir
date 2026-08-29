@@ -47,6 +47,9 @@ importers:
       '@devmemoir/observability':
         specifier: workspace:*
         version: link:../../packages/observability
+      '@devmemoir/worker':
+        specifier: workspace:*
+        version: link:../worker
       '@fastify/cookie':
         specifier: ^11.1.2
         version: 11.1.2

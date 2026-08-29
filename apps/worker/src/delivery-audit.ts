@@ -12,7 +12,9 @@ export type DeliveryAuditDependencies = {
   now?: () => Date;
 };
 
-function currentTime(deps: DeliveryAuditDependencies): Date {
+export type DeliveryAuditEnqueueDependencies = Pick<DeliveryAuditDependencies, "store" | "jobs" | "now"> & Partial<Pick<DeliveryAuditDependencies, "githubApp" | "logger">>;
+
+function currentTime(deps: Pick<DeliveryAuditDependencies, "now">): Date {
   return (deps.now ?? (() => new Date()))();
 }
 
@@ -26,7 +28,7 @@ async function ensureAuditAvailable(audit: NonNullable<Awaited<ReturnType<M1Stor
   }
 }
 
-async function enqueueRepairWake(input: { githubAppId: number; auditRunId: string; deliveryGuid: string; githubDeliveryId: number; resumeAt: Date }, deps: DeliveryAuditDependencies): Promise<void> {
+async function enqueueRepairWake(input: { githubAppId: number; auditRunId: string; deliveryGuid: string; githubDeliveryId: number; resumeAt: Date }, deps: Pick<DeliveryAuditDependencies, "jobs">): Promise<void> {
   await deps.jobs.enqueue(
     "github_delivery_audit",
     deliveryRepairWakeLogicalKey(input.githubAppId, input.deliveryGuid, input.resumeAt),
@@ -37,7 +39,7 @@ async function enqueueRepairWake(input: { githubAppId: number; auditRunId: strin
 
 export async function enqueueGithubDeliveryAudit(
   input: { githubAppId: number; auditRunId?: string },
-  deps: DeliveryAuditDependencies,
+  deps: DeliveryAuditEnqueueDependencies,
   startAfter?: Date,
 ): Promise<string> {
   const audit = await deps.store.startGithubDeliveryAudit({ githubAppId: input.githubAppId, auditRunId: input.auditRunId ?? createId(), now: currentTime(deps) });
@@ -55,12 +57,15 @@ export async function enqueueGithubDeliveryAudit(
   return audit.currentRunId;
 }
 
-export async function resumeGithubDeliveryRepairs(githubAppId: number, deps: DeliveryAuditDependencies): Promise<number> {
+export async function resumeGithubDeliveryRepairs(githubAppId: number, deps: DeliveryAuditEnqueueDependencies): Promise<number> {
   const now = currentTime(deps);
+  const audit = await deps.store.getGithubDeliveryAudit(githubAppId);
+  const auditResumeAt = audit?.status === "paused" && audit.pausedUntil && audit.pausedUntil > now ? audit.pausedUntil : undefined;
   const repairs = await deps.store.listRecoverableGithubDeliveryRepairs(githubAppId);
   let enqueued = 0;
   for (const repair of repairs) {
-    const resumeAt = repair.nextEligibleAt && repair.nextEligibleAt > now ? repair.nextEligibleAt : now;
+    const repairResumeAt = repair.nextEligibleAt && repair.nextEligibleAt > now ? repair.nextEligibleAt : now;
+    const resumeAt = auditResumeAt && auditResumeAt > repairResumeAt ? auditResumeAt : repairResumeAt;
     await enqueueRepairWake({
       githubAppId: repair.githubAppId,
       auditRunId: repair.auditRunId ?? createId(),

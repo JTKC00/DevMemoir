@@ -110,6 +110,17 @@ export type MaintenanceWindow = {
   lastErrorCode?: string;
 };
 
+export const GITHUB_DELIVERY_REPAIR_STATUSES = ["pending", "requesting", "requested", "skipped_processing", "healthy", "expired", "exhausted", "skipped_terminal"] as const;
+export type GithubDeliveryRepairStatus = (typeof GITHUB_DELIVERY_REPAIR_STATUSES)[number];
+export type GithubDeliveryRepairStatusCounts = Record<GithubDeliveryRepairStatus, number>;
+
+export type RepositoryOperationalRecord = {
+  repositoryId: string;
+  installationGithubId: number;
+  generation?: ReconciliationGeneration;
+  progress: HistoricalProgress[];
+};
+
 export type InventoryReconcileResult = {
   observed: number;
   added: number;
@@ -464,6 +475,8 @@ export interface M1Store {
   completeMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobId: string; now: Date }): Promise<void>;
   recordMaintenanceWindowError(input: { task: MaintenanceTask; bucket: string; jobId: string; errorCode: string; now: Date }): Promise<void>;
   getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined>;
+  listMaintenanceOperationalHealth(): Promise<MaintenanceWindow[]>;
+  listRepositoryOperationalHealth(tenantId: string): Promise<RepositoryOperationalRecord[]>;
   selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult>;
@@ -524,6 +537,7 @@ export interface M1Store {
   acceptGithubDeliveryRedelivery(input: { guid: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
   deferGithubDeliveryRedelivery(input: { guid: string; resumeAt: Date; errorCode: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
   listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]>;
+  getDeliveryRepairStatusCounts(githubAppId: number): Promise<GithubDeliveryRepairStatusCounts>;
   markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
 }
 
@@ -688,6 +702,25 @@ export class InMemoryM1Store implements M1Store {
   async getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined> {
     const window = this.maintenanceWindows.get(`${task}:${bucket}`);
     return window ? { ...window } : undefined;
+  }
+  async listMaintenanceOperationalHealth(): Promise<MaintenanceWindow[]> {
+    const latest = new Map<MaintenanceTask, MaintenanceWindow>();
+    for (const window of this.maintenanceWindows.values()) {
+      const current = latest.get(window.task);
+      if (!current || window.acceptedAt > current.acceptedAt) latest.set(window.task, window);
+    }
+    return [...latest.values()].map((window) => ({ ...window }));
+  }
+  async listRepositoryOperationalHealth(tenantId: string): Promise<RepositoryOperationalRecord[]> {
+    const repositories = await this.listRepositories(tenantId);
+    const result: RepositoryOperationalRecord[] = [];
+    for (const repository of repositories) {
+      const installation = [...this.installations.values()].find((value) => value.id === repository.installationId && value.tenantId === tenantId && (!value.status || value.status === "active"));
+      if (!installation) continue;
+      const generation = await this.getCurrentRepositoryReconciliationGeneration(tenantId, repository.id);
+      result.push({ repositoryId: repository.id, installationGithubId: installation.githubInstallationId, ...(generation ? { generation } : {}), progress: await this.listHistoricalProgress(tenantId, repository.id) });
+    }
+    return result;
   }
   async selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
     const repository = await this.getRepositoryById(tenantId, repositoryId);
@@ -1300,6 +1333,12 @@ export class InMemoryM1Store implements M1Store {
   async getGithubDeliveryRepair(guid: string): Promise<GithubDeliveryRepair | undefined> {
     const repair = this.githubDeliveryRepairs.get(guid);
     return repair ? { ...repair } : undefined;
+  }
+
+  async getDeliveryRepairStatusCounts(githubAppId: number): Promise<GithubDeliveryRepairStatusCounts> {
+    const counts = Object.fromEntries(GITHUB_DELIVERY_REPAIR_STATUSES.map((status) => [status, 0])) as GithubDeliveryRepairStatusCounts;
+    for (const repair of this.githubDeliveryRepairs.values()) if (repair.githubAppId === githubAppId) counts[repair.status] += 1;
+    return counts;
   }
 
   async observeGithubDeliveryAttempt(input: GithubDeliveryRepairObservation): Promise<GithubDeliveryRepair> {
