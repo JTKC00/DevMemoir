@@ -52,4 +52,29 @@ describeIntegration("maintenance window claims", () => {
       await poolB.end().catch(() => undefined);
     }
   });
+
+  it("rejects the original accepted job after the window is completed", async () => {
+    const bucket = "20270115T06";
+    buckets.push(bucket);
+    const pool = createPool(databaseUrl as string, 2);
+    const store = new PostgresM1Store(pool);
+    const now = new Date("2027-01-15T06:00:00Z");
+    try {
+      expect(await store.claimMaintenanceWindow({ task: "delivery_audit", bucket, jobKind: "maintenance_audit", jobId: "job-a", now })).toBe(true);
+      await store.completeMaintenanceWindow({ task: "delivery_audit", bucket, jobId: "job-a", now });
+      const replacementPool = createPool(databaseUrl as string, 2);
+      const replacement = new PostgresM1Store(replacementPool);
+      try {
+        expect(await replacement.claimMaintenanceWindow({ task: "delivery_audit", bucket, jobKind: "maintenance_audit", jobId: "job-a", now })).toBe(false);
+        expect(await replacement.claimMaintenanceWindow({ task: "delivery_audit", bucket, jobKind: "maintenance_audit", jobId: "job-b", now })).toBe(false);
+        const window = await replacement.getMaintenanceWindow("delivery_audit", bucket);
+        expect(window?.acceptedJobId).toBe("job-a");
+        expect(window?.completedAt).toEqual(now);
+      } finally {
+        await replacementPool.end();
+      }
+    } finally {
+      await pool.end();
+    }
+  });
 });

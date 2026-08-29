@@ -661,7 +661,8 @@ export class InMemoryM1Store implements M1Store {
   async claimMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobKind: string; jobId: string; now: Date }): Promise<boolean> {
     const key = `${input.task}:${input.bucket}`;
     const existing = this.maintenanceWindows.get(key);
-    if (existing) return existing.acceptedJobId === input.jobId;
+    // Completed windows are terminal even for the original accepted job (queue redelivery after ack loss).
+    if (existing) return !existing.completedAt && existing.acceptedJobId === input.jobId;
     this.maintenanceWindows.set(key, {
       task: input.task,
       bucket: input.bucket,

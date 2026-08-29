@@ -1366,6 +1366,7 @@ export class PostgresM1Store implements M1Store {
     );
     if (inserted.rows[0]) return true;
     const existing = await this.getMaintenanceWindow(input.task, input.bucket);
+    if (existing?.completedAt) return false;
     return existing?.acceptedJobId === input.jobId;
   }
 

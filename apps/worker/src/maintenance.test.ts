@@ -242,14 +242,15 @@ describe("M5.3 periodic maintenance scheduler", () => {
     await processMaintenanceTick(auditPayload, scope.deps, "job-1");
     expect((await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12"))?.completedAt).toEqual(now());
     const generation = (await scope.store.getGithubDeliveryAudit(githubAppId))?.generation;
+    await processMaintenanceTick(auditPayload, scope.deps, "job-1");
     await processMaintenanceTick(auditPayload, scope.deps, "job-2");
     expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.generation).toBe(generation);
     expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
   });
 
-  it("does not start a second M5.2 generation after the accepted audit completes", async () => {
+  it("does not start a second M5.2 generation when the same completed maintenance job is redelivered", async () => {
     const scope = await setup();
-    await processMaintenanceTick(auditPayload, scope.deps, "audit-1");
+    await processMaintenanceTick(auditPayload, scope.deps, "audit-job-1");
     const first = await scope.store.getGithubDeliveryAudit(githubAppId);
     expect(first?.generation).toBe(1);
     await scope.store.commitGithubDeliveryAuditPage({
@@ -260,8 +261,11 @@ describe("M5.3 periodic maintenance scheduler", () => {
       now: now(),
     });
     expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.status).toBe("completed");
-    await processMaintenanceTick(auditPayload, scope.deps, "audit-2");
+    const auditJobs = [...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit").length;
+    await processMaintenanceTick(auditPayload, scope.deps, "audit-job-1");
     expect(await scope.store.getGithubDeliveryAudit(githubAppId)).toMatchObject({ generation: 1, status: "completed" });
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(auditJobs);
+    expect(await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12")).toMatchObject({ acceptedJobId: "audit-job-1", completedAt: now() });
   });
 
   it("keeps private canaries out of scheduler keys, payloads, logs, windows, and schedule metadata", async () => {

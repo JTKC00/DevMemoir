@@ -120,14 +120,32 @@ pg-boss does not enqueue every missed cron fire. After 18 hours offline, the nex
 
 ## Failure handling
 
-Claim happens before work. If the accepted job throws:
+Claim happens before work. Incomplete vs completed windows:
 
-- the window row remains (not deleted);
+```text
+incomplete accepted window
+→ same accepted job may retry
+
+completed window
+→ terminal for all job IDs, including the accepted job itself
+```
+
+If the accepted job throws:
+
+- the window row remains (not deleted, `completed_at` stays null);
 - `last_error_code` is a sanitized code;
 - pg-boss may retry **that same job id**;
 - a different producer cannot insert a second window for the same `(task, bucket)`.
 
-Successful retry of the accepted job marks `completed_at`. Scheduler-tick failures do not mark M5.1/M5.2 checkpoints successful. Per-repository enqueue failures skip that target and continue. GitHub rate limits remain owned by M5.1/M5.2.
+Successful retry of the accepted job marks `completed_at`. After that the window is terminal:
+
+```text
+completeMaintenanceWindow()
+→ crash before queue ack
+→ redelivery of the same pg-boss job becomes a no-op
+```
+
+Completed rows are never deleted or reopened. Scheduler-tick failures do not mark M5.1/M5.2 checkpoints successful. Per-repository enqueue failures skip that target and continue. GitHub rate limits remain owned by M5.1/M5.2.
 
 ## Privacy and logs
 
