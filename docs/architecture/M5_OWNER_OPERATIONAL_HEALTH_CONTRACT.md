@@ -25,7 +25,7 @@ Health is derived at request time from `maintenance_windows`, current `reconcili
 - Daily authorized reconciliation maintenance is stale after more than 36 hours.
 - Active reconciliation and delivery-audit maintenance windows use 12 hours.
 
-A repository is `never_run` without a current generation, `paused` while its durable future pause applies, `failed` when an incomplete generation has a sanitized error, `stale` beyond the threshold, `healthy` after recent completion, and otherwise `in_progress`. Delivery audit follows the equivalent existing audit fields. Maintenance uses the newest window per task: completed windows are `completed`, recent accepted incomplete windows without error are `running`, and errored/overdue/missing windows are `failed_or_incomplete`.
+A repository is `never_run` without a current generation, `paused` while its durable future pause applies, `failed` when an incomplete generation has a sanitized error, `stale` beyond the threshold, `healthy` after recent completion, and otherwise `in_progress`. Delivery audit follows the equivalent existing audit fields. Maintenance uses the newest window per task: recent completed windows are `completed`, recent accepted incomplete windows without error are `running`, and errored/overdue/missing windows are `failed_or_incomplete`.
 
 Overall state is deterministic. It is `attention_required` for stale/missing maintenance, exhausted repairs, failed/stale reconciliation, or failed/stale delivery audit. Otherwise it is `degraded` for a recoverable repair backlog, an authoritative pause, or a running maintenance window. Otherwise it is `healthy`.
 

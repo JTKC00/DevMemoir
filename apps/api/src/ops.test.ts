@@ -35,6 +35,19 @@ describe("M5.4 owner operations API", () => {
     expect(response.body).not.toContain("PRIVATE_REPO_CANARY");
   });
 
+  it("omits unselected and access-removed repositories from owner health", async () => {
+    const included = await app.inject({ method: "GET", url: "/api/ops/health", headers: headersFor("owner-token") });
+    expect(included.json<{ repositories: Array<{ repositoryId: string }> }>().repositories).toEqual([expect.objectContaining({ repositoryId: "repo-opaque" })]);
+    store.repositories.set("tenant:10", { ...store.repositories.get("tenant:10")!, selected: false });
+    const unselected = await app.inject({ method: "GET", url: "/api/ops/health", headers: headersFor("owner-token") });
+    expect(unselected.statusCode).toBe(200);
+    expect(unselected.json<{ repositories: unknown[] }>().repositories).toEqual([]);
+    store.repositories.set("tenant:10", { ...store.repositories.get("tenant:10")!, selected: true, accessStatus: "access_removed" });
+    const removed = await app.inject({ method: "GET", url: "/api/ops/health", headers: headersFor("owner-token") });
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json<{ repositories: unknown[] }>().repositories).toEqual([]);
+  });
+
   it("enforces the same owner authorization on every recovery endpoint", async () => {
     for (const [url, method] of [["/api/ops/repositories/repo-opaque/reconcile", "POST"], ["/api/ops/delivery-audit/retry", "POST"], ["/api/ops/delivery-repairs/resume", "POST"]] as const) {
       expect((await app.inject({ method, url })).statusCode).toBe(401);

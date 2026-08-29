@@ -88,7 +88,11 @@ export function deriveOwnerOperationalHealth(input: { now: Date; maintenance: Ma
     if (!window) { staleMaintenance = true; return { task, bucket: maintenanceWindowBucket(task, input.now), state: "failed_or_incomplete" as const }; }
     const tooOld = stale(window.completedAt ?? window.updatedAt ?? window.acceptedAt, input.now, maintenanceThreshold(task));
     if (tooOld) staleMaintenance = true;
-    const state: OwnerOperationalHealth["maintenance"][number]["state"] = window.completedAt ? "completed" : !window.lastErrorCode && !tooOld ? "running" : "failed_or_incomplete";
+    let state: OwnerOperationalHealth["maintenance"][number]["state"];
+    if (tooOld) state = "failed_or_incomplete";
+    else if (window.completedAt) state = "completed";
+    else if (!window.lastErrorCode) state = "running";
+    else state = "failed_or_incomplete";
     const completedAt = iso(window.completedAt);
     const errorCode = safeError(window.lastErrorCode);
     return { task, bucket: window.bucket, state, acceptedAt: window.acceptedAt.toISOString(), ...(completedAt ? { completedAt } : {}), ...(errorCode ? { errorCode } : {}) };

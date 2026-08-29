@@ -712,9 +712,11 @@ export class InMemoryM1Store implements M1Store {
     return [...latest.values()].map((window) => ({ ...window }));
   }
   async listRepositoryOperationalHealth(tenantId: string): Promise<RepositoryOperationalRecord[]> {
-    const repositories = await this.listRepositories(tenantId);
     const result: RepositoryOperationalRecord[] = [];
-    for (const repository of repositories) {
+    for (const repository of this.repositories.values()) {
+      if (repository.tenantId !== tenantId) continue;
+      if (repository.selected !== true) continue;
+      if (repository.accessStatus && repository.accessStatus !== "accessible") continue;
       const installation = [...this.installations.values()].find((value) => value.id === repository.installationId && value.tenantId === tenantId && (!value.status || value.status === "active"));
       if (!installation) continue;
       const generation = await this.getCurrentRepositoryReconciliationGeneration(tenantId, repository.id);

@@ -54,4 +54,61 @@ describeIntegration("M5.4 PostgreSQL operational aggregation", () => {
       await pool.end(); await admin.end();
     }
   });
+
+  it("includes only selected accessible repositories on an active installation", async () => {
+    const tenantId = randomUUID(); const userId = randomUUID(); const installationId = randomUUID();
+    const githubAppId = 800_000 + Number.parseInt(tenantId.replaceAll("-", "").slice(0, 6), 16);
+    const githubUserId = githubAppId + 1; const installationGithubId = githubAppId + 2;
+    const selectedGithubId = githubAppId + 3; const unselectedGithubId = githubAppId + 4;
+    const pool = createPool(databaseUrl as string, 3); const admin = createPool(databaseUrl as string, 2); const store = new PostgresM1Store(pool);
+    const now = new Date("2099-11-01T00:00:00Z");
+    try {
+      await store.upsertUser({ userId, tenantId, githubAccountId: githubUserId, login: "owner", displayName: "owner" });
+      await store.saveInstallation({ id: installationId, tenantId, githubInstallationId: installationGithubId, accountGithubAccountId: githubUserId });
+      await store.reconcileInstallationInventory({
+        tenantId,
+        githubInstallationId: installationGithubId,
+        observedAt: now,
+        repositories: [
+          { id: randomUUID(), tenantId, installationId, githubRepositoryId: selectedGithubId, ownerLogin: "owner", name: "selected", fullName: "owner/selected", private: true, defaultBranch: "main" },
+          { id: randomUUID(), tenantId, installationId, githubRepositoryId: unselectedGithubId, ownerLogin: "owner", name: "unselected", fullName: "owner/unselected", private: true, defaultBranch: "main" },
+        ],
+      });
+      const selected = await store.getRepositoryByGithubId(tenantId, selectedGithubId);
+      const unselected = await store.getRepositoryByGithubId(tenantId, unselectedGithubId);
+      expect(selected && unselected).toBeTruthy();
+      await store.selectRepository(tenantId, selected!.id);
+      expect(await store.listRepositoryOperationalHealth(tenantId)).toEqual([expect.objectContaining({ repositoryId: selected!.id, installationGithubId })]);
+
+      await store.unselectRepository(tenantId, selected!.id);
+      expect(await store.listRepositoryOperationalHealth(tenantId)).toEqual([]);
+
+      await store.selectRepository(tenantId, selected!.id);
+      await store.reconcileInstallationInventory({
+        tenantId,
+        githubInstallationId: installationGithubId,
+        observedAt: new Date(now.getTime() + 1_000),
+        repositories: [{ id: unselected!.id, tenantId, installationId, githubRepositoryId: unselectedGithubId, ownerLogin: "owner", name: "unselected", fullName: "owner/unselected", private: true, defaultBranch: "main" }],
+      });
+      expect(await store.getRepositoryByGithubId(tenantId, selectedGithubId)).toMatchObject({ accessStatus: "access_removed", selected: false });
+      expect(await store.listRepositoryOperationalHealth(tenantId)).toEqual([]);
+
+      await store.selectRepository(tenantId, unselected!.id);
+      expect(await store.listRepositoryOperationalHealth(tenantId)).toEqual([expect.objectContaining({ repositoryId: unselected!.id })]);
+
+      await store.updateInstallationLifecycle(installationGithubId, "suspended", now);
+      expect(await store.listRepositoryOperationalHealth(tenantId)).toEqual([]);
+    } finally {
+      await admin.query("delete from repository_access where tenant_id=$1", [tenantId]);
+      await admin.query("delete from repositories where tenant_id=$1", [tenantId]);
+      await admin.query("delete from github_installations where tenant_id=$1", [tenantId]);
+      await admin.query("delete from installation_routes where tenant_id=$1", [tenantId]);
+      await admin.query("delete from github_identities where user_id=$1", [userId]);
+      await admin.query("delete from tenant_members where tenant_id=$1", [tenantId]);
+      await admin.query("delete from users where id=$1", [userId]);
+      await admin.query("delete from github_accounts where github_account_id=$1", [githubUserId]);
+      await admin.query("delete from tenants where id=$1", [tenantId]);
+      await pool.end(); await admin.end();
+    }
+  });
 });

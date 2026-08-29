@@ -41,4 +41,36 @@ describe("M5.4 deterministic health derivation", () => {
     expect(deriveDeliveryAuditHealth({ ...base, status: "completed", completedAt: now, lastSuccessAt: now }, now).state).toBe("healthy");
     expect(deriveDeliveryAuditHealth({ ...base, status: "completed", completedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000), lastSuccessAt: new Date(now.getTime() - 13 * 60 * 60 * 1000), updatedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000) }, now).state).toBe("stale");
   });
+
+  it("treats overdue completed maintenance as failed_or_incomplete and keeps recent completed/running rows", () => {
+    const audit = { id: "audit", githubAppId: 1, currentRunId: runId, generation: 1, status: "completed" as const, pageNumber: 1, startedAt: now, updatedAt: now, completedAt: now, lastSuccessAt: now };
+    const hoursAgo = (hours: number) => new Date(now.getTime() - hours * 60 * 60 * 1000);
+    const stamp = (row: MaintenanceWindow, at: Date): MaintenanceWindow => ({ ...row, acceptedAt: at, updatedAt: at, completedAt: at });
+    const stateOf = (health: ReturnType<typeof deriveOwnerOperationalHealth>, task: MaintenanceWindow["task"]) => health.maintenance.find((row) => row.task === task)?.state;
+
+    const staleActive = deriveOwnerOperationalHealth({ now, maintenance: windows().map((row) => row.task === "active_reconciliation" ? stamp(row, hoursAgo(13)) : row), audit, repairCounts: zeroCounts(), repositories: [] });
+    expect(stateOf(staleActive, "active_reconciliation")).toBe("failed_or_incomplete");
+    expect(staleActive.overall).toBe("attention_required");
+
+    const staleAudit = deriveOwnerOperationalHealth({ now, maintenance: windows().map((row) => row.task === "delivery_audit" ? stamp(row, hoursAgo(13)) : row), audit, repairCounts: zeroCounts(), repositories: [] });
+    expect(stateOf(staleAudit, "delivery_audit")).toBe("failed_or_incomplete");
+    expect(staleAudit.overall).toBe("attention_required");
+
+    const staleAuthorized = deriveOwnerOperationalHealth({ now, maintenance: windows().map((row) => row.task === "authorized_reconciliation" ? stamp(row, hoursAgo(37)) : row), audit, repairCounts: zeroCounts(), repositories: [] });
+    expect(stateOf(staleAuthorized, "authorized_reconciliation")).toBe("failed_or_incomplete");
+    expect(staleAuthorized.overall).toBe("attention_required");
+
+    const recent = deriveOwnerOperationalHealth({ now, maintenance: windows(), audit, repairCounts: zeroCounts(), repositories: [] });
+    expect(recent.maintenance.map((row) => row.state)).toEqual(["completed", "completed", "completed"]);
+    expect(recent.overall).toBe("healthy");
+
+    const runningWindows = windows().map((row) => {
+      if (row.task !== "active_reconciliation") return row;
+      const { completedAt: _completedAt, ...rest } = row;
+      return { ...rest, acceptedAt: now, updatedAt: now };
+    });
+    const running = deriveOwnerOperationalHealth({ now, maintenance: runningWindows, audit, repairCounts: zeroCounts(), repositories: [] });
+    expect(stateOf(running, "active_reconciliation")).toBe("running");
+    expect(running.overall).toBe("degraded");
+  });
 });
