@@ -423,6 +423,53 @@ export const reconciliationGenerations = pgTable("reconciliation_generations", {
   uniqueIndex("reconciliation_generations_tenant_id_unique").on(table.tenantId, table.id),
 ]);
 
+export const githubDeliveryAudits = pgTable("github_delivery_audits", {
+  id: id(),
+  githubAppId: bigint("github_app_id", { mode: "number" }).notNull(),
+  currentRunId: uuid("current_run_id").notNull(),
+  generation: bigint("generation", { mode: "number" }).notNull(),
+  status: varchar("status", { length: 30 }).notNull().default("pending"),
+  listCursor: text("list_cursor"),
+  pageNumber: integer("page_number").notNull().default(1),
+  stopBeforeDeliveredAt: nullableTime("stop_before_delivered_at"),
+  newestDeliveredAtSeen: nullableTime("newest_delivered_at_seen"),
+  highWaterDeliveredAt: nullableTime("high_water_delivered_at"),
+  pausedUntil: nullableTime("paused_until"),
+  pauseReason: varchar("pause_reason", { length: 120 }),
+  lastErrorCode: varchar("last_error_code", { length: 120 }),
+  lastSuccessAt: nullableTime("last_success_at"),
+  startedAt: time("started_at"),
+  completedAt: nullableTime("completed_at"),
+  updatedAt: time("updated_at"),
+}, (table) => [
+  uniqueIndex("github_delivery_audits_app_unique").on(table.githubAppId),
+  uniqueIndex("github_delivery_audits_run_unique").on(table.githubAppId, table.currentRunId),
+]);
+
+export const githubDeliveryRepairs = pgTable("github_delivery_repairs", {
+  id: id(),
+  githubDeliveryGuid: varchar("github_delivery_guid", { length: 128 }).notNull(),
+  githubDeliveryId: bigint("github_delivery_id", { mode: "number" }).notNull(),
+  githubAppId: bigint("github_app_id", { mode: "number" }).notNull(),
+  auditRunId: uuid("audit_run_id"),
+  eventName: varchar("event_name", { length: 80 }).notNull(),
+  action: varchar("action", { length: 80 }),
+  installationGithubId: bigint("installation_github_id", { mode: "number" }),
+  repositoryGithubId: bigint("repository_github_id", { mode: "number" }),
+  status: varchar("status", { length: 30 }).notNull().default("pending"),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  lastRedeliveryRequestedAt: nullableTime("last_redelivery_requested_at"),
+  nextEligibleAt: nullableTime("next_eligible_at"),
+  lastGithubStatusCode: integer("last_github_status_code"),
+  lastGithubDeliveredAt: nullableTime("last_github_delivered_at"),
+  sanitizedErrorCode: varchar("sanitized_error_code", { length: 120 }),
+  createdAt: time("created_at"),
+  updatedAt: time("updated_at"),
+}, (table) => [
+  uniqueIndex("github_delivery_repairs_guid_unique").on(table.githubDeliveryGuid),
+  index("github_delivery_repairs_status_idx").on(table.status, table.nextEligibleAt),
+]);
+
 export const outbox = pgTable("outbox", {
   id: id(),
   tenantId: uuid("tenant_id").references(() => tenants.id),
@@ -460,6 +507,8 @@ export const schema = {
   syncJobs,
   syncCursors,
   reconciliationGenerations,
+  githubDeliveryAudits,
+  githubDeliveryRepairs,
   outbox,
 };
 

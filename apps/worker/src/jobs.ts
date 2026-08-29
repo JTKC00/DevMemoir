@@ -1,5 +1,5 @@
 import type { HistoricalSourceStage, M1Store } from "@devmemoir/db";
-import { GithubAccessError, GithubRateLimitPauseError, type GithubClient } from "@devmemoir/github";
+import { GithubAccessError, GithubRateLimitPauseError, type GithubAppClient, type GithubClient } from "@devmemoir/github";
 import { commitSyncLogicalKey, installationInventoryLogicalKey, type JobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { processDelivery } from "./processor.js";
@@ -8,11 +8,13 @@ import { refreshInstallationInventory } from "./inventory.js";
 import { processHistoricalBackfill, resumeHistoricalAfterInventory } from "./historical.js";
 import { ensureInstallationApiAvailable, guardInstallationGithub } from "./durable-github.js";
 import { processRepositoryReconciliation } from "./reconciliation.js";
+import { processGithubDeliveryAudit } from "./delivery-audit.js";
 
 export type QueueDependencies = {
   store: M1Store;
   jobs: JobPort;
   githubForInstallation: (installationId: number) => GithubClient;
+  githubApp?: GithubAppClient;
   logger: Logger;
   config: Parameters<typeof processDelivery>[1]["config"];
   now?: () => Date;
@@ -179,6 +181,11 @@ export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): 
   }
   if (kind.kind === "repository_reconciliation") {
     await processRepositoryReconciliation(kind.payload as SyncJobPayload, { ...deps, ownerGithubAccountId: deps.config.OWNER_GITHUB_USER_ID });
+    return;
+  }
+  if (kind.kind === "github_delivery_audit") {
+    if (!deps.githubApp) throw new Error("App-JWT GitHub client is required for delivery audit");
+    await processGithubDeliveryAudit(kind.payload as SyncJobPayload, { store: deps.store, jobs: deps.jobs, githubApp: deps.githubApp, logger: deps.logger, ...(deps.now ? { now: deps.now } : {}) });
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);

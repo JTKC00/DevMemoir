@@ -2,6 +2,12 @@ import {
   createId,
   canonicalLogicalEventKey,
   deliveryRedeliveryAction,
+  githubDeliveryAttemptSucceeded,
+  githubDeliveryIsExpired,
+  isTerminalDeliveryState,
+  isTerminalGithubDeliveryRepairStatus,
+  nextRedeliveryClaimLeaseAt,
+  nextRedeliveryEligibleAt,
   projectCanonicalFacts,
   repositoryAccessIsAvailable,
   type CommitFact,
@@ -342,6 +348,66 @@ export type ReconciliationGeneration = {
   supersededAt?: Date;
 };
 
+export type GithubDeliveryAudit = {
+  id: string;
+  githubAppId: number;
+  currentRunId: string;
+  generation: number;
+  status: "pending" | "in_progress" | "paused" | "completed";
+  listCursor?: string;
+  pageNumber: number;
+  stopBeforeDeliveredAt?: Date;
+  newestDeliveredAtSeen?: Date;
+  highWaterDeliveredAt?: Date;
+  pausedUntil?: Date;
+  pauseReason?: string;
+  lastErrorCode?: string;
+  lastSuccessAt?: Date;
+  startedAt: Date;
+  completedAt?: Date;
+  updatedAt: Date;
+};
+
+export type GithubDeliveryRepair = {
+  id: string;
+  githubDeliveryGuid: string;
+  githubDeliveryId: number;
+  githubAppId: number;
+  auditRunId?: string;
+  eventName: string;
+  action?: string;
+  installationGithubId?: number;
+  repositoryGithubId?: number;
+  status: "healthy" | "pending" | "requesting" | "requested" | "skipped_terminal" | "skipped_processing" | "exhausted" | "expired";
+  attemptCount: number;
+  lastRedeliveryRequestedAt?: Date;
+  nextEligibleAt?: Date;
+  lastGithubStatusCode?: number;
+  lastGithubDeliveredAt?: Date;
+  sanitizedErrorCode?: string;
+};
+
+export type GithubDeliveryRepairObservation = {
+  githubDeliveryGuid: string;
+  githubDeliveryId: number;
+  githubAppId: number;
+  auditRunId: string;
+  eventName: string;
+  action?: string;
+  installationGithubId?: number;
+  repositoryGithubId?: number;
+  statusCode: number;
+  deliveredAt: Date;
+  now: Date;
+};
+
+export type GithubDeliveryRedeliveryClaim = {
+  allowed: boolean;
+  reason: "claimed" | "healthy" | "terminal" | "processing" | "cooldown" | "exhausted" | "expired" | "stale";
+  repair: GithubDeliveryRepair;
+  localDelivery?: DeliveryRecord;
+};
+
 function branchName(ref: string): string {
   if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
   if (ref.startsWith("heads/")) return ref.slice("heads/".length);
@@ -414,6 +480,28 @@ export interface M1Store {
   pauseInstallationApi(input: { tenantId: string; installationId: string; pausedUntil: Date; reason: string }): Promise<void>;
   resumeInstallationApi(input: { tenantId: string; installationId: string; now: Date }): Promise<void>;
   getHistoricalSourceCounts(tenantId: string, repositoryId: string): Promise<HistoricalSourceCounts>;
+  getDeliveryByGuid(guid: string, tenantId: string): Promise<DeliveryRecord | undefined>;
+  getGithubDeliveryAudit(githubAppId: number): Promise<GithubDeliveryAudit | undefined>;
+  startGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; now: Date }): Promise<GithubDeliveryAudit>;
+  pauseGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; pausedUntil: Date; errorCode: string }): Promise<GithubDeliveryAudit | undefined>;
+  resumeGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; now: Date }): Promise<GithubDeliveryAudit | undefined>;
+  commitGithubDeliveryAuditPage(input: {
+    githubAppId: number;
+    auditRunId: string;
+    expectedPage: number;
+    expectedCursor?: string;
+    nextCursor?: string;
+    newestDeliveredAt?: Date;
+    reachedStop: boolean;
+    now: Date;
+  }): Promise<GithubDeliveryAudit | undefined>;
+  getGithubDeliveryRepair(guid: string): Promise<GithubDeliveryRepair | undefined>;
+  observeGithubDeliveryAttempt(input: GithubDeliveryRepairObservation): Promise<GithubDeliveryRepair>;
+  claimGithubDeliveryRedelivery(input: { guid: string; githubDeliveryId: number; now: Date; maxAttempts: number }): Promise<GithubDeliveryRedeliveryClaim>;
+  acceptGithubDeliveryRedelivery(input: { guid: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
+  deferGithubDeliveryRedelivery(input: { guid: string; resumeAt: Date; errorCode: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
+  listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]>;
+  markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
 }
 
 export class InMemoryM1Store implements M1Store {
@@ -439,6 +527,8 @@ export class InMemoryM1Store implements M1Store {
   readonly historicalIssues = new Map<string, HistoricalIssueFact>();
   readonly historicalReleases = new Map<string, HistoricalReleaseFact>();
   readonly reconciliationGenerations = new Map<string, ReconciliationGeneration>();
+  readonly githubDeliveryAudits = new Map<number, GithubDeliveryAudit>();
+  readonly githubDeliveryRepairs = new Map<string, GithubDeliveryRepair>();
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
 
@@ -653,6 +743,10 @@ export class InMemoryM1Store implements M1Store {
     Object.assign(delivery, patch);
   }
   async getDelivery(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> { return [...this.deliveries.values()].find((value) => value.id === id); }
+  async getDeliveryByGuid(guid: string, tenantId: string): Promise<DeliveryRecord | undefined> {
+    const delivery = this.deliveries.get(guid);
+    return delivery && delivery.tenantId === tenantId ? { ...delivery } : undefined;
+  }
   async claimDeliveryForProcessing(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> {
     const delivery = [...this.deliveries.values()].find((value) => value.id === id);
     if (!delivery || delivery.state === "processed" || delivery.state === "ignored") return undefined;
@@ -1049,5 +1143,177 @@ export class InMemoryM1Store implements M1Store {
       issues: [...this.historicalIssues.keys()].filter((key) => key.startsWith(prefix)).length,
       releases: [...this.historicalReleases.keys()].filter((key) => key.startsWith(prefix)).length,
     };
+  }
+
+  async getGithubDeliveryAudit(githubAppId: number): Promise<GithubDeliveryAudit | undefined> {
+    const audit = this.githubDeliveryAudits.get(githubAppId);
+    return audit ? { ...audit } : undefined;
+  }
+
+  async startGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; now: Date }): Promise<GithubDeliveryAudit> {
+    const existing = this.githubDeliveryAudits.get(input.githubAppId);
+    if (existing && existing.status !== "completed") {
+      if (existing.currentRunId === input.auditRunId && existing.status === "paused" && (!existing.pausedUntil || existing.pausedUntil <= input.now)) {
+        existing.status = "in_progress";
+        delete existing.pausedUntil;
+        delete existing.pauseReason;
+        existing.updatedAt = input.now;
+      }
+      return { ...existing };
+    }
+    const audit: GithubDeliveryAudit = {
+      id: existing?.id ?? createId(),
+      githubAppId: input.githubAppId,
+      currentRunId: input.auditRunId,
+      generation: (existing?.generation ?? 0) + 1,
+      status: "in_progress",
+      pageNumber: 1,
+      stopBeforeDeliveredAt: existing?.highWaterDeliveredAt ?? new Date(input.now.getTime() - 3 * 24 * 60 * 60 * 1000),
+      startedAt: input.now,
+      updatedAt: input.now,
+    };
+    this.githubDeliveryAudits.set(input.githubAppId, audit);
+    return { ...audit };
+  }
+
+  async pauseGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; pausedUntil: Date; errorCode: string }): Promise<GithubDeliveryAudit | undefined> {
+    const audit = this.githubDeliveryAudits.get(input.githubAppId);
+    if (!audit || audit.currentRunId !== input.auditRunId) return undefined;
+    audit.status = "paused";
+    audit.pausedUntil = input.pausedUntil;
+    audit.pauseReason = input.errorCode;
+    audit.lastErrorCode = input.errorCode;
+    audit.updatedAt = input.pausedUntil;
+    return { ...audit };
+  }
+
+  async resumeGithubDeliveryAudit(input: { githubAppId: number; auditRunId: string; now: Date }): Promise<GithubDeliveryAudit | undefined> {
+    const audit = this.githubDeliveryAudits.get(input.githubAppId);
+    if (!audit || audit.currentRunId !== input.auditRunId) return undefined;
+    if (audit.pausedUntil && audit.pausedUntil > input.now) return { ...audit };
+    audit.status = "in_progress";
+    delete audit.pausedUntil;
+    delete audit.pauseReason;
+    audit.updatedAt = input.now;
+    return { ...audit };
+  }
+
+  async commitGithubDeliveryAuditPage(input: {
+    githubAppId: number;
+    auditRunId: string;
+    expectedPage: number;
+    expectedCursor?: string;
+    nextCursor?: string;
+    newestDeliveredAt?: Date;
+    reachedStop: boolean;
+    now: Date;
+  }): Promise<GithubDeliveryAudit | undefined> {
+    const audit = this.githubDeliveryAudits.get(input.githubAppId);
+    if (!audit || audit.currentRunId !== input.auditRunId) return undefined;
+    if (audit.pageNumber !== input.expectedPage) return undefined;
+    if ((audit.listCursor ?? undefined) !== input.expectedCursor) return undefined;
+    if (input.newestDeliveredAt && (!audit.newestDeliveredAtSeen || input.newestDeliveredAt > audit.newestDeliveredAtSeen)) audit.newestDeliveredAtSeen = input.newestDeliveredAt;
+    if (input.reachedStop || !input.nextCursor) {
+      audit.status = "completed";
+      audit.completedAt = input.now;
+      audit.lastSuccessAt = input.now;
+      if (audit.newestDeliveredAtSeen) audit.highWaterDeliveredAt = audit.newestDeliveredAtSeen;
+      delete audit.listCursor;
+      audit.updatedAt = input.now;
+      return { ...audit };
+    }
+    audit.listCursor = input.nextCursor;
+    audit.pageNumber = input.expectedPage + 1;
+    audit.status = "in_progress";
+    audit.updatedAt = input.now;
+    return { ...audit };
+  }
+
+  async getGithubDeliveryRepair(guid: string): Promise<GithubDeliveryRepair | undefined> {
+    const repair = this.githubDeliveryRepairs.get(guid);
+    return repair ? { ...repair } : undefined;
+  }
+
+  async observeGithubDeliveryAttempt(input: GithubDeliveryRepairObservation): Promise<GithubDeliveryRepair> {
+    const existing = this.githubDeliveryRepairs.get(input.githubDeliveryGuid);
+    if (existing?.lastGithubDeliveredAt && existing.lastGithubDeliveredAt >= input.deliveredAt) return { ...existing };
+    const healthy = githubDeliveryAttemptSucceeded(input.statusCode);
+    const status: GithubDeliveryRepair["status"] = healthy ? "healthy" : existing?.status === "requesting" ? "requesting" : "pending";
+    const repair: GithubDeliveryRepair = {
+      id: existing?.id ?? createId(),
+      githubDeliveryGuid: input.githubDeliveryGuid,
+      githubDeliveryId: input.githubDeliveryId,
+      githubAppId: input.githubAppId,
+      auditRunId: input.auditRunId,
+      eventName: input.eventName,
+      ...(input.action ? { action: input.action } : {}),
+      ...(input.installationGithubId ? { installationGithubId: input.installationGithubId } : {}),
+      ...(input.repositoryGithubId ? { repositoryGithubId: input.repositoryGithubId } : {}),
+      status,
+      attemptCount: existing?.attemptCount ?? 0,
+      ...(existing?.lastRedeliveryRequestedAt ? { lastRedeliveryRequestedAt: existing.lastRedeliveryRequestedAt } : {}),
+      ...(existing?.nextEligibleAt ? { nextEligibleAt: existing.nextEligibleAt } : {}),
+      lastGithubStatusCode: input.statusCode,
+      lastGithubDeliveredAt: input.deliveredAt,
+      ...(existing?.sanitizedErrorCode ? { sanitizedErrorCode: existing.sanitizedErrorCode } : {}),
+    };
+    this.githubDeliveryRepairs.set(input.githubDeliveryGuid, repair);
+    return { ...repair };
+  }
+
+  async claimGithubDeliveryRedelivery(input: { guid: string; githubDeliveryId: number; now: Date; maxAttempts: number }): Promise<GithubDeliveryRedeliveryClaim> {
+    const repair = this.githubDeliveryRepairs.get(input.guid);
+    if (!repair) throw new Error("Delivery repair not found");
+    const localDelivery = [...this.deliveries.values()].find((delivery) => delivery.guid === input.guid);
+    const finish = (reason: GithubDeliveryRedeliveryClaim["reason"], status?: GithubDeliveryRepair["status"]): GithubDeliveryRedeliveryClaim => {
+      if (status) repair.status = status;
+      return { allowed: false, reason, repair: { ...repair }, ...(localDelivery ? { localDelivery: { ...localDelivery } } : {}) };
+    };
+    if (isTerminalGithubDeliveryRepairStatus(repair.status)) {
+      return finish(repair.status === "skipped_terminal" ? "terminal" : repair.status === "exhausted" ? "exhausted" : repair.status === "expired" ? "expired" : "healthy");
+    }
+    if (repair.lastGithubDeliveredAt && githubDeliveryIsExpired(repair.lastGithubDeliveredAt, input.now)) return finish("expired", "expired");
+    if (localDelivery && isTerminalDeliveryState(localDelivery.state)) return finish("terminal", "skipped_terminal");
+    if (localDelivery?.state === "processing") return finish("processing", "skipped_processing");
+    if (repair.attemptCount >= input.maxAttempts) return finish("exhausted", "exhausted");
+    if (repair.nextEligibleAt && repair.nextEligibleAt > input.now) return finish("cooldown");
+    repair.status = "requesting";
+    repair.githubDeliveryId = input.githubDeliveryId;
+    repair.nextEligibleAt = nextRedeliveryClaimLeaseAt(input.now);
+    return { allowed: true, reason: "claimed", repair: { ...repair }, ...(localDelivery ? { localDelivery: { ...localDelivery } } : {}) };
+  }
+
+  async acceptGithubDeliveryRedelivery(input: { guid: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const repair = this.githubDeliveryRepairs.get(input.guid);
+    if (!repair) return undefined;
+    if (repair.status === "requested" && repair.lastRedeliveryRequestedAt) return { ...repair };
+    repair.status = "requested";
+    repair.attemptCount += 1;
+    repair.lastRedeliveryRequestedAt = input.now;
+    repair.nextEligibleAt = nextRedeliveryEligibleAt(repair.attemptCount, input.now);
+    return { ...repair };
+  }
+
+  async deferGithubDeliveryRedelivery(input: { guid: string; resumeAt: Date; errorCode: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const repair = this.githubDeliveryRepairs.get(input.guid);
+    if (!repair) return undefined;
+    repair.status = "requesting";
+    repair.nextEligibleAt = input.resumeAt;
+    repair.sanitizedErrorCode = input.errorCode;
+    return { ...repair };
+  }
+
+  async listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]> {
+    return [...this.githubDeliveryRepairs.values()]
+      .filter((repair) => repair.githubAppId === githubAppId && (repair.status === "pending" || repair.status === "requesting" || repair.status === "requested" || repair.status === "skipped_processing"))
+      .map((repair) => ({ ...repair }));
+  }
+
+  async markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined> {
+    const repair = this.githubDeliveryRepairs.get(input.guid);
+    if (!repair) return undefined;
+    repair.status = input.status;
+    if (input.errorCode) repair.sanitizedErrorCode = input.errorCode;
+    return { ...repair };
   }
 }

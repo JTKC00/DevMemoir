@@ -4,12 +4,14 @@ import {
   GithubAccessError,
   GithubEndpointDeniedError,
   GithubRateLimitPauseError,
+  GithubTransientError,
   githubRefParameter,
   InstallationGithubClient,
   InstallationRequestLanes,
+  nextCursorFromLink,
   nextPageFromLink,
+  OctokitGithubClient,
   type GithubRequestResponse,
-  type OctokitGithubClient,
   stripCompareFiles,
 } from "./index.js";
 
@@ -40,6 +42,8 @@ describe("GitHub endpoint permit-list", () => {
       "GET /repos/{owner}/{repo}/pulls",
       "GET /repos/{owner}/{repo}/issues",
       "GET /repos/{owner}/{repo}/releases",
+      "GET /app/hook/deliveries",
+      "POST /app/hook/deliveries/{delivery_id}/attempts",
     ];
     for (const endpoint of allowed) expect(() => assertGithubEndpointAllowed(endpoint)).not.toThrow();
   });
@@ -52,6 +56,7 @@ describe("GitHub endpoint permit-list", () => {
       "GET /repos/{owner}/{repo}/zipball/{ref}",
       "POST /graphql",
       "GET /repos/{owner}/{repo}/pulls/{pull_number}/files",
+      "GET /app/hook/deliveries/{delivery_id}",
     ];
     for (const endpoint of denied) expect(() => assertGithubEndpointAllowed(endpoint)).toThrow(GithubEndpointDeniedError);
   });
@@ -261,8 +266,23 @@ describe("installation request rate-limit lanes", () => {
     } catch (error) {
       caught = error;
     }
-    expect(String(caught)).toBe("Error: GitHub installation request failed");
+    expect(caught).toBeInstanceOf(GithubTransientError);
+    expect(JSON.parse(JSON.stringify(caught))).toEqual({ class: "GithubTransientError", status: 500 });
+    expect(String(caught)).toContain("GitHub request failed");
     expect(JSON.stringify(caught)).not.toMatch(/PRIVATE|private\/file|ghp_/);
+  });
+
+  it("classifies transport failures without a GitHub status as sanitized transients", async () => {
+    const lanes = new InstallationRequestLanes();
+    let caught: unknown;
+    try {
+      await lanes.run(1, async () => { throw new Error("connect ECONNRESET PRIVATE REPOSITORY ghp_PRIVATE"); });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(GithubTransientError);
+    expect(JSON.parse(JSON.stringify(caught))).toEqual({ class: "GithubTransientError", status: 0 });
+    expect(String(caught)).not.toMatch(/PRIVATE|ECONNRESET|ghp_/);
   });
 
   it("serializes pause errors to opaque operational fields only", async () => {
@@ -289,5 +309,70 @@ describe("reference and pagination helpers", () => {
   it("parses the next page from a multi-link response", () => {
     expect(nextPageFromLink(pageLink)).toBe(2);
     expect(nextPageFromLink('<https://api.github.com/example?page=1>; rel="prev"')).toBeUndefined();
+  });
+
+  it("parses the next delivery-list cursor without retaining the GitHub URL", () => {
+    const link = '<https://api.github.com/app/hook/deliveries?cursor=v1_PRIVATE_CURSOR>; rel="next"';
+    expect(nextCursorFromLink(link)).toBe("v1_PRIVATE_CURSOR");
+    expect(nextCursorFromLink('<https://api.github.com/app/hook/deliveries?page=2>; rel="next"')).toBeUndefined();
+  });
+});
+
+class FakeAppGithub extends OctokitGithubClient {
+  readonly calls: RequestCall[] = [];
+  constructor(private readonly responses: GithubRequestResponse[]) {
+    super({ appId: 1, privateKey: "test-key" });
+  }
+  protected override async requestApp(route: string, parameters?: Record<string, unknown>): Promise<GithubRequestResponse> {
+    this.calls.push({ route, ...(parameters ? { parameters } : {}) });
+    const response = this.responses.shift();
+    if (!response) throw new Error("No fixture response");
+    return response;
+  }
+}
+
+describe("App JWT webhook delivery APIs", () => {
+  it("lists deliveries through the App JWT route and strips payload-bearing fields", async () => {
+    const client = new FakeAppGithub([{
+      headers: { link: '<https://api.github.com/app/hook/deliveries?cursor=v1_next>; rel="next"' },
+      data: [{
+        id: 99,
+        guid: "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+        delivered_at: "2026-08-28T00:00:00Z",
+        redelivery: false,
+        duration: 1.2,
+        status: "failed to connect to https://private.example/webhook",
+        status_code: 502,
+        event: "push",
+        action: null,
+        installation_id: 22,
+        repository_id: 10,
+        url: "https://private.example/webhook",
+        request: { headers: { Authorization: "ghp_PRIVATE" }, payload: { commits: [{ message: "PRIVATE_COMMIT_CANARY" }] } },
+        response: { payload: "PRIVATE BODY" },
+      }],
+    }]);
+    const page = await client.listAppWebhookDeliveries({ perPage: 100 });
+    expect(page).toEqual({
+      deliveries: [{
+        id: 99,
+        guid: "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+        deliveredAt: new Date("2026-08-28T00:00:00Z"),
+        redelivery: false,
+        statusCode: 502,
+        eventName: "push",
+        installationGithubId: 22,
+        repositoryGithubId: 10,
+      }],
+      nextCursor: "v1_next",
+    });
+    expect(JSON.stringify(page)).not.toMatch(/PRIVATE|ghp_|webhook|commits|duration|status":"failed/);
+    expect(client.calls[0]).toEqual({ route: "GET /app/hook/deliveries", parameters: { per_page: 100 } });
+  });
+
+  it("redelivers by GitHub numeric delivery id over the App JWT route", async () => {
+    const client = new FakeAppGithub([{ status: 202, data: {} }]);
+    await client.redeliverAppWebhookDelivery(99);
+    expect(client.calls[0]).toEqual({ route: "POST /app/hook/deliveries/{delivery_id}/attempts", parameters: { delivery_id: 99 } });
   });
 });
