@@ -1,6 +1,6 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
-import { emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
+import { collectQueueRebuildReconciliationTargets, emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
 import type {
   ActivityRecord,
   ActivityQuery,
@@ -17,6 +17,7 @@ import type {
   MaintenanceTarget,
   MaintenanceWindow,
   GithubDeliveryRepairStatusCounts,
+  QueueRebuildReconciliationTarget,
   RepositoryOperationalRecord,
   HistoricalActor,
   HistoricalCursor,
@@ -108,6 +109,21 @@ function historicalProgressFromRow(row: Row | undefined): HistoricalProgress | u
     ...(pausedUntil ? { pausedUntil } : {}),
     ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
     completenessState: row.completeness_state as HistoricalProgress["completenessState"],
+  };
+}
+
+function maintenanceWindowFromRow(row: Row | undefined): MaintenanceWindow | undefined {
+  if (!row) return undefined;
+  const completedAt = date(row.completed_at);
+  return {
+    task: String(row.task) as MaintenanceTask,
+    bucket: String(row.bucket),
+    jobKind: String(row.job_kind),
+    acceptedJobId: String(row.accepted_job_id),
+    acceptedAt: date(row.accepted_at) ?? new Date(0),
+    updatedAt: date(row.updated_at) ?? new Date(0),
+    ...(completedAt ? { completedAt } : {}),
+    ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}),
   };
 }
 
@@ -1392,28 +1408,40 @@ export class PostgresM1Store implements M1Store {
 
   async getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined> {
     const result = await this.pool.query<Row>("select task,bucket,job_kind,accepted_job_id,accepted_at,completed_at,last_error_code,updated_at from maintenance_windows where task=$1 and bucket=$2", [task, bucket]);
-    const row = result.rows[0];
-    if (!row) return undefined;
-    const completedAt = date(row.completed_at);
-    return {
-      task: String(row.task) as MaintenanceTask,
-      bucket: String(row.bucket),
-      jobKind: String(row.job_kind),
-      acceptedJobId: String(row.accepted_job_id),
-      acceptedAt: date(row.accepted_at) ?? new Date(0),
-      updatedAt: date(row.updated_at) ?? new Date(0),
-      ...(completedAt ? { completedAt } : {}),
-      ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}),
-    };
+    return maintenanceWindowFromRow(result.rows[0]);
+  }
+
+  async listIncompleteMaintenanceWindows(): Promise<MaintenanceWindow[]> {
+    const result = await this.pool.query<Row>("select task,bucket,job_kind,accepted_job_id,accepted_at,completed_at,last_error_code,updated_at from maintenance_windows where completed_at is null order by task,bucket");
+    return result.rows.map((row) => maintenanceWindowFromRow(row)).filter((row): row is MaintenanceWindow => Boolean(row));
+  }
+
+  async recoverIncompleteMaintenanceWindow(input: {
+    task: MaintenanceTask;
+    bucket: string;
+    expectedAcceptedJobId: string;
+    replacementJobId: string;
+    now: Date;
+  }): Promise<boolean> {
+    const result = await this.pool.query<Row>(
+      "update maintenance_windows set accepted_job_id=$4,updated_at=$5 where task=$1 and bucket=$2 and accepted_job_id=$3 and completed_at is null returning task",
+      [input.task, input.bucket, input.expectedAcceptedJobId, input.replacementJobId, input.now],
+    );
+    return Boolean(result.rows[0]);
+  }
+
+  async listQueueRebuildReconciliationTargets(): Promise<QueueRebuildReconciliationTarget[]> {
+    return collectQueueRebuildReconciliationTargets(this);
+  }
+
+  async getQueueRebuildDeliveryAudit(githubAppId: number): Promise<GithubDeliveryAudit | undefined> {
+    return this.getGithubDeliveryAudit(githubAppId);
   }
 
 
   async listMaintenanceOperationalHealth(): Promise<MaintenanceWindow[]> {
     const result = await this.pool.query<Row>("select distinct on (task) task,bucket,job_kind,accepted_job_id,accepted_at,completed_at,last_error_code,updated_at from maintenance_windows order by task,accepted_at desc");
-    return result.rows.map((row) => {
-      const completedAt = date(row.completed_at);
-      return { task: String(row.task) as MaintenanceTask, bucket: String(row.bucket), jobKind: String(row.job_kind), acceptedJobId: String(row.accepted_job_id), acceptedAt: date(row.accepted_at) ?? new Date(0), updatedAt: date(row.updated_at) ?? new Date(0), ...(completedAt ? { completedAt } : {}), ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}) };
-    });
+    return result.rows.map((row) => maintenanceWindowFromRow(row)).filter((row): row is MaintenanceWindow => Boolean(row));
   }
 
   async listRepositoryOperationalHealth(tenantId: string): Promise<RepositoryOperationalRecord[]> {

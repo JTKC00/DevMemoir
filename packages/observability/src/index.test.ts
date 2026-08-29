@@ -20,4 +20,23 @@ describe("allowlist logger", () => {
     expect(capture.text()).toContain("repo-1");
     expect(capture.text()).not.toContain("message");
   });
+
+  it("emits queue rebuild counts and drops private fields", async () => {
+    const capture = createCanarySink();
+    const logger = createLogger(capture.sink);
+    logger.info({
+      event_type: "queue_rebuild",
+      result: "completed",
+      reconciliation_count: 2,
+      audit_count: 1,
+      repair_count: 4,
+      maintenance_count: 1,
+      blocked_count: 1,
+      repository_name: "PRIVATE_REPOSITORY_NAME",
+      token: "PRIVATE_TOKEN",
+    });
+    expect(capture.text()).toContain("queue_rebuild");
+    expect(capture.text()).toContain("\"reconciliation_count\":2");
+    expect(capture.text()).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_TOKEN/);
+  });
 });

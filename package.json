@@ -13,7 +13,8 @@
     "test:watch": "pnpm -r --if-present test:watch",
     "typecheck": "pnpm build && pnpm -r --if-present typecheck",
     "db:generate": "pnpm --filter @devmemoir/db db:generate",
-    "db:migrate": "pnpm --filter @devmemoir/db db:migrate"
+    "db:migrate": "pnpm --filter @devmemoir/db db:migrate",
+    "ops:queue-rebuild": "pnpm --filter @devmemoir/worker ops:queue-rebuild"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",

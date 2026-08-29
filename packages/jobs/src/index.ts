@@ -44,6 +44,8 @@ export type SyncJobPayload = {
   cursor?: string;
   githubDeliveryId?: number;
   maintenanceTask?: MaintenanceTask;
+  /** Durable M5.3 bucket. Recovery ticks must reuse the incomplete window's bucket. */
+  maintenanceBucket?: string;
 };
 
 export type QueueJob<T = unknown> = {
@@ -77,6 +79,7 @@ export class InMemoryJobPort implements JobPort {
   readonly jobs = new Map<string, QueueJob>();
   readonly schedules = new Map<string, JobSchedule>();
   readonly schedulePayloads = new Map<string, object>();
+  readonly startAfter = new Map<string, Date>();
   private sequence = 0;
 
   async start(): Promise<void> {}
@@ -91,11 +94,12 @@ export class InMemoryJobPort implements JobPort {
   async work<T extends object>(_kind: JobKind, _handler: (job: QueueJob<T>) => Promise<void>): Promise<void> {}
   async has(jobId: string, kind: JobKind): Promise<boolean> { return this.jobs.get(jobId)?.kind === kind; }
 
-  async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, _options?: { startAfter?: Date }): Promise<string> {
+  async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string> {
     const existing = [...this.jobs.values()].find((job) => job.kind === kind && job.logicalKey === logicalKey);
     if (existing) return existing.id;
     const id = `job-${++this.sequence}`;
     this.jobs.set(id, { id, kind, logicalKey, payload });
+    if (options?.startAfter) this.startAfter.set(id, options.startAfter);
     return id;
   }
 
@@ -109,12 +113,14 @@ export class InMemoryJobPort implements JobPort {
 }
 
 export class PgBossJobPort implements JobPort {
+  readonly schema: string;
   private readonly boss: PgBoss;
   private readonly kindsByJobId = new Map<string, JobKind>();
   private readonly jobIdsByLogicalKey = new Map<string, string>();
 
-  constructor(connectionString: string) {
-    this.boss = new PgBoss({ connectionString, max: 5 });
+  constructor(connectionString: string, options?: { schema?: string }) {
+    this.schema = options?.schema ?? "pgboss";
+    this.boss = new PgBoss({ connectionString, max: 5, schema: this.schema });
   }
 
   async start(): Promise<void> {
@@ -261,4 +267,13 @@ export function deliveryRepairWakeLogicalKey(githubAppId: number, deliveryGuid: 
 export function maintenanceTickLogicalKey(kind: MaintenanceJobKind, bucket: string): string {
   if (!/^\d{8}T\d{2}$|^\d{4}-\d{2}-\d{2}$/.test(bucket)) throw new Error("Invalid opaque maintenance bucket");
   return `maintenance:${kind}:${bucket}`;
+}
+
+/**
+ * Test/admin only. Drops a pg-boss operational schema so it can be recreated.
+ * Never call this from worker boot. Application tables are not touched.
+ */
+export async function resetPgBossOperationalSchema(executeSql: (text: string) => Promise<unknown>, schema = "pgboss"): Promise<void> {
+  if (!/^[a-z][a-z0-9_]*$/.test(schema)) throw new Error("Invalid pg-boss schema name");
+  await executeSql(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
 }

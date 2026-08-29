@@ -137,6 +137,8 @@ If the accepted job throws:
 - pg-boss may retry **that same job id**;
 - a different producer cannot insert a second window for the same `(task, bucket)`.
 
+If pg-boss operational state is lost, M5.5 queue rebuild may replace `accepted_job_id` on an **incomplete** window through `recoverIncompleteMaintenanceWindow` (compare-and-set). That is an exceptional queue-loss recovery transition, not normal scheduler or worker-boot behavior. See [M5_QUEUE_REBUILD_CONTRACT.md](./M5_QUEUE_REBUILD_CONTRACT.md). Completed windows remain terminal.
+
 Successful retry of the accepted job marks `completed_at`. After that the window is terminal:
 
 ```text

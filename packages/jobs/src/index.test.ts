@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryJobPort, MAINTENANCE_SCHEDULES, commitSyncLogicalKey, deliveryAuditLogicalKey, deliveryLogicalKey, deliveryRepairWakeLogicalKey, historicalBackfillLogicalKey, maintenanceTickLogicalKey, repositoryReconciliationLogicalKey } from "./index.js";
+import { InMemoryJobPort, MAINTENANCE_SCHEDULES, commitSyncLogicalKey, deliveryAuditLogicalKey, deliveryLogicalKey, deliveryRepairWakeLogicalKey, historicalBackfillLogicalKey, maintenanceTickLogicalKey, repositoryReconciliationLogicalKey, resetPgBossOperationalSchema } from "./index.js";
 
 describe("JobPort logical keys", () => {
   it("deduplicates the same logical delivery", async () => {
@@ -20,6 +20,14 @@ describe("JobPort logical keys", () => {
     expect(() => maintenanceTickLogicalKey("maintenance_active", "PRIVATE_REPO_CANARY")).toThrow("Invalid opaque maintenance bucket");
   });
 
+  it("records delayed startAfter without putting private content in keys", async () => {
+    const jobs = new InMemoryJobPort();
+    const resumeAt = new Date("2026-08-29T13:00:00Z");
+    const id = await jobs.enqueue("repository_reconciliation", "reconcile:repo:00000000-0000-4000-8000-000000000001:coordinator", { kind: "repository_reconciliation" }, { startAfter: resumeAt });
+    expect(jobs.startAfter.get(id)).toEqual(resumeAt);
+    expect(JSON.stringify([...jobs.jobs.values()])).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_COMMIT_MESSAGE|PRIVATE_TOKEN/);
+  });
+
   it("upserts recurring maintenance schedules by queue name", async () => {
     const jobs = new InMemoryJobPort();
     for (let index = 0; index < 3; index += 1) {
@@ -29,5 +37,9 @@ describe("JobPort logical keys", () => {
     }
     expect(await jobs.getSchedules()).toEqual(MAINTENANCE_SCHEDULES.map((schedule) => ({ name: schedule.kind, cron: schedule.cron })));
     expect(JSON.stringify([...jobs.schedulePayloads.values()])).not.toMatch(/PRIVATE_REPO_CANARY|PRIVATE_COMMIT_CANARY|PRIVATE_PR_TITLE_CANARY/);
+  });
+
+  it("rejects unsafe pg-boss schema names for operational reset", async () => {
+    await expect(resetPgBossOperationalSchema(async () => undefined, "pgboss;drop")).rejects.toThrow("Invalid pg-boss schema name");
   });
 });
