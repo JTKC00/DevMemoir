@@ -287,9 +287,12 @@ export function maintenanceDayBucket(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
 
+export function maintenanceWindowBucket(task: MaintenanceTask, now: Date): string {
+  return task === "authorized_reconciliation" ? maintenanceDayBucket(now) : maintenanceSixHourBucket(now);
+}
+
 export function maintenanceReconciliationRunId(task: Exclude<MaintenanceTask, "delivery_audit">, repositoryId: string, now: Date): string {
-  const bucket = task === "authorized_reconciliation" ? maintenanceDayBucket(now) : maintenanceSixHourBucket(now);
-  return uuidv5(`${task}:${repositoryId}:${bucket}`, MAINTENANCE_NAMESPACE);
+  return uuidv5(`${task}:${repositoryId}:${maintenanceWindowBucket(task, now)}`, MAINTENANCE_NAMESPACE);
 }
 
 export function truncatePrivateText(value: string | undefined, limit = 4000): string | undefined {

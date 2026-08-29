@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
 import { InMemoryM1Store } from "@devmemoir/db";
-import { maintenanceReconciliationRunId } from "@devmemoir/domain";
+import { maintenanceReconciliationRunId, maintenanceWindowBucket } from "@devmemoir/domain";
 import type { GithubAppClient, GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort, MAINTENANCE_SCHEDULES, type SyncJobPayload } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
@@ -105,6 +105,10 @@ function repositoryIds(payloads: SyncJobPayload[]): string[] {
   return payloads.map((payload) => payload.repositoryId).filter((id): id is string => Boolean(id)).sort();
 }
 
+const activePayload: SyncJobPayload = { kind: "maintenance_active", maintenanceTask: "active_reconciliation" };
+const dailyPayload: SyncJobPayload = { kind: "maintenance_authorized", maintenanceTask: "authorized_reconciliation" };
+const auditPayload: SyncJobPayload = { kind: "maintenance_audit", maintenanceTask: "delivery_audit" };
+
 describe("M5.3 periodic maintenance scheduler", () => {
   it("registers three singleton schedules idempotently", async () => {
     const jobs = new InMemoryJobPort();
@@ -117,7 +121,7 @@ describe("M5.3 periodic maintenance scheduler", () => {
   it("enqueues M5.1 work for active repositories A/B and skips inaccessible C without mutating source", async () => {
     const scope = await setup();
     const eventsBefore = scope.store.events.length;
-    await processMaintenanceTick({ kind: "maintenance_active", maintenanceTask: "active_reconciliation" }, scope.deps);
+    await processMaintenanceTick(activePayload, scope.deps, "job-active-1");
     const payloads = reconciliationJobs(scope.jobs);
     expect(repositoryIds(payloads)).toEqual([repoA.repositoryId, repoB.repositoryId].sort());
     expect(payloads.some((payload) => payload.repositoryId === repoC.repositoryId)).toBe(false);
@@ -128,28 +132,20 @@ describe("M5.3 periodic maintenance scheduler", () => {
 
   it("uses the daily pass for all authorized repositories including stale ones", async () => {
     const scope = await setup();
-    await processMaintenanceTick({ kind: "maintenance_active", maintenanceTask: "active_reconciliation" }, scope.deps);
+    await processMaintenanceTick(activePayload, scope.deps, "job-active-1");
     const activeIds = repositoryIds(reconciliationJobs(scope.jobs));
     expect(activeIds).toEqual([repoA.repositoryId, repoB.repositoryId].sort());
     expect(activeIds).not.toContain(repoD.repositoryId);
 
-    await processMaintenanceTick({ kind: "maintenance_authorized", maintenanceTask: "authorized_reconciliation" }, scope.deps);
+    await processMaintenanceTick(dailyPayload, scope.deps, "job-daily-1");
     const dailyIds = [...new Set(repositoryIds(reconciliationJobs(scope.jobs)))].sort();
     expect(dailyIds).toEqual([repoA.repositoryId, repoB.repositoryId, repoD.repositoryId].sort());
     expect(dailyIds).not.toContain(repoC.repositoryId);
     expect(reconciliationJobs(scope.jobs).some((payload) => payload.repositoryId === repoD.repositoryId && payload.reconciliationRunId === maintenanceReconciliationRunId("authorized_reconciliation", repoD.repositoryId, now()))).toBe(true);
   });
 
-  it("reuses M5.1 logical keys and current generations instead of creating parallel work", async () => {
+  it("reuses M5.1 current generations on the accepted window and no-ops a second producer", async () => {
     const scope = await setup();
-    const payload: SyncJobPayload = { kind: "maintenance_active", maintenanceTask: "active_reconciliation" };
-    await processMaintenanceTick(payload, scope.deps);
-    await processMaintenanceTick(payload, scope.deps);
-    const first = reconciliationJobs(scope.jobs);
-    expect(first).toHaveLength(2);
-    const expectedRunId = maintenanceReconciliationRunId("active_reconciliation", repoA.repositoryId, now());
-    expect(first.find((row) => row.repositoryId === repoA.repositoryId)?.reconciliationRunId).toBe(expectedRunId);
-
     const existingRunId = "00000000-0000-4000-8000-0000000000ff";
     await scope.store.startRepositoryReconciliation({
       tenantId: repoA.tenantId,
@@ -159,46 +155,128 @@ describe("M5.3 periodic maintenance scheduler", () => {
       reconciliationRunId: existingRunId,
       now: now(),
     });
-    await processMaintenanceTick(payload, scope.deps);
-    const after = reconciliationJobs(scope.jobs).filter((row) => row.repositoryId === repoA.repositoryId);
-    expect(after.some((row) => row.reconciliationRunId === existingRunId)).toBe(true);
+    await processMaintenanceTick(activePayload, scope.deps, "job-active-1");
+    expect(reconciliationJobs(scope.jobs).find((row) => row.repositoryId === repoA.repositoryId)?.reconciliationRunId).toBe(existingRunId);
+    await processMaintenanceTick(activePayload, scope.deps, "job-active-2");
+    expect(reconciliationJobs(scope.jobs).filter((row) => row.repositoryId === repoA.repositoryId)).toHaveLength(1);
+    expect(await scope.store.getMaintenanceWindow("active_reconciliation", maintenanceWindowBucket("active_reconciliation", now()))).toMatchObject({ acceptedJobId: "job-active-1" });
   });
 
-  it("starts or resumes the existing M5.2 audit generation and does not bypass a pause", async () => {
+  it("claims a delivery-audit window once; a later tick does not bypass pause or start a new generation", async () => {
     const scope = await setup();
     const auditRunId = "00000000-0000-4000-8000-0000000000aa";
     await scope.store.startGithubDeliveryAudit({ githubAppId, auditRunId, now: now() });
-    await processQueueJob({ id: "tick-1", kind: "maintenance_audit", logicalKey: "maintenance_audit", payload: { kind: "maintenance_audit", maintenanceTask: "delivery_audit" } }, scope.deps);
+    await processQueueJob({ id: "tick-1", kind: "maintenance_audit", logicalKey: "maintenance_audit", payload: auditPayload }, scope.deps);
     const inProgress = await scope.store.getGithubDeliveryAudit(githubAppId);
-    expect(inProgress).toMatchObject({ currentRunId: auditRunId, status: "in_progress" });
+    expect(inProgress).toMatchObject({ currentRunId: auditRunId, status: "in_progress", generation: 1 });
 
     const pausedUntil = new Date("2026-08-29T12:15:00Z");
     await scope.store.pauseGithubDeliveryAudit({ githubAppId, auditRunId, pausedUntil, errorCode: "github_primary_rate_limit" });
-    await processMaintenanceTick({ kind: "maintenance_audit", maintenanceTask: "delivery_audit" }, scope.deps);
+    await processMaintenanceTick(auditPayload, scope.deps, "tick-2");
     const paused = await scope.store.getGithubDeliveryAudit(githubAppId);
-    expect(paused).toMatchObject({ currentRunId: auditRunId, status: "paused" });
+    expect(paused).toMatchObject({ currentRunId: auditRunId, status: "paused", generation: 1 });
     expect(paused?.pausedUntil).toEqual(pausedUntil);
-    const auditJobs = [...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit");
-    expect(auditJobs.some((job) => job.logicalKey.includes(`wake:${pausedUntil.getTime()}`))).toBe(true);
-    expect(auditJobs.every((job) => (job.payload as SyncJobPayload).auditRunId === auditRunId)).toBe(true);
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
   });
 
   it("does not replay missed intervals as a catch-up storm", async () => {
     const jobs = new InMemoryJobPort();
-    await enqueueCurrentMaintenanceTicks(jobs);
-    await enqueueCurrentMaintenanceTicks(jobs);
-    await enqueueCurrentMaintenanceTicks(jobs);
+    await enqueueCurrentMaintenanceTicks(jobs, now());
+    await enqueueCurrentMaintenanceTicks(jobs, now());
+    await enqueueCurrentMaintenanceTicks(jobs, now());
     expect([...jobs.jobs.values()].map((job) => job.kind).sort()).toEqual(["maintenance_active", "maintenance_audit", "maintenance_authorized"]);
   });
 
-  it("keeps private canaries out of scheduler keys, payloads, logs, and schedule metadata", async () => {
+  it("accepts one sequential redeploy per task in the same bucket", async () => {
+    const scope = await setup();
+    await processMaintenanceTick(activePayload, scope.deps, "worker-a");
+    await processMaintenanceTick(dailyPayload, scope.deps, "worker-a");
+    await processMaintenanceTick(auditPayload, scope.deps, "worker-a");
+    const reconcileAfterFirst = reconciliationJobs(scope.jobs).length;
+    const auditAfterFirst = [...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit").length;
+    await processMaintenanceTick(activePayload, scope.deps, "worker-b");
+    await processMaintenanceTick(dailyPayload, scope.deps, "worker-b");
+    await processMaintenanceTick(auditPayload, scope.deps, "worker-b");
+    expect(reconciliationJobs(scope.jobs)).toHaveLength(reconcileAfterFirst);
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(auditAfterFirst);
+  });
+
+  it("treats 12:05 boot and 12:30 cron as the same audit bucket", async () => {
+    const scope = await setup();
+    const boot = { ...scope.deps, now: () => new Date("2026-08-29T12:05:00Z") };
+    const cron = { ...scope.deps, now: () => new Date("2026-08-29T12:30:00Z") };
+    await processMaintenanceTick(auditPayload, boot, "boot-1205");
+    await processMaintenanceTick(auditPayload, cron, "cron-1230");
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
+    expect(await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12")).toMatchObject({ acceptedJobId: "boot-1205" });
+  });
+
+  it("allows the reverse order of cron then redeploy in the same audit bucket", async () => {
+    const scope = await setup();
+    const cron = { ...scope.deps, now: () => new Date("2026-08-29T12:30:00Z") };
+    const deploy = { ...scope.deps, now: () => new Date("2026-08-29T12:45:00Z") };
+    await processMaintenanceTick(auditPayload, cron, "cron-1230");
+    await processMaintenanceTick(auditPayload, deploy, "boot-1245");
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.generation).toBe(1);
+  });
+
+  it("allows the next 6h and next daily buckets independently", async () => {
+    const scope = await setup();
+    await processMaintenanceTick(activePayload, { ...scope.deps, now: () => new Date("2026-08-29T12:00:00Z") }, "active-12");
+    await processMaintenanceTick(activePayload, { ...scope.deps, now: () => new Date("2026-08-29T18:00:00Z") }, "active-18");
+    expect(await scope.store.getMaintenanceWindow("active_reconciliation", "20260829T12")).toMatchObject({ acceptedJobId: "active-12" });
+    expect(await scope.store.getMaintenanceWindow("active_reconciliation", "20260829T18")).toMatchObject({ acceptedJobId: "active-18" });
+    await processMaintenanceTick(dailyPayload, { ...scope.deps, now: () => new Date("2026-08-29T00:00:00Z") }, "day-29");
+    await processMaintenanceTick(dailyPayload, { ...scope.deps, now: () => new Date("2026-08-30T00:00:00Z") }, "day-30");
+    expect(await scope.store.getMaintenanceWindow("authorized_reconciliation", "2026-08-29")).toMatchObject({ acceptedJobId: "day-29" });
+    expect(await scope.store.getMaintenanceWindow("authorized_reconciliation", "2026-08-30")).toMatchObject({ acceptedJobId: "day-30" });
+  });
+
+  it("retries the accepted job after failure and does not let a second producer claim", async () => {
+    const scope = await setup();
+    const failing = { store: scope.store, jobs: scope.jobs, githubForInstallation: scope.deps.githubForInstallation, logger: scope.deps.logger, config: scope.deps.config, now };
+    await expect(processMaintenanceTick(auditPayload, failing, "job-1")).rejects.toThrow("App-JWT GitHub client is required for delivery audit");
+    expect(await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12")).toMatchObject({ acceptedJobId: "job-1", lastErrorCode: "tick_failed" });
+    expect((await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12"))?.completedAt).toBeUndefined();
+    await processMaintenanceTick(auditPayload, scope.deps, "job-1");
+    expect((await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12"))?.completedAt).toEqual(now());
+    const generation = (await scope.store.getGithubDeliveryAudit(githubAppId))?.generation;
+    await processMaintenanceTick(auditPayload, scope.deps, "job-2");
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.generation).toBe(generation);
+    expect([...scope.jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
+  });
+
+  it("does not start a second M5.2 generation after the accepted audit completes", async () => {
+    const scope = await setup();
+    await processMaintenanceTick(auditPayload, scope.deps, "audit-1");
+    const first = await scope.store.getGithubDeliveryAudit(githubAppId);
+    expect(first?.generation).toBe(1);
+    await scope.store.commitGithubDeliveryAuditPage({
+      githubAppId,
+      auditRunId: first?.currentRunId as string,
+      expectedPage: 1,
+      reachedStop: true,
+      now: now(),
+    });
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.status).toBe("completed");
+    await processMaintenanceTick(auditPayload, scope.deps, "audit-2");
+    expect(await scope.store.getGithubDeliveryAudit(githubAppId)).toMatchObject({ generation: 1, status: "completed" });
+  });
+
+  it("keeps private canaries out of scheduler keys, payloads, logs, windows, and schedule metadata", async () => {
     const scope = await setup();
     await registerMaintenanceSchedules(scope.jobs);
-    await enqueueCurrentMaintenanceTicks(scope.jobs);
-    await processMaintenanceTick({ kind: "maintenance_active", maintenanceTask: "active_reconciliation" }, scope.deps);
-    await processMaintenanceTick({ kind: "maintenance_authorized", maintenanceTask: "authorized_reconciliation" }, scope.deps);
-    await processMaintenanceTick({ kind: "maintenance_audit", maintenanceTask: "delivery_audit" }, scope.deps);
-    const text = operationalText(scope);
+    await enqueueCurrentMaintenanceTicks(scope.jobs, now());
+    await processMaintenanceTick(activePayload, scope.deps, "job-active-1");
+    await processMaintenanceTick(dailyPayload, scope.deps, "job-daily-1");
+    await processMaintenanceTick(auditPayload, scope.deps, "job-audit-1");
+    const windows = [
+      await scope.store.getMaintenanceWindow("active_reconciliation", "20260829T12"),
+      await scope.store.getMaintenanceWindow("authorized_reconciliation", "2026-08-29"),
+      await scope.store.getMaintenanceWindow("delivery_audit", "20260829T12"),
+    ];
+    const text = `${operationalText(scope)}\n${JSON.stringify(windows)}`;
     expect(text).not.toMatch(/PRIVATE_REPO_CANARY|PRIVATE_COMMIT_CANARY|PRIVATE_PR_TITLE_CANARY/);
     for (const job of scope.jobs.jobs.values()) {
       expect(job.logicalKey).not.toMatch(/PRIVATE_REPO_CANARY|PRIVATE_COMMIT_CANARY|PRIVATE_PR_TITLE_CANARY/);

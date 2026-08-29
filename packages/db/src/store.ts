@@ -16,6 +16,7 @@ import {
   type DeliveryState,
   type DevelopmentEvent,
   type CanonicalProjectionInput,
+  type MaintenanceTask,
   type RepositoryAccessStatus,
 } from "@devmemoir/domain";
 
@@ -96,6 +97,17 @@ export type MaintenanceTarget = {
   tenantId: string;
   repositoryId: string;
   installationGithubId: number;
+};
+
+export type MaintenanceWindow = {
+  task: MaintenanceTask;
+  bucket: string;
+  jobKind: string;
+  acceptedJobId: string;
+  acceptedAt: Date;
+  updatedAt: Date;
+  completedAt?: Date;
+  lastErrorCode?: string;
 };
 
 export type InventoryReconcileResult = {
@@ -448,6 +460,10 @@ export interface M1Store {
   listRepositories(tenantId: string): Promise<RepositoryRecord[]>;
   listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]>;
   listMaintenanceTargets(input?: { activeSince?: Date }): Promise<MaintenanceTarget[]>;
+  claimMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobKind: string; jobId: string; now: Date }): Promise<boolean>;
+  completeMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobId: string; now: Date }): Promise<void>;
+  recordMaintenanceWindowError(input: { task: MaintenanceTask; bucket: string; jobId: string; errorCode: string; now: Date }): Promise<void>;
+  getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined>;
   selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult>;
@@ -536,6 +552,7 @@ export class InMemoryM1Store implements M1Store {
   readonly reconciliationGenerations = new Map<string, ReconciliationGeneration>();
   readonly githubDeliveryAudits = new Map<number, GithubDeliveryAudit>();
   readonly githubDeliveryRepairs = new Map<string, GithubDeliveryRepair>();
+  readonly maintenanceWindows = new Map<string, MaintenanceWindow>();
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
 
@@ -640,6 +657,36 @@ export class InMemoryM1Store implements M1Store {
       }
     }
     return targets;
+  }
+  async claimMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobKind: string; jobId: string; now: Date }): Promise<boolean> {
+    const key = `${input.task}:${input.bucket}`;
+    const existing = this.maintenanceWindows.get(key);
+    if (existing) return existing.acceptedJobId === input.jobId;
+    this.maintenanceWindows.set(key, {
+      task: input.task,
+      bucket: input.bucket,
+      jobKind: input.jobKind,
+      acceptedJobId: input.jobId,
+      acceptedAt: input.now,
+      updatedAt: input.now,
+    });
+    return true;
+  }
+  async completeMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobId: string; now: Date }): Promise<void> {
+    const window = this.maintenanceWindows.get(`${input.task}:${input.bucket}`);
+    if (!window || window.acceptedJobId !== input.jobId || window.completedAt) return;
+    window.completedAt = input.now;
+    window.updatedAt = input.now;
+  }
+  async recordMaintenanceWindowError(input: { task: MaintenanceTask; bucket: string; jobId: string; errorCode: string; now: Date }): Promise<void> {
+    const window = this.maintenanceWindows.get(`${input.task}:${input.bucket}`);
+    if (!window || window.acceptedJobId !== input.jobId) return;
+    window.lastErrorCode = input.errorCode;
+    window.updatedAt = input.now;
+  }
+  async getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined> {
+    const window = this.maintenanceWindows.get(`${task}:${bucket}`);
+    return window ? { ...window } : undefined;
   }
   async selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
     const repository = await this.getRepositoryById(tenantId, repositoryId);

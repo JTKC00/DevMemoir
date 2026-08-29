@@ -190,7 +190,7 @@ export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): 
     return;
   }
   if (kind.kind === "maintenance_active" || kind.kind === "maintenance_authorized" || kind.kind === "maintenance_audit") {
-    await processMaintenanceTick(kind.payload as SyncJobPayload, deps);
+    await processMaintenanceTick(kind.payload as SyncJobPayload, deps, kind.id);
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);

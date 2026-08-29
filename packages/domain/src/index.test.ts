@@ -10,6 +10,7 @@ import {
   maintenanceDayBucket,
   maintenanceReconciliationRunId,
   maintenanceSixHourBucket,
+  maintenanceWindowBucket,
   nextRedeliveryEligibleAt,
   parseWebhook,
   projectCanonicalFacts,
@@ -74,6 +75,9 @@ describe("maintenance buckets", () => {
     expect(first).toBe(second);
     expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     expect(maintenanceReconciliationRunId("authorized_reconciliation", repositoryId, now)).not.toBe(first);
+    expect(maintenanceWindowBucket("delivery_audit", new Date("2026-08-29T12:05:00Z"))).toBe("20260829T12");
+    expect(maintenanceWindowBucket("delivery_audit", new Date("2026-08-29T12:30:00Z"))).toBe("20260829T12");
+    expect(maintenanceWindowBucket("active_reconciliation", new Date("2026-08-29T18:00:00Z"))).toBe("20260829T18");
     expect(JSON.stringify({ first, bucket: maintenanceSixHourBucket(now) })).not.toMatch(/PRIVATE_REPO_CANARY|PRIVATE_COMMIT_CANARY|PRIVATE_PR_TITLE_CANARY/);
   });
 });

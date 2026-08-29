@@ -6,6 +6,7 @@ import type { GithubAppClient } from "@devmemoir/github";
 import { InMemoryJobPort, MAINTENANCE_SCHEDULES, PgBossJobPort } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
 import { enqueueCurrentMaintenanceTicks, processMaintenanceTick, registerMaintenanceSchedules } from "./maintenance.js";
+import { maintenanceWindowBucket } from "@devmemoir/domain";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required for M5.3 PostgreSQL maintenance scheduler tests");
@@ -99,6 +100,7 @@ async function createScope(): Promise<Scope> {
 }
 
 async function cleanup(scope: Scope): Promise<void> {
+  await scope.admin.query("delete from maintenance_windows where bucket in ('20260829T12','2026-08-29','20260315T12','20260316T12')").catch(() => undefined);
   for (const tenantId of [scope.tenantA, scope.tenantB, scope.tenantC]) {
     await scope.admin.query("delete from sync_jobs where tenant_id=$1", [tenantId]);
     await scope.admin.query("delete from repository_access where tenant_id=$1", [tenantId]);
@@ -144,13 +146,13 @@ describeIntegration("M5.3 PostgreSQL maintenance scheduler", () => {
       githubApp,
       now: () => new Date("2026-08-29T12:00:00Z"),
     };
-    await processMaintenanceTick({ kind: "maintenance_active", maintenanceTask: "active_reconciliation" }, deps);
+    await processMaintenanceTick({ kind: "maintenance_active", maintenanceTask: "active_reconciliation" }, deps, "job-active-1");
     const active = [...jobs.jobs.values()].filter((job) => job.kind === "repository_reconciliation").map((job) => (job.payload as { repositoryId?: string }).repositoryId);
     expect(active).toContain(scope.repoA);
     expect(active).not.toContain(scope.repoB);
     expect(active).not.toContain(scope.repoC);
 
-    await processMaintenanceTick({ kind: "maintenance_authorized", maintenanceTask: "authorized_reconciliation" }, deps);
+    await processMaintenanceTick({ kind: "maintenance_authorized", maintenanceTask: "authorized_reconciliation" }, deps, "job-daily-1");
     const daily = [...jobs.jobs.values()].filter((job) => job.kind === "repository_reconciliation").map((job) => (job.payload as { repositoryId?: string }).repositoryId);
     expect(daily).toContain(scope.repoA);
     expect(daily).toContain(scope.repoB);
@@ -158,7 +160,19 @@ describeIntegration("M5.3 PostgreSQL maintenance scheduler", () => {
     expect(JSON.stringify([...jobs.jobs.values()])).not.toMatch(/private-owner|private-repository|PRIVATE_REPO_CANARY/);
   });
 
-  it("registers pg-boss schedules once under concurrent workers and executes a catch-up tick", async () => {
+  it("registers pg-boss schedules once and accepts exactly one current-bucket audit across restart", async () => {
+    const scope = await createScope();
+    const githubAppId = 960_000 + Number.parseInt(scope.tenantA.replaceAll("-", "").slice(0, 5), 16);
+    const windowNow = new Date("2026-03-15T12:05:00Z");
+    const jobsMemory = new InMemoryJobPort();
+    const deps = {
+      store: scope.store,
+      jobs: jobsMemory,
+      logger: createLogger(),
+      config: configFor(githubAppId),
+      githubApp,
+      now: () => windowNow,
+    };
     const workerA = new PgBossJobPort(databaseUrl as string);
     const workerB = new PgBossJobPort(databaseUrl as string);
     try {
@@ -167,26 +181,64 @@ describeIntegration("M5.3 PostgreSQL maintenance scheduler", () => {
       await Promise.all([registerMaintenanceSchedules(workerA), registerMaintenanceSchedules(workerB)]);
       const names = (await workerA.getSchedules()).filter((row) => row.name.startsWith("maintenance_")).map((row) => row.name).sort();
       expect(names).toEqual(["maintenance_active", "maintenance_audit", "maintenance_authorized"]);
-      expect((await workerA.getSchedules()).filter((row) => row.name === "maintenance_active")).toHaveLength(1);
       expect(MAINTENANCE_SCHEDULES.map((schedule) => schedule.cron)).toEqual(["0 */6 * * *", "0 0 * * *", "30 */6 * * *"]);
 
       await workerA.stop();
       await registerMaintenanceSchedules(workerB);
       expect((await workerB.getSchedules()).filter((row) => row.name.startsWith("maintenance_"))).toHaveLength(3);
 
-      await enqueueCurrentMaintenanceTicks(workerB);
-      await enqueueCurrentMaintenanceTicks(workerB);
+      await enqueueCurrentMaintenanceTicks(workerB, windowNow);
       let processed = 0;
-      await workerB.work("maintenance_authorized", async () => {
+      await workerB.work("maintenance_audit", async (job) => {
+        await processMaintenanceTick(job.payload, deps, job.id);
         processed += 1;
       });
       const started = Date.now();
       while (processed < 1 && Date.now() - started < 20_000) await new Promise((resolve) => setTimeout(resolve, 100));
       expect(processed).toBeGreaterThanOrEqual(1);
-      expect(processed).toBeLessThanOrEqual(2);
+      const first = await scope.store.getGithubDeliveryAudit(githubAppId);
+      expect(first?.generation).toBe(1);
+      await scope.store.commitGithubDeliveryAuditPage({
+        githubAppId,
+        auditRunId: first?.currentRunId as string,
+        expectedPage: 1,
+        reachedStop: true,
+        now: windowNow,
+      });
+
+      await processMaintenanceTick({ kind: "maintenance_audit", maintenanceTask: "delivery_audit" }, { ...deps, now: () => new Date("2026-03-15T12:45:00Z") }, "redeploy-1245");
+      expect(await scope.store.getGithubDeliveryAudit(githubAppId)).toMatchObject({ generation: 1, status: "completed" });
+      expect(await scope.store.getMaintenanceWindow("delivery_audit", maintenanceWindowBucket("delivery_audit", windowNow))).toMatchObject({ acceptedJobId: expect.any(String) });
     } finally {
       await workerB.stop().catch(() => undefined);
       await workerA.stop().catch(() => undefined);
+      await scope.admin.query("delete from github_delivery_audits where github_app_id=$1", [githubAppId]);
     }
   }, 60_000);
+
+  it("serializes concurrent producers onto one durable audit window", async () => {
+    const scope = await createScope();
+    const githubAppId = 970_000 + Number.parseInt(scope.tenantB.replaceAll("-", "").slice(0, 5), 16);
+    const jobs = new InMemoryJobPort();
+    const deps = {
+      store: scope.store,
+      jobs,
+      logger: createLogger(),
+      config: configFor(githubAppId),
+      githubApp,
+      now: () => new Date("2026-03-16T12:00:00Z"),
+    };
+    const payload = { kind: "maintenance_audit" as const, maintenanceTask: "delivery_audit" as const };
+    await Promise.all([
+      processMaintenanceTick(payload, deps, "concurrent-a"),
+      processMaintenanceTick(payload, deps, "concurrent-b"),
+    ]);
+    expect([...jobs.jobs.values()].filter((job) => job.kind === "github_delivery_audit")).toHaveLength(1);
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.generation).toBe(1);
+    const window = await scope.store.getMaintenanceWindow("delivery_audit", "20260316T12");
+    expect(window?.acceptedJobId === "concurrent-a" || window?.acceptedJobId === "concurrent-b").toBe(true);
+    await processMaintenanceTick(payload, deps, "concurrent-c");
+    expect((await scope.store.getGithubDeliveryAudit(githubAppId))?.generation).toBe(1);
+    await scope.admin.query("delete from github_delivery_audits where github_app_id=$1", [githubAppId]);
+  });
 });

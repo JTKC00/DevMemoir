@@ -1,7 +1,7 @@
-import { MAINTENANCE_ACTIVE_WINDOW_MS, maintenanceReconciliationRunId, type MaintenanceTask } from "@devmemoir/domain";
+import { MAINTENANCE_ACTIVE_WINDOW_MS, maintenanceReconciliationRunId, maintenanceWindowBucket, type MaintenanceTask } from "@devmemoir/domain";
 import type { M1Store, MaintenanceTarget } from "@devmemoir/db";
 import type { GithubAppClient } from "@devmemoir/github";
-import { MAINTENANCE_SCHEDULES, type JobPort, type SyncJobPayload } from "@devmemoir/jobs";
+import { MAINTENANCE_SCHEDULES, maintenanceTickLogicalKey, type JobPort, type SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit } from "./delivery-audit.js";
 import { enqueueRepositoryReconciliation } from "./reconciliation.js";
@@ -25,10 +25,10 @@ export async function registerMaintenanceSchedules(jobs: JobPort): Promise<void>
   }
 }
 
-export async function enqueueCurrentMaintenanceTicks(jobs: JobPort): Promise<void> {
+export async function enqueueCurrentMaintenanceTicks(jobs: JobPort, now = new Date()): Promise<void> {
   for (const schedule of MAINTENANCE_SCHEDULES) {
     const payload: SyncJobPayload = { kind: schedule.kind, maintenanceTask: schedule.task };
-    await jobs.enqueue(schedule.kind, schedule.kind, payload);
+    await jobs.enqueue(schedule.kind, maintenanceTickLogicalKey(schedule.kind, maintenanceWindowBucket(schedule.task, now)), payload);
   }
 }
 
@@ -81,17 +81,24 @@ async function tickDeliveryAudit(deps: MaintenanceDependencies, now: Date): Prom
   deps.logger.info({ maintenance_task: "delivery_audit", result: "enqueued", eligible_count: 1, enqueued_count: 1, skipped_count: 0 });
 }
 
-export async function processMaintenanceTick(payload: SyncJobPayload, deps: MaintenanceDependencies): Promise<void> {
+export async function processMaintenanceTick(payload: SyncJobPayload, deps: MaintenanceDependencies, jobId: string): Promise<void> {
   const task = payload.maintenanceTask ?? MAINTENANCE_SCHEDULES.find((schedule) => schedule.kind === payload.kind)?.task;
   if (!task) throw new Error("Unknown maintenance task");
   const now = currentTime(deps);
+  const bucket = maintenanceWindowBucket(task, now);
+  const jobKind = payload.kind ?? MAINTENANCE_SCHEDULES.find((schedule) => schedule.task === task)?.kind;
+  if (!jobKind) throw new Error("Unknown maintenance job kind");
+  const claimed = await deps.store.claimMaintenanceWindow({ task, bucket, jobKind, jobId, now });
+  if (!claimed) {
+    deps.logger.info({ maintenance_task: task, result: "skipped", eligible_count: 0, enqueued_count: 0, skipped_count: 1 });
+    return;
+  }
   try {
-    if (task === "delivery_audit") {
-      await tickDeliveryAudit(deps, now);
-      return;
-    }
-    await tickReconciliation(task, deps, now);
+    if (task === "delivery_audit") await tickDeliveryAudit(deps, now);
+    else await tickReconciliation(task, deps, now);
+    await deps.store.completeMaintenanceWindow({ task, bucket, jobId, now: currentTime(deps) });
   } catch (error) {
+    await deps.store.recordMaintenanceWindowError({ task, bucket, jobId, errorCode: "tick_failed", now: currentTime(deps) });
     deps.logger.error({ maintenance_task: task, result: "failed", error_code: "tick_failed" }, error);
     throw error;
   }
