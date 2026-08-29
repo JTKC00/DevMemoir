@@ -57,6 +57,10 @@ export type QueueJob<T = unknown> = {
 
 export type JobSchedule = { name: string; cron: string };
 
+type PgBossDatabaseAdapter = {
+  executeSql(text: string, values: unknown[]): Promise<{ rows: Array<{ id: string }> }>;
+};
+
 export interface JobPort {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -69,6 +73,8 @@ export interface JobPort {
    * never persist the logical key as a job ID.
    */
   enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string | undefined>;
+  /** Resolves the durable owner of an active logical singleton, including across process restarts. */
+  findActiveJobByLogicalKey(kind: JobKind, logicalKey: string): Promise<string | undefined>;
   work<T extends object>(kind: JobKind, handler: (job: QueueJob<T>) => Promise<void>): Promise<void>;
   has(jobId: string, kind: JobKind): Promise<boolean>;
   retry(jobId: string): Promise<void>;
@@ -103,6 +109,10 @@ export class InMemoryJobPort implements JobPort {
     return id;
   }
 
+  async findActiveJobByLogicalKey(kind: JobKind, logicalKey: string): Promise<string | undefined> {
+    return [...this.jobs.values()].find((job) => job.kind === kind && job.logicalKey === logicalKey)?.id;
+  }
+
   async retry(jobId: string): Promise<void> {
     if (!this.jobs.has(jobId)) throw new Error("Job not found");
   }
@@ -115,12 +125,17 @@ export class InMemoryJobPort implements JobPort {
 export class PgBossJobPort implements JobPort {
   readonly schema: string;
   private readonly boss: PgBoss;
+  private readonly pgBossDb: PgBossDatabaseAdapter;
   private readonly kindsByJobId = new Map<string, JobKind>();
   private readonly jobIdsByLogicalKey = new Map<string, string>();
 
   constructor(connectionString: string, options?: { schema?: string }) {
     this.schema = options?.schema ?? "pgboss";
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,49}$/.test(this.schema)) throw new Error("Invalid pg-boss schema name");
     this.boss = new PgBoss({ connectionString, max: 5, schema: this.schema });
+    // pg-boss 10.4 exposes getDb() at runtime but omits it from types.d.ts.
+    // Keep this compatibility dependency and all pg-boss schema SQL inside the adapter.
+    this.pgBossDb = (this.boss as PgBoss & { getDb(): PgBossDatabaseAdapter }).getDb();
   }
 
   async start(): Promise<void> {
@@ -162,6 +177,27 @@ export class PgBossJobPort implements JobPort {
     }
     this.kindsByJobId.set(id, kind);
     this.jobIdsByLogicalKey.set(logicalMapKey, id);
+    return id;
+  }
+
+  async findActiveJobByLogicalKey(kind: JobKind, logicalKey: string): Promise<string | undefined> {
+    const result = await this.pgBossDb.executeSql(
+      `SELECT id::text AS id
+       FROM ${this.schema}.job
+       WHERE name = $1
+         AND singleton_key = $2
+         AND state IN ('created', 'retry', 'active')
+       ORDER BY CASE state WHEN 'created' THEN 1 WHEN 'retry' THEN 2 ELSE 3 END,
+                created_on DESC,
+                id
+       LIMIT 1`,
+      [kind, logicalKey],
+    );
+    const id = result.rows[0]?.id;
+    if (id) {
+      this.kindsByJobId.set(id, kind);
+      this.jobIdsByLogicalKey.set(`${kind}:${logicalKey}`, id);
+    }
     return id;
   }
 

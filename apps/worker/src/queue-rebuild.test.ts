@@ -112,6 +112,21 @@ function captureText(jobs: InMemoryJobPort, logs: string, result: unknown): stri
 }
 
 describe("M5.5 queue rebuild", () => {
+  it("counts a missing maintenance replacement as a sanitized failure", async () => {
+    const store = new InMemoryM1Store();
+    const jobs = new InMemoryJobPort();
+    const capture = createCanarySink();
+    await store.claimMaintenanceWindow({ task: "delivery_audit", bucket: "20260829T12", jobKind: "maintenance_audit", jobId: "old-job", now });
+    jobs.enqueue = async () => undefined as never;
+    jobs.findActiveJobByLogicalKey = async () => undefined;
+    const result = await rebuildQueue({ store, jobs, githubAppId, logger: createLogger(capture.sink), now: () => now });
+    expect(result.result).toBe("partial");
+    expect(result.maintenance.ownershipRecovered).toBe(0);
+    expect((await store.getMaintenanceWindow("delivery_audit", "20260829T12"))?.acceptedJobId).toBe("old-job");
+    expect(capture.text()).toContain("maintenance_replacement_job_missing");
+    expect(capture.text()).not.toMatch(canary);
+  });
+
   it("dry-run inspects durable truth without queue or source mutation", async () => {
     const store = new InMemoryM1Store();
     const jobs = new InMemoryJobPort();

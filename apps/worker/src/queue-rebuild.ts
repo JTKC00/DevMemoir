@@ -218,8 +218,15 @@ async function rebuildMaintenanceWindows(deps: QueueRebuildDependencies, result:
     }
     try {
       const payload: SyncJobPayload = { kind: window.jobKind, maintenanceTask: window.task, maintenanceBucket: window.bucket };
-      const jobId = await deps.jobs.enqueue(window.jobKind, maintenanceTickLogicalKey(window.jobKind, window.bucket), payload);
-      if (!jobId) continue;
+      const logicalKey = maintenanceTickLogicalKey(window.jobKind, window.bucket);
+      const enqueuedJobId = await deps.jobs.enqueue(window.jobKind, logicalKey, payload);
+      const jobId = enqueuedJobId ?? await deps.jobs.findActiveJobByLogicalKey(window.jobKind, logicalKey);
+      if (!jobId) {
+        failures += 1;
+        deps.logger.error({ event_type: "queue_rebuild", result: "failed", error_code: "maintenance_replacement_job_missing", maintenance_task: window.task });
+        continue;
+      }
+      if (jobId === window.acceptedJobId) continue;
       const recovered = await deps.store.recoverIncompleteMaintenanceWindow({
         task: window.task,
         bucket: window.bucket,

@@ -199,6 +199,76 @@ function github(scope: Scope, counters: { issues: number[]; auditCursors: Array<
 }
 
 describeIntegration("M5.5 pg-boss wipe, rebuild, and resume", () => {
+  it("recovers an enqueued maintenance singleton after CAS failure and a fresh-process rerun", async () => {
+    const scope = await createScope();
+    const at = new Date("2026-08-29T12:00:00Z");
+    await scope.store.claimMaintenanceWindow({ task: "active_reconciliation", bucket: scope.bucket, jobKind: "maintenance_active", jobId: "old-job", now: at });
+    await resetPgBossOperationalSchema((text) => scope.admin.query(text), scope.schema);
+    const capture = createCanarySink();
+    const firstPort = new PgBossJobPort(databaseUrl as string, { schema: scope.schema });
+    await firstPort.start();
+    let failCas = true;
+    const failAfterEnqueueStore = new Proxy(scope.store, {
+      get(target, property) {
+        if (property === "recoverIncompleteMaintenanceWindow") {
+          return async (input: Parameters<PostgresM1Store["recoverIncompleteMaintenanceWindow"]>[0]) => {
+            if (failCas) {
+              failCas = false;
+              throw new Error("intentional_post_enqueue_cas_failure");
+            }
+            return target.recoverIncompleteMaintenanceWindow(input);
+          };
+        }
+        const value = target[property as keyof PostgresM1Store];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const logicalKey = `maintenance:maintenance_active:${scope.bucket}`;
+    const first = await rebuildQueue({ store: failAfterEnqueueStore, jobs: firstPort, githubAppId: scope.githubAppId, logger: createLogger(capture.sink), now: () => at });
+    expect(first.result).toBe("partial");
+    const replacementJobId = await firstPort.findActiveJobByLogicalKey("maintenance_active", logicalKey);
+    expect(replacementJobId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.acceptedJobId).toBe("old-job");
+    expect((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.completedAt).toBeUndefined();
+    await firstPort.stop();
+
+    const freshPort = new PgBossJobPort(databaseUrl as string, { schema: scope.schema });
+    await freshPort.start();
+    expect(await freshPort.findActiveJobByLogicalKey("maintenance_active", logicalKey)).toBe(replacementJobId);
+    const second = await rebuildQueue({ store: scope.store, jobs: freshPort, githubAppId: scope.githubAppId, logger: createLogger(capture.sink), now: () => at });
+    expect(second.maintenance.ownershipRecovered).toBe(1);
+    expect((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.acceptedJobId).toBe(replacementJobId);
+    expect((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.completedAt).toBeUndefined();
+
+    await rebuildQueue({ store: scope.store, jobs: freshPort, githubAppId: scope.githubAppId, logger: createLogger(capture.sink), now: () => at });
+    expect((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.acceptedJobId).toBe(replacementJobId);
+    const queued = await scope.admin.query<{ id: string }>(
+      `select id::text as id from ${scope.schema}.job where name=$1 and singleton_key=$2`,
+      ["maintenance_active", logicalKey],
+    );
+    expect(queued.rows.map((row) => row.id)).toEqual([replacementJobId]);
+
+    const clients = github(scope, { issues: [], auditCursors: [], redeliveries: 0 });
+    const deps: QueueDependencies = {
+      store: scope.store,
+      jobs: freshPort,
+      githubForInstallation: () => clients.client,
+      githubApp: clients.app,
+      logger: createLogger(capture.sink),
+      config: configFor(scope.githubAppId),
+      now: () => at,
+    };
+    await freshPort.work("maintenance_active", async (job) => processQueueJob(job, deps));
+    await waitFor(async () => Boolean((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.completedAt));
+    expect(await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket)).toMatchObject({ acceptedJobId: replacementJobId, completedAt: at });
+    expect(await freshPort.findActiveJobByLogicalKey("maintenance_active", logicalKey)).toBeUndefined();
+    const terminal = await rebuildQueue({ store: scope.store, jobs: freshPort, githubAppId: scope.githubAppId, logger: createLogger(capture.sink), now: () => at });
+    expect(terminal.maintenance.incompleteFound).toBe(0);
+    expect((await scope.store.getMaintenanceWindow("active_reconciliation", scope.bucket))?.acceptedJobId).toBe(replacementJobId);
+    expect(capture.text()).not.toMatch(canary);
+    await freshPort.stop();
+  }, 60_000);
+
   it("rebuilds unfinished durable work onto a fresh queue and resumes the same identities", async () => {
     const scope = await createScope();
     const seeded = await seedUnfinished(scope);

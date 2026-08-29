@@ -103,6 +103,10 @@ only one rebuilder wins
 
 `recoverIncompleteMaintenanceWindow(...)` implements that transition. `last_error_code` is preserved. The replacement job payload includes the original `maintenanceBucket` so the normal M5.3 handler completes the same window.
 
+If replacement enqueue succeeds but the ownership CAS fails before commit, a fresh rebuild resolves the existing active pg-boss singleton job ID and retries the same ownership CAS. Both a newly enqueued replacement and an existing active singleton therefore converge on the same CAS path. Process-local `JobPort` maps are never recovery truth.
+
+`PgBossJobPort.findActiveJobByLogicalKey(...)` is deliberately narrow: with pg-boss 10.4 it queries the adapter-owned pg-boss `job` table by queue name and `singleton_key`, returning only `created`, `retry`, or `active` jobs. Completed, failed, cancelled, and archived jobs are not recovery owners. This is an internal pg-boss 10.4 schema compatibility assumption isolated to the jobs adapter because that version has no public singleton-key lookup API.
+
 This is **not** normal scheduler behavior and must not run on every worker boot. Ordinary multi-worker startup must not steal a legitimately running maintenance owner.
 
 ## Command
