@@ -57,7 +57,7 @@ The stuck threshold is `OPERATIONAL_STUCK_WORK_MS` (30 minutes).
 
 A valid future GitHub pause is `degraded`, not stuck.
 
-Delivery repairs reuse M5.4 statuses. Recoverable backlog with a future `nextEligibleAt` is `degraded`. Exhausted repairs, or a large/aged recoverable backlog with no valid pause, are `attention_required`.
+Delivery repairs reuse M5.4 statuses. Recoverable backlog with a future `nextEligibleAt` is `degraded`. `readyRecoverable` counts only repairs whose `nextEligibleAt` is absent or `<= now`. The large-backlog threshold (`DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD`) applies to that ready/actionable count only, not to paused cooldown rows. Exhausted repairs, a large ready backlog, or an aged ready backlog (`OPERATIONAL_STUCK_WORK_MS`) are `attention_required`.
 
 ## Quota lanes, backoff, and jitter
 
@@ -101,7 +101,7 @@ Overall state stays `healthy` / `degraded` / `attention_required`.
 - expired processing lease exists
 - stuck reconciliation, audit, or maintenance window exists
 - exhausted repair exists
-- large/aged recoverable repair backlog with no valid pause
+- large or aged *actionable* (`readyRecoverable`) repair backlog
 - M5.4 maintenance/reconciliation/audit freshness is already stale or failed
 
 `degraded` when none of the above apply and any of:
@@ -128,6 +128,8 @@ sanitized structured warning logs
 There is no email, Slack, SMS, PagerDuty, or third-party webhook.
 
 Structured events are aggregates only: `worker_heartbeat_stale`, `processing_lease_expired`, `reconciliation_stuck`, `delivery_audit_stuck`, `maintenance_window_stuck`, `github_quota_paused`, `delivery_repair_attention`. Repeated identical counts are throttled in-process for 5 minutes because logs are not recovery truth.
+
+`delivery_repair_attention` is emitted when `operations.repairs.needsAttention` is true — the same derivation as overall health — for exhausted repairs, a large actionable backlog, or an aged actionable backlog. The opaque count is `exhausted + readyRecoverable`. Paused cooldown rows never contribute.
 
 ## Privacy
 

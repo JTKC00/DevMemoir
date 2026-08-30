@@ -33,7 +33,7 @@ export type OwnerOperationalHealth = {
     reconciliation: { activeAgeSeconds?: number; authorizedAgeSeconds?: number; stuckCount: number; oldestActivityAt?: string };
     githubQuota: { pausedInstallations: number; earliestResumeAt?: string; latestResumeAt?: string; appAuditPaused: boolean; appAuditResumeAt?: string };
     leases: { expiredProcessing: number; stuckReconciliations: number; stuckAudits: number; stuckMaintenanceWindows: number };
-    repairs: { recoverableBacklog: number; pausedRecoverable: number; exhausted: number; oldestRecoverableAgeSeconds?: number };
+    repairs: { recoverableBacklog: number; pausedRecoverable: number; readyRecoverable: number; exhausted: number; oldestRecoverableAgeSeconds?: number; needsAttention: boolean };
   };
 };
 
@@ -106,6 +106,18 @@ export function deriveDeliveryAuditHealth(audit: GithubDeliveryAudit | undefined
 
 function maintenanceThreshold(task: MaintenanceTask): number { return task === "authorized_reconciliation" ? AUTHORIZED_RECONCILIATION_STALE_MS : task === "delivery_audit" ? DELIVERY_AUDIT_STALE_MS : ACTIVE_RECONCILIATION_STALE_MS; }
 
+function deriveRepairAttention(input: {
+  recoverableBacklog: number;
+  pausedRecoverable: number;
+  exhausted: number;
+  oldestReadyAgeSeconds?: number;
+}): { readyRecoverable: number; needsAttention: boolean } {
+  const readyRecoverable = Math.max(0, input.recoverableBacklog - input.pausedRecoverable);
+  const readyBacklogLarge = readyRecoverable >= DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD;
+  const readyBacklogAged = readyRecoverable > 0 && (input.oldestReadyAgeSeconds ?? 0) > OPERATIONAL_STUCK_WORK_MS / 1000;
+  return { readyRecoverable, needsAttention: input.exhausted > 0 || readyBacklogLarge || readyBacklogAged };
+}
+
 export function deriveOwnerOperationalHealth(input: {
   now: Date;
   maintenance: MaintenanceWindow[];
@@ -146,9 +158,13 @@ export function deriveOwnerOperationalHealth(input: {
   const activeAgeSeconds = ageSeconds(summary.get("active_reconciliation")?.lastCompletedAt, input.now);
   const authorizedAgeSeconds = ageSeconds(summary.get("authorized_reconciliation")?.lastCompletedAt, input.now);
   const oldestRecoverableAgeSeconds = ageSeconds(repairHealth.oldestRecoverableAt, input.now);
-  const readyRecoverable = Math.max(0, repairHealth.recoverableBacklog - repairHealth.pausedRecoverable);
-  const oldestReadyAge = ageSeconds(repairHealth.oldestReadyRecoverableAt, input.now);
-  const repairNeedsAttention = repairHealth.exhausted > 0 || (readyRecoverable > 0 && (repairHealth.recoverableBacklog >= DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD || (oldestReadyAge ?? 0) > OPERATIONAL_STUCK_WORK_MS / 1000));
+  const oldestReadyAgeSeconds = ageSeconds(repairHealth.oldestReadyRecoverableAt, input.now);
+  const { readyRecoverable, needsAttention: repairNeedsAttention } = deriveRepairAttention({
+    recoverableBacklog: repairHealth.recoverableBacklog,
+    pausedRecoverable: repairHealth.pausedRecoverable,
+    exhausted: repairHealth.exhausted,
+    ...(oldestReadyAgeSeconds !== undefined ? { oldestReadyAgeSeconds } : {}),
+  });
   const stuckExists = leaseAlerts.expiredProcessing > 0 || leaseAlerts.stuckReconciliations > 0 || leaseAlerts.stuckAudits > 0 || leaseAlerts.stuckMaintenanceWindows > 0;
   const attention = staleMaintenance || worker.state === "stale" || stuckExists || repairNeedsAttention || repositories.some((row) => row.state === "failed" || row.state === "stale") || deliveryAudit.state === "failed" || deliveryAudit.state === "stale";
   const quotaPaused = quota.pausedInstallations > 0 || quota.appAuditPaused;
@@ -171,7 +187,7 @@ export function deriveOwnerOperationalHealth(input: {
       reconciliation: { ...(activeAgeSeconds !== undefined ? { activeAgeSeconds } : {}), ...(authorizedAgeSeconds !== undefined ? { authorizedAgeSeconds } : {}), stuckCount: leaseAlerts.stuckReconciliations, ...(oldestActivityAt ? { oldestActivityAt } : {}) },
       githubQuota: { pausedInstallations: quota.pausedInstallations, ...(earliestResumeAt ? { earliestResumeAt } : {}), ...(latestResumeAt ? { latestResumeAt } : {}), appAuditPaused: quota.appAuditPaused, ...(appAuditResumeAt ? { appAuditResumeAt } : {}) },
       leases: { expiredProcessing: leaseAlerts.expiredProcessing, stuckReconciliations: leaseAlerts.stuckReconciliations, stuckAudits: leaseAlerts.stuckAudits, stuckMaintenanceWindows: leaseAlerts.stuckMaintenanceWindows },
-      repairs: { recoverableBacklog: repairHealth.recoverableBacklog, pausedRecoverable: repairHealth.pausedRecoverable, exhausted: repairHealth.exhausted, ...(oldestRecoverableAgeSeconds !== undefined ? { oldestRecoverableAgeSeconds } : {}) },
+      repairs: { recoverableBacklog: repairHealth.recoverableBacklog, pausedRecoverable: repairHealth.pausedRecoverable, readyRecoverable, exhausted: repairHealth.exhausted, ...(oldestRecoverableAgeSeconds !== undefined ? { oldestRecoverableAgeSeconds } : {}), needsAttention: repairNeedsAttention },
     },
   };
 }
@@ -185,7 +201,7 @@ export function operationalWarnings(health: OwnerOperationalHealth): Operational
   if (health.operations.leases.stuckMaintenanceWindows > 0) warnings.push({ eventType: "maintenance_window_stuck", count: health.operations.leases.stuckMaintenanceWindows });
   const quotaPauses = health.operations.githubQuota.pausedInstallations + Number(health.operations.githubQuota.appAuditPaused);
   if (quotaPauses > 0) warnings.push({ eventType: "github_quota_paused", count: quotaPauses });
-  if (health.operations.repairs.exhausted > 0) warnings.push({ eventType: "delivery_repair_attention", count: health.operations.repairs.exhausted });
+  if (health.operations.repairs.needsAttention) warnings.push({ eventType: "delivery_repair_attention", count: health.operations.repairs.exhausted + health.operations.repairs.readyRecoverable });
   return warnings;
 }
 

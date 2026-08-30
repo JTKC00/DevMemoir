@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
-import { InMemoryM1Store, OPERATIONAL_STUCK_WORK_MS, WORKER_HEARTBEAT_STALE_MS } from "@devmemoir/db";
+import { DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD, InMemoryM1Store, OPERATIONAL_STUCK_WORK_MS, WORKER_HEARTBEAT_STALE_MS } from "@devmemoir/db";
 import { hashOpaqueToken } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort } from "@devmemoir/jobs";
@@ -43,7 +43,7 @@ describe("M5.4 owner operations API", () => {
         reconciliation: { activeAgeSeconds: 0, authorizedAgeSeconds: 0, stuckCount: 0 },
         githubQuota: { pausedInstallations: 0, appAuditPaused: false },
         leases: { expiredProcessing: 0, stuckReconciliations: 0, stuckAudits: 0, stuckMaintenanceWindows: 0 },
-        repairs: { recoverableBacklog: 0, pausedRecoverable: 0, exhausted: 0 },
+        repairs: { recoverableBacklog: 0, pausedRecoverable: 0, readyRecoverable: 0, exhausted: 0, needsAttention: false },
       },
     });
     expect(response.body).not.toContain("PRIVATE_REPO_CANARY");
@@ -172,5 +172,22 @@ describe("M5.4 owner operations API", () => {
     });
     expect(paused.json().operations.leases.expiredProcessing).toBe(1);
     expect(["degraded", "attention_required"]).toContain(paused.json().overall);
+  });
+
+  it("does not raise attention_required for a large recoverable backlog that is almost entirely cooling down", async () => {
+    const future = new Date(now.getTime() + 60_000);
+    const auditRunId = "00000000-0000-4000-8000-000000000060";
+    for (let index = 0; index < DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD; index += 1) {
+      const guid = `00000000-0000-4000-8a00-${String(index).padStart(12, "0")}`;
+      await store.observeGithubDeliveryAttempt({ githubDeliveryGuid: guid, githubDeliveryId: 200 + index, githubAppId: 1, auditRunId, eventName: "push", statusCode: 500, deliveredAt: now, now });
+      if (index < DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD - 1) await store.deferGithubDeliveryRedelivery({ guid, resumeAt: future, errorCode: "github_primary_rate_limit", now });
+    }
+    const response = await app.inject({ method: "GET", url: "/api/ops/health", headers: headersFor("owner-token") });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      overall: "degraded",
+      operations: { repairs: { recoverableBacklog: 25, pausedRecoverable: 24, readyRecoverable: 1, exhausted: 0, needsAttention: false } },
+    });
+    expect(capture.text()).not.toContain("delivery_repair_attention");
   });
 });

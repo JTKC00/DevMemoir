@@ -15,7 +15,7 @@ type OpsHealth = {
     reconciliation: { activeAgeSeconds?: number; authorizedAgeSeconds?: number; stuckCount: number };
     githubQuota: { pausedInstallations: number; earliestResumeAt?: string; latestResumeAt?: string; appAuditPaused: boolean; appAuditResumeAt?: string };
     leases: { expiredProcessing: number; stuckReconciliations: number; stuckAudits: number; stuckMaintenanceWindows: number };
-    repairs: { recoverableBacklog: number; pausedRecoverable: number; exhausted: number; oldestRecoverableAgeSeconds?: number };
+    repairs: { recoverableBacklog: number; pausedRecoverable: number; readyRecoverable: number; exhausted: number; oldestRecoverableAgeSeconds?: number; needsAttention: boolean };
   };
 };
 
@@ -78,6 +78,6 @@ export default async function OpsPage({ searchParams }: { searchParams: Promise<
     <section className="card"><h2>Delivery Audit</h2><p>{badge(health.deliveryAudit.state)}</p><p className="muted">Generation {health.deliveryAudit.generation ?? "none"} · page {health.deliveryAudit.page ?? "none"} · last activity {time(health.deliveryAudit.updatedAt)}{health.deliveryAudit.pausedUntil ? ` · retry after ${time(health.deliveryAudit.pausedUntil)}` : ""}</p>{health.deliveryAudit.errorCode ? <code>{health.deliveryAudit.errorCode}</code> : null}
       {health.deliveryAudit.state === "in_progress" || (health.deliveryAudit.state === "paused" && health.deliveryAudit.pausedUntil && new Date(health.deliveryAudit.pausedUntil) > new Date()) ? <button disabled>{health.deliveryAudit.state === "paused" ? "Paused" : "Already running"}</button> : <form action={retryDeliveryAudit}><button type="submit">Retry delivery audit</button></form>}
     </section>
-    <section className="card"><h2>Delivery Repairs</h2><p>{health.operations.repairs.recoverableBacklog} recoverable · {health.operations.repairs.exhausted} exhausted · {health.deliveryRepairs.terminal} terminal</p><p className="muted">Oldest recoverable {age(health.operations.repairs.oldestRecoverableAgeSeconds)} · paused {health.operations.repairs.pausedRecoverable}</p><div className="repair-counts">{Object.entries(health.deliveryRepairs.byStatus).map(([status, count]) => <span key={status}><strong>{count}</strong> {label(status)}</span>)}</div>{health.deliveryRepairs.recoverable > 0 ? <form action={resumeDeliveryRepairs}><button type="submit">Resume recoverable repairs</button></form> : <button disabled>Nothing to resume</button>}</section>
+    <section className="card"><h2>Delivery Repairs</h2><p>{health.operations.repairs.recoverableBacklog} recoverable · {health.operations.repairs.pausedRecoverable} paused · {health.operations.repairs.readyRecoverable} ready · {health.operations.repairs.exhausted} exhausted · {health.deliveryRepairs.terminal} terminal</p><p className="muted">Oldest recoverable {age(health.operations.repairs.oldestRecoverableAgeSeconds)}</p><div className="repair-counts">{Object.entries(health.deliveryRepairs.byStatus).map(([status, count]) => <span key={status}><strong>{count}</strong> {label(status)}</span>)}</div>{health.deliveryRepairs.recoverable > 0 ? <form action={resumeDeliveryRepairs}><button type="submit">Resume recoverable repairs</button></form> : <button disabled>Nothing to resume</button>}</section>
   </main>;
 }

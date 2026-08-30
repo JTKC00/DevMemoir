@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GithubDeliveryRepairStatusCounts, MaintenanceWindow, RepositoryOperationalRecord, WorkerOperationalHealth } from "@devmemoir/db";
-import { OPERATIONAL_STUCK_WORK_MS } from "@devmemoir/db";
+import { DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD, OPERATIONAL_STUCK_WORK_MS } from "@devmemoir/db";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
 import { deriveDeliveryAuditHealth, deriveOwnerOperationalHealth, deriveRepositoryHealth, emitOperationalWarnings, operationalWarnings, resetOperationalWarningThrottle } from "./ops-health.js";
 
@@ -129,12 +129,47 @@ describe("M5.6 worker, lease, and quota health", () => {
     const exhausted = base({ repairHealth: { recoverableBacklog: 0, pausedRecoverable: 0, exhausted: 3 } });
     expect(exhausted.overall).toBe("attention_required");
     expect(exhausted.operations.repairs.exhausted).toBe(3);
+    expect(exhausted.operations.repairs.needsAttention).toBe(true);
+  });
+
+  it("keeps a mostly paused or fully paused recoverable backlog degraded, not attention_required", () => {
+    const mostlyPaused = base({
+      repairCounts: { ...zeroCounts(), pending: 25 },
+      repairHealth: { recoverableBacklog: 25, pausedRecoverable: 24, exhausted: 0, oldestReadyRecoverableAt: now },
+    });
+    expect(mostlyPaused.overall).toBe("degraded");
+    expect(mostlyPaused.operations.repairs).toMatchObject({ recoverableBacklog: 25, pausedRecoverable: 24, readyRecoverable: 1, exhausted: 0, needsAttention: false });
+    expect(operationalWarnings(mostlyPaused).some((warning) => warning.eventType === "delivery_repair_attention")).toBe(false);
+
+    const allPaused = base({
+      repairCounts: { ...zeroCounts(), pending: 25 },
+      repairHealth: { recoverableBacklog: 25, pausedRecoverable: 25, exhausted: 0 },
+    });
+    expect(allPaused.overall).toBe("degraded");
+    expect(allPaused.operations.repairs).toMatchObject({ readyRecoverable: 0, needsAttention: false });
+    expect(operationalWarnings(allPaused)).toEqual([]);
+  });
+
+  it("raises delivery_repair_attention for large ready, aged ready, and exhausted repairs", () => {
+    const largeReady = base({
+      repairCounts: { ...zeroCounts(), pending: DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD },
+      repairHealth: { recoverableBacklog: DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD, pausedRecoverable: 0, exhausted: 0, oldestReadyRecoverableAt: now },
+    });
+    expect(largeReady.overall).toBe("attention_required");
+    expect(largeReady.operations.repairs).toMatchObject({ readyRecoverable: DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD, needsAttention: true });
+    expect(operationalWarnings(largeReady)).toEqual([{ eventType: "delivery_repair_attention", count: DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD }]);
 
     const agedReady = base({
-      repairCounts: { ...zeroCounts(), pending: 2 },
-      repairHealth: { recoverableBacklog: 2, pausedRecoverable: 0, exhausted: 0, oldestReadyRecoverableAt: new Date(now.getTime() - OPERATIONAL_STUCK_WORK_MS - 1_000) },
+      repairCounts: { ...zeroCounts(), pending: 1 },
+      repairHealth: { recoverableBacklog: 1, pausedRecoverable: 0, exhausted: 0, oldestReadyRecoverableAt: new Date(now.getTime() - OPERATIONAL_STUCK_WORK_MS - 1_000) },
     });
     expect(agedReady.overall).toBe("attention_required");
+    expect(agedReady.operations.repairs.needsAttention).toBe(true);
+    expect(operationalWarnings(agedReady)).toEqual([{ eventType: "delivery_repair_attention", count: 1 }]);
+
+    const exhausted = base({ repairHealth: { recoverableBacklog: 0, pausedRecoverable: 0, exhausted: 4 } });
+    expect(exhausted.overall).toBe("attention_required");
+    expect(operationalWarnings(exhausted)).toEqual([{ eventType: "delivery_repair_attention", count: 4 }]);
   });
 
   it("exposes opaque reconciliation ages and throttles repeated structured warnings", () => {
@@ -158,5 +193,19 @@ describe("M5.6 worker, lease, and quota health", () => {
     expect(capture.lines.filter((line) => line.includes("worker_heartbeat_stale"))).toHaveLength(2);
     expect(capture.text()).toContain("\"count\":1");
     expect(capture.text()).not.toMatch(/PRIVATE_/);
+  });
+
+  it("throttles repeated delivery_repair_attention warnings for the same repair-attention condition", () => {
+    const health = base({
+      repairCounts: { ...zeroCounts(), pending: DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD },
+      repairHealth: { recoverableBacklog: DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD, pausedRecoverable: 0, exhausted: 0, oldestReadyRecoverableAt: now },
+    });
+    resetOperationalWarningThrottle();
+    const capture = createCanarySink();
+    emitOperationalWarnings({ health, logger: createLogger(capture.sink), now });
+    emitOperationalWarnings({ health, logger: createLogger(capture.sink), now: new Date(now.getTime() + 1_000) });
+    expect(capture.lines.filter((line) => line.includes("delivery_repair_attention"))).toHaveLength(1);
+    emitOperationalWarnings({ health, logger: createLogger(capture.sink), now: new Date(now.getTime() + 5 * 60 * 1000) });
+    expect(capture.lines.filter((line) => line.includes("delivery_repair_attention"))).toHaveLength(2);
   });
 });
