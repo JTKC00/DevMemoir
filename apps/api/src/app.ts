@@ -11,7 +11,7 @@ import type { Logger } from "@devmemoir/observability";
 import { RepositorySelectionError, type M1Store, type SessionRecord } from "@devmemoir/db";
 import { enqueueRepositoryReconciliation, resumeGithubDeliveryRepairs } from "@devmemoir/worker/recovery";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
-import { deriveOwnerOperationalHealth } from "./ops-health.js";
+import { deriveOwnerOperationalHealth, emitOperationalWarnings } from "./ops-health.js";
 import { verifyGithubSignature, webhookBodyLimit } from "./webhook.js";
 
 export type ApiDependencies = {
@@ -134,13 +134,32 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   app.get("/api/ops/health", async (request, reply) => {
     const session = await requireOwner(request as RequestWithSession, reply);
     if (!session) return;
-    const [maintenance, audit, repairCounts, repositories] = await Promise.all([
+    const observedAt = now();
+    const [maintenance, audit, repairCounts, repositories, worker, leaseAlerts, quota, repairHealth, maintenanceSummary] = await Promise.all([
       deps.store.listMaintenanceOperationalHealth(),
       deps.store.getGithubDeliveryAudit(deps.config.GITHUB_APP_ID),
       deps.store.getDeliveryRepairStatusCounts(deps.config.GITHUB_APP_ID),
       deps.store.listRepositoryOperationalHealth(session.tenantId),
+      deps.store.getWorkerOperationalHealth({ now: observedAt }),
+      deps.store.getOperationalLeaseAlerts({ tenantId: session.tenantId, githubAppId: deps.config.GITHUB_APP_ID, now: observedAt }),
+      deps.store.getGithubQuotaOperationalHealth({ tenantId: session.tenantId, githubAppId: deps.config.GITHUB_APP_ID, now: observedAt }),
+      deps.store.getDeliveryRepairOperationalHealth({ githubAppId: deps.config.GITHUB_APP_ID, now: observedAt }),
+      deps.store.getMaintenanceOperationalSummary(),
     ]);
-    return deriveOwnerOperationalHealth({ now: now(), maintenance, ...(audit ? { audit } : {}), repairCounts, repositories });
+    const health = deriveOwnerOperationalHealth({
+      now: observedAt,
+      maintenance,
+      ...(audit ? { audit } : {}),
+      repairCounts,
+      repositories,
+      worker,
+      leaseAlerts,
+      quota,
+      repairHealth,
+      maintenanceSummary,
+    });
+    emitOperationalWarnings({ health, logger: deps.logger, now: observedAt });
+    return health;
   });
 
   app.post<{ Params: { repositoryId: string } }>("/api/ops/repositories/:repositoryId/reconcile", async (request, reply) => {

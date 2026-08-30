@@ -457,6 +457,14 @@ export const maintenanceWindows = pgTable("maintenance_windows", {
   updatedAt: time("updated_at"),
 }, (table) => [primaryKey({ columns: [table.task, table.bucket] })]);
 
+export const workerHeartbeats = pgTable("worker_heartbeats", {
+  workerInstanceId: uuid("worker_instance_id").primaryKey(),
+  startedAt: time("started_at"),
+  lastHeartbeatAt: time("last_heartbeat_at"),
+  stoppedAt: nullableTime("stopped_at"),
+  updatedAt: time("updated_at"),
+}, (table) => [index("worker_heartbeats_last_heartbeat_idx").on(table.lastHeartbeatAt)]);
+
 export const githubDeliveryRepairs = pgTable("github_delivery_repairs", {
   id: id(),
   githubDeliveryGuid: varchar("github_delivery_guid", { length: 128 }).notNull(),
@@ -521,6 +529,7 @@ export const schema = {
   githubDeliveryAudits,
   githubDeliveryRepairs,
   maintenanceWindows,
+  workerHeartbeats,
   outbox,
 };
 

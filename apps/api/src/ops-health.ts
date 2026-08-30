@@ -1,5 +1,18 @@
 import { MAINTENANCE_TASKS, maintenanceWindowBucket, type MaintenanceTask } from "@devmemoir/domain";
-import type { GithubDeliveryAudit, GithubDeliveryRepairStatusCounts, HistoricalProgress, MaintenanceWindow, RepositoryOperationalRecord } from "@devmemoir/db";
+import {
+  DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD,
+  OPERATIONAL_STUCK_WORK_MS,
+  type DeliveryRepairOperationalHealth,
+  type GithubDeliveryAudit,
+  type GithubDeliveryRepairStatusCounts,
+  type GithubQuotaOperationalHealth,
+  type HistoricalProgress,
+  type MaintenanceOperationalSummary,
+  type MaintenanceWindow,
+  type OperationalLeaseAlerts,
+  type RepositoryOperationalRecord,
+  type WorkerOperationalHealth,
+} from "@devmemoir/db";
 
 export const ACTIVE_RECONCILIATION_STALE_MS = 12 * 60 * 60 * 1000;
 export const AUTHORIZED_RECONCILIATION_STALE_MS = 36 * 60 * 60 * 1000;
@@ -15,6 +28,18 @@ export type OwnerOperationalHealth = {
   deliveryAudit: { state: OperationalState; generation?: number; page?: number; startedAt?: string; updatedAt?: string; completedAt?: string; lastSuccessAt?: string; pausedUntil?: string; errorCode?: string };
   deliveryRepairs: { recoverable: number; terminal: number; byStatus: GithubDeliveryRepairStatusCounts };
   repositories: Array<{ repositoryId: string; installationGithubId: number; state: OperationalState; generation?: number; stage?: string; lastSuccessAt?: string; completedAt?: string; pausedUntil?: string; errorCode?: string }>;
+  operations: {
+    worker: { state: WorkerOperationalHealth["state"]; liveWorkers: number; staleWorkers: number; lastHeartbeatAt?: string };
+    reconciliation: { activeAgeSeconds?: number; authorizedAgeSeconds?: number; stuckCount: number; oldestActivityAt?: string };
+    githubQuota: { pausedInstallations: number; earliestResumeAt?: string; latestResumeAt?: string; appAuditPaused: boolean; appAuditResumeAt?: string };
+    leases: { expiredProcessing: number; stuckReconciliations: number; stuckAudits: number; stuckMaintenanceWindows: number };
+    repairs: { recoverableBacklog: number; pausedRecoverable: number; exhausted: number; oldestRecoverableAgeSeconds?: number };
+  };
+};
+
+export type OperationalWarning = {
+  eventType: "worker_heartbeat_stale" | "processing_lease_expired" | "reconciliation_stuck" | "delivery_audit_stuck" | "maintenance_window_stuck" | "github_quota_paused" | "delivery_repair_attention";
+  count: number;
 };
 
 const RECOVERABLE = ["pending", "requesting", "requested", "skipped_processing"] as const;
@@ -26,6 +51,7 @@ function latest(values: Array<Date | undefined>): Date | undefined {
   return values.reduce<Date | undefined>((current, value) => value && (!current || value > current) ? value : current, undefined);
 }
 function stale(last: Date | undefined, now: Date, threshold: number): boolean { return !last || now.getTime() - last.getTime() > threshold; }
+function ageSeconds(value: Date | undefined, now: Date): number | undefined { return value ? Math.max(0, Math.floor((now.getTime() - value.getTime()) / 1000)) : undefined; }
 function progressForGeneration(source: RepositoryOperationalRecord): HistoricalProgress[] {
   if (!source.generation) return [];
   return source.progress.filter((row) => row.cursor.reconciliationRunId === source.generation?.reconciliationRunId);
@@ -80,7 +106,18 @@ export function deriveDeliveryAuditHealth(audit: GithubDeliveryAudit | undefined
 
 function maintenanceThreshold(task: MaintenanceTask): number { return task === "authorized_reconciliation" ? AUTHORIZED_RECONCILIATION_STALE_MS : task === "delivery_audit" ? DELIVERY_AUDIT_STALE_MS : ACTIVE_RECONCILIATION_STALE_MS; }
 
-export function deriveOwnerOperationalHealth(input: { now: Date; maintenance: MaintenanceWindow[]; audit?: GithubDeliveryAudit; repairCounts: GithubDeliveryRepairStatusCounts; repositories: RepositoryOperationalRecord[] }): OwnerOperationalHealth {
+export function deriveOwnerOperationalHealth(input: {
+  now: Date;
+  maintenance: MaintenanceWindow[];
+  maintenanceSummary?: MaintenanceOperationalSummary[];
+  audit?: GithubDeliveryAudit;
+  repairCounts: GithubDeliveryRepairStatusCounts;
+  repositories: RepositoryOperationalRecord[];
+  worker?: WorkerOperationalHealth;
+  leaseAlerts?: OperationalLeaseAlerts;
+  quota?: GithubQuotaOperationalHealth;
+  repairHealth?: DeliveryRepairOperationalHealth;
+}): OwnerOperationalHealth {
   const byTask = new Map(input.maintenance.map((window) => [window.task, window]));
   let staleMaintenance = false;
   const maintenance: OwnerOperationalHealth["maintenance"] = MAINTENANCE_TASKS.map((task) => {
@@ -101,7 +138,80 @@ export function deriveOwnerOperationalHealth(input: { now: Date; maintenance: Ma
   const deliveryAudit = deriveDeliveryAuditHealth(input.audit, input.now);
   const recoverable = RECOVERABLE.reduce((sum, status) => sum + input.repairCounts[status], 0);
   const terminal = TERMINAL.reduce((sum, status) => sum + input.repairCounts[status], 0);
-  const attention = staleMaintenance || input.repairCounts.exhausted > 0 || repositories.some((row) => row.state === "failed" || row.state === "stale") || deliveryAudit.state === "failed" || deliveryAudit.state === "stale";
-  const degraded = recoverable > 0 || repositories.some((row) => row.state === "paused") || deliveryAudit.state === "paused" || maintenance.some((row) => row.state === "running");
-  return { overall: attention ? "attention_required" : degraded ? "degraded" : "healthy", generatedAt: input.now.toISOString(), maintenance, deliveryAudit, deliveryRepairs: { recoverable, terminal, byStatus: input.repairCounts }, repositories };
+  const worker = input.worker ?? { state: "healthy", liveWorkers: 1, staleWorkers: 0, lastHeartbeatAt: input.now };
+  const leaseAlerts = input.leaseAlerts ?? { expiredProcessing: 0, stuckReconciliations: 0, stuckAudits: 0, stuckMaintenanceWindows: 0 };
+  const quota = input.quota ?? { pausedInstallations: 0, appAuditPaused: false };
+  const repairHealth = input.repairHealth ?? { recoverableBacklog: recoverable, pausedRecoverable: 0, exhausted: input.repairCounts.exhausted };
+  const summary = new Map(input.maintenanceSummary?.map((row) => [row.task, row]));
+  const activeAgeSeconds = ageSeconds(summary.get("active_reconciliation")?.lastCompletedAt, input.now);
+  const authorizedAgeSeconds = ageSeconds(summary.get("authorized_reconciliation")?.lastCompletedAt, input.now);
+  const oldestRecoverableAgeSeconds = ageSeconds(repairHealth.oldestRecoverableAt, input.now);
+  const readyRecoverable = Math.max(0, repairHealth.recoverableBacklog - repairHealth.pausedRecoverable);
+  const oldestReadyAge = ageSeconds(repairHealth.oldestReadyRecoverableAt, input.now);
+  const repairNeedsAttention = repairHealth.exhausted > 0 || (readyRecoverable > 0 && (repairHealth.recoverableBacklog >= DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD || (oldestReadyAge ?? 0) > OPERATIONAL_STUCK_WORK_MS / 1000));
+  const stuckExists = leaseAlerts.expiredProcessing > 0 || leaseAlerts.stuckReconciliations > 0 || leaseAlerts.stuckAudits > 0 || leaseAlerts.stuckMaintenanceWindows > 0;
+  const attention = staleMaintenance || worker.state === "stale" || stuckExists || repairNeedsAttention || repositories.some((row) => row.state === "failed" || row.state === "stale") || deliveryAudit.state === "failed" || deliveryAudit.state === "stale";
+  const quotaPaused = quota.pausedInstallations > 0 || quota.appAuditPaused;
+  const workerUnavailable = worker.state === "stopped" || worker.state === "never_seen";
+  const degraded = recoverable > 0 || quotaPaused || workerUnavailable || repositories.some((row) => row.state === "paused") || deliveryAudit.state === "paused" || maintenance.some((row) => row.state === "running");
+  const oldestActivityAt = iso(leaseAlerts.oldestRepositoryReconciliationActivityAt);
+  const lastHeartbeatAt = iso(worker.lastHeartbeatAt);
+  const earliestResumeAt = iso(quota.earliestResumeAt);
+  const latestResumeAt = iso(quota.latestResumeAt);
+  const appAuditResumeAt = iso(quota.appAuditResumeAt);
+  return {
+    overall: attention ? "attention_required" : degraded ? "degraded" : "healthy",
+    generatedAt: input.now.toISOString(),
+    maintenance,
+    deliveryAudit,
+    deliveryRepairs: { recoverable, terminal, byStatus: input.repairCounts },
+    repositories,
+    operations: {
+      worker: { state: worker.state, liveWorkers: worker.liveWorkers, staleWorkers: worker.staleWorkers, ...(lastHeartbeatAt ? { lastHeartbeatAt } : {}) },
+      reconciliation: { ...(activeAgeSeconds !== undefined ? { activeAgeSeconds } : {}), ...(authorizedAgeSeconds !== undefined ? { authorizedAgeSeconds } : {}), stuckCount: leaseAlerts.stuckReconciliations, ...(oldestActivityAt ? { oldestActivityAt } : {}) },
+      githubQuota: { pausedInstallations: quota.pausedInstallations, ...(earliestResumeAt ? { earliestResumeAt } : {}), ...(latestResumeAt ? { latestResumeAt } : {}), appAuditPaused: quota.appAuditPaused, ...(appAuditResumeAt ? { appAuditResumeAt } : {}) },
+      leases: { expiredProcessing: leaseAlerts.expiredProcessing, stuckReconciliations: leaseAlerts.stuckReconciliations, stuckAudits: leaseAlerts.stuckAudits, stuckMaintenanceWindows: leaseAlerts.stuckMaintenanceWindows },
+      repairs: { recoverableBacklog: repairHealth.recoverableBacklog, pausedRecoverable: repairHealth.pausedRecoverable, exhausted: repairHealth.exhausted, ...(oldestRecoverableAgeSeconds !== undefined ? { oldestRecoverableAgeSeconds } : {}) },
+    },
+  };
+}
+
+export function operationalWarnings(health: OwnerOperationalHealth): OperationalWarning[] {
+  const warnings: OperationalWarning[] = [];
+  if (health.operations.worker.staleWorkers > 0) warnings.push({ eventType: "worker_heartbeat_stale", count: health.operations.worker.staleWorkers });
+  if (health.operations.leases.expiredProcessing > 0) warnings.push({ eventType: "processing_lease_expired", count: health.operations.leases.expiredProcessing });
+  if (health.operations.leases.stuckReconciliations > 0) warnings.push({ eventType: "reconciliation_stuck", count: health.operations.leases.stuckReconciliations });
+  if (health.operations.leases.stuckAudits > 0) warnings.push({ eventType: "delivery_audit_stuck", count: health.operations.leases.stuckAudits });
+  if (health.operations.leases.stuckMaintenanceWindows > 0) warnings.push({ eventType: "maintenance_window_stuck", count: health.operations.leases.stuckMaintenanceWindows });
+  const quotaPauses = health.operations.githubQuota.pausedInstallations + Number(health.operations.githubQuota.appAuditPaused);
+  if (quotaPauses > 0) warnings.push({ eventType: "github_quota_paused", count: quotaPauses });
+  if (health.operations.repairs.exhausted > 0) warnings.push({ eventType: "delivery_repair_attention", count: health.operations.repairs.exhausted });
+  return warnings;
+}
+
+export const OPERATIONAL_WARNING_THROTTLE_MS = 5 * 60 * 1000;
+
+type WarningLogger = { warn: (fields: { event_type: string; count: number }) => void };
+const lastEmittedWarnings = new Map<OperationalWarning["eventType"], { at: number; count: number }>();
+
+export function resetOperationalWarningThrottle(): void {
+  lastEmittedWarnings.clear();
+}
+
+export function emitOperationalWarnings(input: {
+  health: OwnerOperationalHealth;
+  logger: WarningLogger;
+  now?: Date;
+  throttleMs?: number;
+}): OperationalWarning[] {
+  const nowMs = (input.now ?? new Date(input.health.generatedAt)).getTime();
+  const throttleMs = input.throttleMs ?? OPERATIONAL_WARNING_THROTTLE_MS;
+  const warnings = operationalWarnings(input.health);
+  for (const warning of warnings) {
+    const previous = lastEmittedWarnings.get(warning.eventType);
+    if (previous && previous.count === warning.count && nowMs - previous.at < throttleMs) continue;
+    input.logger.warn({ event_type: warning.eventType, count: warning.count });
+    lastEmittedWarnings.set(warning.eventType, { at: nowMs, count: warning.count });
+  }
+  return warnings;
 }

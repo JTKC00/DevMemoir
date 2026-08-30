@@ -216,6 +216,16 @@ Suppressed webhook repair, App-JWT-only failed-delivery audit, same-GUID recover
 - [x] Incomplete maintenance windows transfer lost queue ownership through a bounded CAS; completed windows remain terminal.
 - [x] Real PostgreSQL discovery/CAS tests and a real pg-boss wipe/rebuild/resume integration prove same-generation, same-cursor, pause, repair, and privacy invariants.
 
+### M5.6 completion
+
+- [x] Durable worker heartbeat (30s cadence, 90s stale, 7-day retention) is observable as healthy/stale/stopped/never_seen without false crash alerts for a graceful stop.
+- [x] Stuck-work alerts reuse existing processing leases, reconciliation, delivery-audit, maintenance-window, and repair rows; valid future GitHub pauses stay degraded, not stuck.
+- [x] Installation request lanes remain concurrency 1/2; App-JWT audit stays isolated; server rate-limit times are hard lower bounds; bounded 0–5s jitter is injected and testable.
+- [x] Owner-only `/ops` and `GET /api/ops/health` expose opaque worker, reconciliation-age, quota-pause, lease, and repair metrics; structured warnings are throttled; private canaries stay out.
+- [x] InMemory and PostgreSQL coverage, plus M5.1–M5.5 regressions, keep Milestone 5 closed.
+
+Milestone 5 is complete: repository reconciliation, failed-delivery audit/repair, periodic maintenance, owner operational health, queue rebuild, worker heartbeat, stuck-work alerts, and GitHub quota/backoff policy are all implemented. M6 is not started in this slice.
+
 ### Risks
 
 Audit/reconcile loops can amplify API load or use the wrong credential; installation lanes, explicit schedules, and endpoint/credential contract tests bound the blast radius.

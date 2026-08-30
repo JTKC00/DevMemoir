@@ -1,21 +1,25 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
-import { collectQueueRebuildReconciliationTargets, emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, repositoryProjectionInputsChanged, RepositorySelectionError } from "./store.js";
+import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, MAINTENANCE_TASKS, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { collectQueueRebuildReconciliationTargets, emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, OPERATIONAL_STUCK_WORK_MS, repositoryProjectionInputsChanged, RepositorySelectionError, WEBHOOK_PROCESSING_LEASE_MS, WORKER_HEARTBEAT_STALE_MS } from "./store.js";
 import type {
   ActivityRecord,
   ActivityQuery,
   AuthTransactionRecord,
   DeliveryInsertResult,
   DeliveryRecord,
+  DeliveryRepairOperationalHealth,
   GithubDeliveryAudit,
   GithubDeliveryRedeliveryClaim,
   GithubDeliveryRepair,
   GithubDeliveryRepairObservation,
+  GithubQuotaOperationalHealth,
   InventoryReconcileResult,
   InstallationRecord,
   InstallationLifecycleStatus,
   MaintenanceTarget,
   MaintenanceWindow,
+  MaintenanceOperationalSummary,
+  OperationalLeaseAlerts,
   GithubDeliveryRepairStatusCounts,
   QueueRebuildReconciliationTarget,
   RepositoryOperationalRecord,
@@ -34,6 +38,7 @@ import type {
   RefSyncContinuation,
   SessionRecord,
   UserRecord,
+  WorkerOperationalHealth,
 } from "./store.js";
 import { HISTORICAL_STAGES } from "./store.js";
 
@@ -220,6 +225,8 @@ function repairFromRow(row: Row | undefined): GithubDeliveryRepair | undefined {
   const lastRedeliveryRequestedAt = date(row.last_redelivery_requested_at);
   const nextEligibleAt = date(row.next_eligible_at);
   const lastGithubDeliveredAt = date(row.last_github_delivered_at);
+  const createdAt = date(row.created_at);
+  const updatedAt = date(row.updated_at);
   return {
     id: String(row.id),
     githubDeliveryGuid: String(row.github_delivery_guid),
@@ -237,6 +244,8 @@ function repairFromRow(row: Row | undefined): GithubDeliveryRepair | undefined {
     ...(row.last_github_status_code !== null && row.last_github_status_code !== undefined ? { lastGithubStatusCode: Number(row.last_github_status_code) } : {}),
     ...(lastGithubDeliveredAt ? { lastGithubDeliveredAt } : {}),
     ...(row.sanitized_error_code ? { sanitizedErrorCode: String(row.sanitized_error_code) } : {}),
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
   };
 }
 
@@ -246,6 +255,7 @@ function deliveryFromRow(row: Row | undefined): DeliveryRecord | undefined {
   const lastReceivedAt = date(row.last_received_at);
   const payloadExpiresAt = date(row.payload_expires_at);
   const processedAt = date(row.processed_at);
+  const leaseExpiresAt = date(row.lease_expires_at);
   if (!firstReceivedAt || !lastReceivedAt || !payloadExpiresAt) return undefined;
   return {
     id: String(row.id),
@@ -265,6 +275,7 @@ function deliveryFromRow(row: Row | undefined): DeliveryRecord | undefined {
     lastReceivedAt,
     receiptCount: Number(row.receipt_count),
     processingAttempts: Number(row.processing_attempts),
+    ...(leaseExpiresAt ? { leaseExpiresAt } : {}),
     ...(row.job_id ? { jobId: String(row.job_id) } : {}),
     ...(row.sanitized_error_code ? { errorCode: String(row.sanitized_error_code) } : {}),
     ...(processedAt ? { processedAt } : {}),
@@ -477,6 +488,115 @@ export class PostgresM1Store implements M1Store {
     return targets;
   }
 
+  async recordWorkerHeartbeat(input: { workerInstanceId: string; startedAt: Date; now: Date }): Promise<void> {
+    await this.pool.query(
+      "insert into worker_heartbeats (worker_instance_id,started_at,last_heartbeat_at,updated_at) values ($1,$2,$3,$3) on conflict (worker_instance_id) do update set last_heartbeat_at=excluded.last_heartbeat_at,stopped_at=null,updated_at=excluded.updated_at",
+      [input.workerInstanceId, input.startedAt, input.now],
+    );
+  }
+
+  async markWorkerStopped(input: { workerInstanceId: string; now: Date }): Promise<void> {
+    await this.pool.query("update worker_heartbeats set stopped_at=$2,updated_at=$2 where worker_instance_id=$1", [input.workerInstanceId, input.now]);
+  }
+
+  async pruneOldWorkerHeartbeats(input: { before: Date }): Promise<number> {
+    const result = await this.pool.query("delete from worker_heartbeats where stopped_at < $1 or last_heartbeat_at < $1", [input.before]);
+    return result.rowCount ?? 0;
+  }
+
+  async getWorkerOperationalHealth(input: { now: Date }): Promise<WorkerOperationalHealth> {
+    const staleBefore = new Date(input.now.getTime() - WORKER_HEARTBEAT_STALE_MS);
+    const result = await this.pool.query<Row>(
+      `select count(*)::integer as total,
+              count(*) filter (where stopped_at is null and last_heartbeat_at >= $1)::integer as live_workers,
+              count(*) filter (where stopped_at is null and last_heartbeat_at < $1)::integer as stale_workers,
+              max(last_heartbeat_at) as last_heartbeat_at
+       from worker_heartbeats`,
+      [staleBefore],
+    );
+    const row = result.rows[0];
+    const total = Number(row?.total ?? 0);
+    const liveWorkers = Number(row?.live_workers ?? 0);
+    const staleWorkers = Number(row?.stale_workers ?? 0);
+    const lastHeartbeatAt = date(row?.last_heartbeat_at);
+    const state = total === 0 ? "never_seen" : liveWorkers > 0 ? "healthy" : staleWorkers > 0 ? "stale" : "stopped";
+    return { state, liveWorkers, staleWorkers, ...(lastHeartbeatAt ? { lastHeartbeatAt } : {}) };
+  }
+
+  async getOperationalLeaseAlerts(input: { tenantId: string; githubAppId: number; now: Date }): Promise<OperationalLeaseAlerts> {
+    const cutoff = new Date(input.now.getTime() - OPERATIONAL_STUCK_WORK_MS);
+    const expiredProcessing = await this.tenantQuery(input.tenantId, async (client) => {
+      const result = await client.query<Row>("select count(*)::integer as count from webhook_deliveries where tenant_id=$1 and state='processing' and lease_expires_at <= $2", [input.tenantId, input.now]);
+      return Number(result.rows[0]?.count ?? 0);
+    });
+    let stuckReconciliations = 0;
+    let oldestRepositoryReconciliationActivityAt: Date | undefined;
+    for (const source of await this.listRepositoryOperationalHealth(input.tenantId)) {
+      if (!source.generation) continue;
+      const progress = source.progress.filter((row) => row.cursor.reconciliationRunId === source.generation?.reconciliationRunId);
+      if (progress.some((row) => row.status === "paused" && row.pausedUntil && row.pausedUntil > input.now)) continue;
+      if (!progress.some((row) => row.status === "in_progress")) continue;
+      const activity = [...progress.map((row) => row.lastSuccessAt), ...progress.map((row) => row.startedAt), source.generation.startedAt]
+        .filter((value): value is Date => Boolean(value))
+        .reduce<Date | undefined>((latest, value) => !latest || value > latest ? value : latest, undefined);
+      if (activity && activity < cutoff) {
+        stuckReconciliations += 1;
+        if (!oldestRepositoryReconciliationActivityAt || activity < oldestRepositoryReconciliationActivityAt) oldestRepositoryReconciliationActivityAt = activity;
+      }
+    }
+    const auditResult = await this.pool.query<Row>(
+      "select count(*)::integer as count from github_delivery_audits where github_app_id=$1 and status='in_progress' and coalesce(last_success_at, updated_at, started_at) < $2 and (paused_until is null or paused_until <= $3)",
+      [input.githubAppId, cutoff, input.now],
+    );
+    const maintenanceResult = await this.pool.query<Row>("select count(*)::integer as count from maintenance_windows where completed_at is null and updated_at < $1", [cutoff]);
+    return {
+      expiredProcessing,
+      stuckReconciliations,
+      ...(oldestRepositoryReconciliationActivityAt ? { oldestRepositoryReconciliationActivityAt } : {}),
+      stuckAudits: Number(auditResult.rows[0]?.count ?? 0),
+      stuckMaintenanceWindows: Number(maintenanceResult.rows[0]?.count ?? 0),
+    };
+  }
+
+  async getGithubQuotaOperationalHealth(input: { tenantId: string; githubAppId: number; now: Date }): Promise<GithubQuotaOperationalHealth> {
+    const installations = await this.tenantQuery(input.tenantId, async (client) => client.query<Row>(
+      "select count(*)::integer as count,min(api_paused_until) as earliest,max(api_paused_until) as latest from github_installations where tenant_id=$1 and api_paused_until > $2",
+      [input.tenantId, input.now],
+    ));
+    const row = installations.rows[0];
+    const audit = await this.pool.query<Row>("select paused_until from github_delivery_audits where github_app_id=$1 and status='paused' and paused_until > $2", [input.githubAppId, input.now]);
+    const earliestResumeAt = date(row?.earliest);
+    const latestResumeAt = date(row?.latest);
+    const appAuditResumeAt = date(audit.rows[0]?.paused_until);
+    return { pausedInstallations: Number(row?.count ?? 0), ...(earliestResumeAt ? { earliestResumeAt } : {}), ...(latestResumeAt ? { latestResumeAt } : {}), appAuditPaused: Boolean(appAuditResumeAt), ...(appAuditResumeAt ? { appAuditResumeAt } : {}) };
+  }
+
+  async getDeliveryRepairOperationalHealth(input: { githubAppId: number; now: Date }): Promise<DeliveryRepairOperationalHealth> {
+    const result = await this.pool.query<Row>(
+      `select count(*) filter (where status in ('pending','requesting','requested','skipped_processing'))::integer as recoverable,
+              count(*) filter (where status in ('pending','requesting','requested','skipped_processing') and next_eligible_at > $2)::integer as paused,
+              count(*) filter (where status='exhausted')::integer as exhausted,
+              min(created_at) filter (where status in ('pending','requesting','requested','skipped_processing')) as oldest,
+              min(created_at) filter (where status in ('pending','requesting','requested','skipped_processing') and (next_eligible_at is null or next_eligible_at <= $2)) as oldest_ready
+       from github_delivery_repairs where github_app_id=$1`,
+      [input.githubAppId, input.now],
+    );
+    const row = result.rows[0];
+    const oldestRecoverableAt = date(row?.oldest);
+    const oldestReadyRecoverableAt = date(row?.oldest_ready);
+    return { recoverableBacklog: Number(row?.recoverable ?? 0), pausedRecoverable: Number(row?.paused ?? 0), exhausted: Number(row?.exhausted ?? 0), ...(oldestRecoverableAt ? { oldestRecoverableAt } : {}), ...(oldestReadyRecoverableAt ? { oldestReadyRecoverableAt } : {}) };
+  }
+
+  async getMaintenanceOperationalSummary(): Promise<MaintenanceOperationalSummary[]> {
+    const latest = await this.listMaintenanceOperationalHealth();
+    const completed = await this.pool.query<Row>("select task,max(completed_at) as last_completed_at from maintenance_windows where completed_at is not null group by task");
+    return MAINTENANCE_TASKS.map((task) => {
+      const latestWindow = latest.find((row) => row.task === task);
+      const lastCompletedAt = date(completed.rows.find((row) => row.task === task)?.last_completed_at);
+      return { task, ...(latestWindow ? { latestWindow } : {}), ...(lastCompletedAt ? { lastCompletedAt } : {}) };
+    });
+  }
+
   async listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]> {
     return this.tenantQuery(tenantId, async (client) => {
       const result = await client.query<Row>("select r.id,r.tenant_id,ra.installation_id,r.github_repository_id,r.owner_login,r.name,r.full_name,r.private,r.visibility,r.node_id,r.github_created_at,r.github_updated_at,r.github_pushed_at,r.default_branch,r.description,r.archived_at,r.disabled,r.first_seen_at,r.last_seen_at,r.last_authoritative_observed_at,ra.access_status,ra.selected,ra.revoked_at from repositories r join repository_access ra on ra.repository_id=r.id and ra.tenant_id=r.tenant_id where r.tenant_id=$1 and ($2::uuid is null or ra.installation_id=$2) order by r.full_name asc", [tenantId, installationId ?? null]);
@@ -605,6 +725,8 @@ export class PostgresM1Store implements M1Store {
     if (patch.errorCode !== undefined) add("sanitized_error_code", patch.errorCode);
     if (patch.processedAt !== undefined) add("processed_at", patch.processedAt);
     if (patch.tenantId !== undefined) add("tenant_id", patch.tenantId);
+    if (patch.leaseExpiresAt !== undefined) add("lease_expires_at", patch.leaseExpiresAt);
+    else if (patch.state !== undefined && patch.state !== "processing") add("lease_expires_at", null);
     if (fields.length) {
       const query = `update webhook_deliveries set ${fields.join(",")} where id=$${values.length + 1}`;
       if (tenantId) await this.tenantQuery(tenantId, async (client) => { await client.query(query, [...values, id]); });
@@ -622,10 +744,12 @@ export class PostgresM1Store implements M1Store {
     return this.tenantQuery(tenantId, async (client) => deliveryFromRow((await client.query<Row>("select * from webhook_deliveries where github_delivery_guid=$1", [guid])).rows[0]));
   }
 
-  async claimDeliveryForProcessing(id: string, tenantId?: string): Promise<DeliveryRecord | undefined> {
-    const run = async (client: PoolClient) => deliveryFromRow((await client.query<Row>("update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1 where id=$1 and state not in ('processed','ignored') returning *", [id])).rows[0]);
+  async claimDeliveryForProcessing(id: string, tenantId?: string, now = new Date()): Promise<DeliveryRecord | undefined> {
+    const leaseExpiresAt = new Date(now.getTime() + WEBHOOK_PROCESSING_LEASE_MS);
+    const sql = "update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1,lease_expires_at=$2 where id=$1 and state not in ('processed','ignored') returning *";
+    const run = async (client: PoolClient) => deliveryFromRow((await client.query<Row>(sql, [id, leaseExpiresAt])).rows[0]);
     if (tenantId) return this.tenantQuery(tenantId, run);
-    const result = await this.pool.query<Row>("update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1 where id=$1 and state not in ('processed','ignored') returning *", [id]);
+    const result = await this.pool.query<Row>(sql, [id, leaseExpiresAt]);
     return deliveryFromRow(result.rows[0]);
   }
 

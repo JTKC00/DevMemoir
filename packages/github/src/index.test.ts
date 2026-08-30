@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  APP_JWT_RATE_LIMIT_LANE,
   assertGithubEndpointAllowed,
   GithubAccessError,
   GithubEndpointDeniedError,
-  GithubRateLimitPauseError,
   GithubTransientError,
   githubRefParameter,
   InstallationGithubClient,
@@ -16,6 +16,7 @@ import {
 } from "./index.js";
 
 type RequestCall = { route: string; parameters?: Record<string, unknown> };
+const zeroJitter = () => 0;
 
 function githubClient(responses: GithubRequestResponse[]): { client: InstallationGithubClient; calls: RequestCall[] } {
   const calls: RequestCall[] = [];
@@ -182,6 +183,19 @@ describe("installation request rate-limit lanes", () => {
     await expect(blocked).resolves.toEqual({ data: "one" });
   });
 
+  it("keeps the App-JWT lane isolated from installation traffic", async () => {
+    const lanes = new InstallationRequestLanes();
+    let releaseApp!: () => void;
+    const blockedApp = lanes.run(APP_JWT_RATE_LIMIT_LANE, async () => {
+      await new Promise<void>((resolve) => { releaseApp = resolve; });
+      return { data: "app" };
+    });
+
+    await expect(lanes.run(77, async () => ({ data: "installation" }))).resolves.toEqual({ data: "installation" });
+    releaseApp();
+    await expect(blockedApp).resolves.toEqual({ data: "app" });
+  });
+
   it("supports concurrency 2 but rejects any higher configuration", async () => {
     const lanes = new InstallationRequestLanes(2);
     let active = 0;
@@ -198,32 +212,45 @@ describe("installation request rate-limit lanes", () => {
   it("classifies primary exhaustion, pauses without retrying, and resumes at reset", async () => {
     let now = Date.parse("2026-01-01T00:00:00Z");
     const resetSeconds = (now + 120_000) / 1000;
-    const lanes = new InstallationRequestLanes(1, () => now);
+    let jitterCalls = 0;
+    const lanes = new InstallationRequestLanes(1, () => now, undefined, () => { jitterCalls += 1; return 3_000; });
     let calls = 0;
     const exhausted = lanes.run(1, async () => {
       calls += 1;
       throw { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(resetSeconds) }, message: "PRIVATE REPOSITORY NAME" };
     });
-    await expect(exhausted).rejects.toMatchObject({ code: "primary_rate_limit", status: 403, resumeAt: new Date(now + 120_000) });
-    await expect(lanes.run(1, async () => { calls += 1; return { data: {} }; })).rejects.toBeInstanceOf(GithubRateLimitPauseError);
+    await expect(exhausted).rejects.toMatchObject({ code: "primary_rate_limit", status: 403, resumeAt: new Date(now + 123_000) });
+    await expect(lanes.run(1, async () => { calls += 1; return { data: {} }; })).rejects.toMatchObject({ resumeAt: new Date(now + 123_000) });
     expect(calls).toBe(1);
-    now += 120_000;
+    expect(jitterCalls).toBe(1);
+    now += 123_000;
     await expect(lanes.run(1, async () => { calls += 1; return { data: "resumed" }; })).resolves.toEqual({ data: "resumed" });
     expect(calls).toBe(2);
   });
 
-  it("honors Retry-After and gives secondary limits without it at least 60 seconds", async () => {
+  it("adds deterministic jitter after Retry-After and the secondary fallback", async () => {
     const now = Date.parse("2026-01-01T00:00:00Z");
-    const retryLanes = new InstallationRequestLanes(1, () => now);
-    await expect(retryLanes.run(1, async () => { throw { status: 429, headers: { "Retry-After": "90" } }; })).rejects.toMatchObject({ code: "retry_after", resumeAt: new Date(now + 90_000) });
+    const retryLanes = new InstallationRequestLanes(1, () => now, undefined, () => 3_000);
+    await expect(retryLanes.run(1, async () => { throw { status: 429, headers: { "Retry-After": "60" } }; })).rejects.toMatchObject({ code: "retry_after", resumeAt: new Date(now + 63_000) });
 
-    const secondaryLanes = new InstallationRequestLanes(1, () => now);
-    await expect(secondaryLanes.run(1, async () => { throw { status: 403, response: { status: 403, headers: {}, data: { message: "You have exceeded a secondary rate limit. PRIVATE CANARY" } } }; })).rejects.toMatchObject({ code: "secondary_rate_limit", resumeAt: new Date(now + 60_000) });
+    const secondaryLanes = new InstallationRequestLanes(1, () => now, undefined, () => 4_000);
+    await expect(secondaryLanes.run(1, async () => { throw { status: 403, response: { status: 403, headers: {}, data: { message: "You have exceeded a secondary rate limit. PRIVATE CANARY" } } }; })).rejects.toMatchObject({ code: "secondary_rate_limit", resumeAt: new Date(now + 64_000) });
+  });
+
+  it("uses the latest server-provided lower bound before adding jitter", async () => {
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    const resetAt = now + 90_000;
+    let requestedMax = 0;
+    const lanes = new InstallationRequestLanes(1, () => now, undefined, (maxMs) => { requestedMax = maxMs; return maxMs + 1_000; });
+    await expect(lanes.run(1, async () => {
+      throw { status: 403, headers: { "Retry-After": "60", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String(resetAt / 1000) } };
+    })).rejects.toMatchObject({ code: "primary_rate_limit", resumeAt: new Date(resetAt + 5_000) });
+    expect(requestedMax).toBe(5_000);
   });
 
   it("uses a successful remaining=0 response to pause subsequent calls", async () => {
     const now = Date.parse("2026-01-01T00:00:00Z");
-    const lanes = new InstallationRequestLanes(1, () => now);
+    const lanes = new InstallationRequestLanes(1, () => now, undefined, zeroJitter);
     let calls = 0;
     await expect(lanes.run(1, async () => { calls += 1; return { status: 200, headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String((now + 30_000) / 1000) }, data: "last allowed" }; })).resolves.toMatchObject({ data: "last allowed" });
     await expect(lanes.run(1, async () => { calls += 1; return { data: "must not run" }; })).rejects.toMatchObject({ code: "primary_rate_limit", resumeAt: new Date(now + 30_000) });
@@ -233,11 +260,20 @@ describe("installation request rate-limit lanes", () => {
   it("awaits a sanitized durable observer for successful remaining=0 responses", async () => {
     const now = Date.parse("2026-01-01T00:00:00Z");
     const observed: Array<{ installationId: number; code: string; resumeAt: Date }> = [];
-    const lanes = new InstallationRequestLanes(1, () => now, (installationId, state) => {
+    let releaseObserver!: () => void;
+    const observerGate = new Promise<void>((resolve) => { releaseObserver = resolve; });
+    const lanes = new InstallationRequestLanes(1, () => now, async (installationId, state) => {
       observed.push({ installationId, code: state.code, resumeAt: state.resumeAt });
-    });
-    await expect(lanes.run(77, async () => ({ status: 200, headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String((now + 30_000) / 1000) }, data: "last allowed" }))).resolves.toMatchObject({ data: "last allowed" });
-    expect(observed).toEqual([{ installationId: 77, code: "primary_rate_limit", resumeAt: new Date(now + 30_000) }]);
+      await observerGate;
+    }, () => 2_500);
+    let responseExposed = false;
+    const response = lanes.run(77, async () => ({ status: 200, headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String((now + 30_000) / 1000) }, data: "last allowed" }))
+      .then((value) => { responseExposed = true; return value; });
+    await vi.waitFor(() => expect(observed).toHaveLength(1));
+    expect(responseExposed).toBe(false);
+    expect(observed).toEqual([{ installationId: 77, code: "primary_rate_limit", resumeAt: new Date(now + 32_500) }]);
+    releaseObserver();
+    await expect(response).resolves.toMatchObject({ data: "last allowed" });
   });
 
   it.each([
@@ -287,7 +323,7 @@ describe("installation request rate-limit lanes", () => {
 
   it("serializes pause errors to opaque operational fields only", async () => {
     const now = Date.parse("2026-01-01T00:00:00Z");
-    const lanes = new InstallationRequestLanes(1, () => now);
+    const lanes = new InstallationRequestLanes(1, () => now, undefined, zeroJitter);
     let caught: unknown;
     try {
       await lanes.run(1, async () => { throw { status: 429, headers: { "retry-after": "60" }, message: "PRIVATE BODY ghp_PRIVATE" }; });

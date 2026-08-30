@@ -39,4 +39,18 @@ describe("allowlist logger", () => {
     expect(capture.text()).toContain("\"reconciliation_count\":2");
     expect(capture.text()).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_TOKEN/);
   });
+
+  it("emits opaque operational warning counts and drops private fields", () => {
+    const capture = createCanarySink();
+    const logger = createLogger(capture.sink);
+    logger.warn({
+      event_type: "worker_heartbeat_stale",
+      count: 2,
+      repository_name: "PRIVATE_REPOSITORY_NAME",
+      token: "PRIVATE_TOKEN",
+    });
+    expect(capture.text()).toContain("worker_heartbeat_stale");
+    expect(capture.text()).toContain("\"count\":2");
+    expect(capture.text()).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_TOKEN/);
+  });
 });

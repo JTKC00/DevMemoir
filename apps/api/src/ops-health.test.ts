@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { GithubDeliveryRepairStatusCounts, MaintenanceWindow, RepositoryOperationalRecord } from "@devmemoir/db";
-import { deriveDeliveryAuditHealth, deriveOwnerOperationalHealth, deriveRepositoryHealth } from "./ops-health.js";
+import type { GithubDeliveryRepairStatusCounts, MaintenanceWindow, RepositoryOperationalRecord, WorkerOperationalHealth } from "@devmemoir/db";
+import { OPERATIONAL_STUCK_WORK_MS } from "@devmemoir/db";
+import { createCanarySink, createLogger } from "@devmemoir/observability";
+import { deriveDeliveryAuditHealth, deriveOwnerOperationalHealth, deriveRepositoryHealth, emitOperationalWarnings, operationalWarnings, resetOperationalWarningThrottle } from "./ops-health.js";
 
 const now = new Date("2026-08-29T12:00:00Z");
 const runId = "00000000-0000-4000-8000-000000000001";
@@ -72,5 +74,89 @@ describe("M5.4 deterministic health derivation", () => {
     const running = deriveOwnerOperationalHealth({ now, maintenance: runningWindows, audit, repairCounts: zeroCounts(), repositories: [] });
     expect(stateOf(running, "active_reconciliation")).toBe("running");
     expect(running.overall).toBe("degraded");
+  });
+});
+
+describe("M5.6 worker, lease, and quota health", () => {
+  const audit = { id: "audit", githubAppId: 1, currentRunId: runId, generation: 1, status: "completed" as const, pageNumber: 1, startedAt: now, updatedAt: now, completedAt: now, lastSuccessAt: now };
+  const liveWorker = (): WorkerOperationalHealth => ({ state: "healthy", liveWorkers: 1, staleWorkers: 0, lastHeartbeatAt: now });
+  const base = (overrides: Partial<Parameters<typeof deriveOwnerOperationalHealth>[0]> = {}) => deriveOwnerOperationalHealth({
+    now,
+    maintenance: windows(),
+    audit,
+    repairCounts: zeroCounts(),
+    repositories: [repository("completed")],
+    worker: liveWorker(),
+    ...overrides,
+  });
+
+  it("derives worker heartbeat states without treating a live sibling as a crash", () => {
+    expect(base().overall).toBe("healthy");
+    expect(base().operations.worker).toMatchObject({ state: "healthy", liveWorkers: 1, staleWorkers: 0, lastHeartbeatAt: now.toISOString() });
+
+    const stale = base({ worker: { state: "stale", liveWorkers: 0, staleWorkers: 1, lastHeartbeatAt: new Date(now.getTime() - 91_000) } });
+    expect(stale.operations.worker.state).toBe("stale");
+    expect(stale.overall).toBe("attention_required");
+
+    const mixed = base({ worker: { state: "healthy", liveWorkers: 1, staleWorkers: 1, lastHeartbeatAt: now } });
+    expect(mixed.overall).toBe("healthy");
+    expect(mixed.operations.worker).toMatchObject({ liveWorkers: 1, staleWorkers: 1 });
+    expect(operationalWarnings(mixed)).toEqual([{ eventType: "worker_heartbeat_stale", count: 1 }]);
+
+    expect(base({ worker: { state: "stopped", liveWorkers: 0, staleWorkers: 0, lastHeartbeatAt: now } }).overall).toBe("degraded");
+    expect(base({ worker: { state: "never_seen", liveWorkers: 0, staleWorkers: 0 } }).overall).toBe("degraded");
+  });
+
+  it("does not treat a valid future pause as stuck work", () => {
+    const paused = base({
+      repositories: [repository("paused")],
+      leaseAlerts: { expiredProcessing: 0, stuckReconciliations: 0, stuckAudits: 0, stuckMaintenanceWindows: 0 },
+      quota: { pausedInstallations: 1, earliestResumeAt: new Date(now.getTime() + 60_000), appAuditPaused: false },
+    });
+    expect(paused.overall).toBe("degraded");
+    expect(paused.operations.leases.stuckReconciliations).toBe(0);
+    expect(paused.operations.githubQuota.pausedInstallations).toBe(1);
+  });
+
+  it("raises attention for expired leases, stuck durable work, and exhausted repairs", () => {
+    const stuck = base({
+      leaseAlerts: { expiredProcessing: 1, stuckReconciliations: 2, stuckAudits: 1, stuckMaintenanceWindows: 1, oldestRepositoryReconciliationActivityAt: new Date(now.getTime() - OPERATIONAL_STUCK_WORK_MS - 1) },
+    });
+    expect(stuck.overall).toBe("attention_required");
+    expect(stuck.operations.leases).toMatchObject({ expiredProcessing: 1, stuckReconciliations: 2, stuckAudits: 1, stuckMaintenanceWindows: 1 });
+    expect(stuck.operations.reconciliation.stuckCount).toBe(2);
+
+    const exhausted = base({ repairHealth: { recoverableBacklog: 0, pausedRecoverable: 0, exhausted: 3 } });
+    expect(exhausted.overall).toBe("attention_required");
+    expect(exhausted.operations.repairs.exhausted).toBe(3);
+
+    const agedReady = base({
+      repairCounts: { ...zeroCounts(), pending: 2 },
+      repairHealth: { recoverableBacklog: 2, pausedRecoverable: 0, exhausted: 0, oldestReadyRecoverableAt: new Date(now.getTime() - OPERATIONAL_STUCK_WORK_MS - 1_000) },
+    });
+    expect(agedReady.overall).toBe("attention_required");
+  });
+
+  it("exposes opaque reconciliation ages and throttles repeated structured warnings", () => {
+    const health = base({
+      worker: { state: "stale", liveWorkers: 0, staleWorkers: 1, lastHeartbeatAt: new Date(now.getTime() - 91_000) },
+      maintenanceSummary: [
+        { task: "active_reconciliation", lastCompletedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000) },
+        { task: "authorized_reconciliation", lastCompletedAt: new Date(now.getTime() - 18 * 60 * 60 * 1000) },
+        { task: "delivery_audit" },
+      ],
+    });
+    expect(health.operations.reconciliation).toMatchObject({ activeAgeSeconds: 7200, authorizedAgeSeconds: 64800, stuckCount: 0 });
+    expect(JSON.stringify(health)).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_COMMIT_MESSAGE|PRIVATE_PR_TITLE|PRIVATE_WEBHOOK_PAYLOAD|PRIVATE_TOKEN|PRIVATE_SECRET/);
+
+    resetOperationalWarningThrottle();
+    const capture = createCanarySink();
+    emitOperationalWarnings({ health, logger: createLogger(capture.sink), now });
+    emitOperationalWarnings({ health, logger: createLogger(capture.sink), now: new Date(now.getTime() + 1_000) });
+    expect(capture.lines.filter((line) => line.includes("worker_heartbeat_stale"))).toHaveLength(1);
+    emitOperationalWarnings({ health, logger: createLogger(capture.sink), now: new Date(now.getTime() + 5 * 60 * 1000) });
+    expect(capture.lines.filter((line) => line.includes("worker_heartbeat_stale"))).toHaveLength(2);
+    expect(capture.text()).toContain("\"count\":1");
+    expect(capture.text()).not.toMatch(/PRIVATE_/);
   });
 });

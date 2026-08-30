@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
-import { InMemoryM1Store } from "@devmemoir/db";
+import { InMemoryM1Store, OPERATIONAL_STUCK_WORK_MS, WORKER_HEARTBEAT_STALE_MS } from "@devmemoir/db";
 import { hashOpaqueToken } from "@devmemoir/domain";
 import type { GithubClient } from "@devmemoir/github";
 import { InMemoryJobPort } from "@devmemoir/jobs";
 import { createCanarySink, createLogger } from "@devmemoir/observability";
 import { buildApi } from "./app.js";
+import { resetOperationalWarningThrottle } from "./ops-health.js";
 
 const now = new Date("2026-08-29T12:00:00Z");
 const config = { NODE_ENV: "test", LOG_LEVEL: "error", API_ORIGIN: "http://localhost:4000", WEB_ORIGIN: "http://localhost:3000", DATABASE_URL: "postgres://unused", DATABASE_API_URL: "postgres://unused", DATABASE_WORKER_URL: "postgres://unused", DATABASE_QUEUE_URL: "postgres://unused", DATABASE_MIGRATIONS_URL: "postgres://unused", DATABASE_DIRECT_URL: "postgres://unused", DATABASE_POOL_MAX: 2, GITHUB_APP_ID: 1, GITHUB_APP_CLIENT_ID: "client", GITHUB_APP_CLIENT_SECRET: "secret", GITHUB_APP_PRIVATE_KEY: "private", GITHUB_WEBHOOK_SECRET: "webhook-secret-123456", GITHUB_API_VERSION: "2022-11-28", OWNER_GITHUB_USER_ID: 7, ENCRYPTION_KEY_BASE64: Buffer.alloc(32, 4).toString("base64"), SESSION_SECRET: "session-secret-that-is-at-least-32-bytes-long", AUTH_TRANSACTION_TTL_SECONDS: 600, HANDOFF_TTL_SECONDS: 120, SESSION_TTL_SECONDS: 3600, CSRF_HEADER: "x-devmemoir-csrf", PORT: 4000, HOST: "127.0.0.1" } satisfies AppConfig;
@@ -22,6 +23,8 @@ describe("M5.4 owner operations API", () => {
     await store.saveInstallation({ id: "installation", tenantId: "tenant", githubInstallationId: 22, accountGithubAccountId: 7 });
     await store.saveRepository({ id: "repo-opaque", tenantId: "tenant", installationId: "installation", githubRepositoryId: 10, ownerLogin: "PRIVATE_REPO_CANARY", name: "PRIVATE_REPO_CANARY", fullName: "PRIVATE_REPO_CANARY/repo", private: true, defaultBranch: "main", selected: true, accessStatus: "accessible" });
     for (const [index, task] of ["active_reconciliation", "authorized_reconciliation", "delivery_audit"].entries()) { const bucket = index === 1 ? "2026-08-29" : "20260829T12"; await store.claimMaintenanceWindow({ task: task as "active_reconciliation", bucket, jobKind: `maintenance_${index}`, jobId: `job-${index}`, now }); await store.completeMaintenanceWindow({ task: task as "active_reconciliation", bucket, jobId: `job-${index}`, now }); }
+    await store.recordWorkerHeartbeat({ workerInstanceId: "00000000-0000-4000-8000-000000000099", startedAt: now, now });
+    resetOperationalWarningThrottle();
     app = await buildApi({ config, store, github, jobs, logger: createLogger(capture.sink), now: () => now });
   });
   afterEach(async () => app.close());
@@ -31,7 +34,18 @@ describe("M5.4 owner operations API", () => {
     expect((await app.inject({ method: "GET", url: "/api/ops/health", headers: headersFor("other-token") })).statusCode).toBe(403);
     const response = await app.inject({ method: "GET", url: "/api/ops/health", headers: headersFor("owner-token") });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ overall: "healthy", repositories: [{ repositoryId: "repo-opaque", installationGithubId: 22, state: "never_run" }], deliveryRepairs: { recoverable: 0, terminal: 0 } });
+    expect(response.json()).toMatchObject({
+      overall: "healthy",
+      repositories: [{ repositoryId: "repo-opaque", installationGithubId: 22, state: "never_run" }],
+      deliveryRepairs: { recoverable: 0, terminal: 0 },
+      operations: {
+        worker: { state: "healthy", liveWorkers: 1, staleWorkers: 0, lastHeartbeatAt: now.toISOString() },
+        reconciliation: { activeAgeSeconds: 0, authorizedAgeSeconds: 0, stuckCount: 0 },
+        githubQuota: { pausedInstallations: 0, appAuditPaused: false },
+        leases: { expiredProcessing: 0, stuckReconciliations: 0, stuckAudits: 0, stuckMaintenanceWindows: 0 },
+        repairs: { recoverableBacklog: 0, pausedRecoverable: 0, exhausted: 0 },
+      },
+    });
     expect(response.body).not.toContain("PRIVATE_REPO_CANARY");
   });
 
@@ -95,5 +109,68 @@ describe("M5.4 owner operations API", () => {
     expect(response.statusCode).toBe(202); expect(response.json()).toMatchObject({ recoverableFound: 1, enqueued: 1, skipped: 0 });
     for (const [guid, record] of terminalBefore) expect(await store.getGithubDeliveryRepair(guid)).toEqual(record);
     expect(response.body + capture.text()).not.toContain("PRIVATE_EVENT_CANARY");
+  });
+
+  it("reports worker heartbeat age, stale/live mix, graceful stop, and never-seen", async () => {
+    const owner = headersFor("owner-token");
+    const fresh = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(fresh.json()).toMatchObject({ overall: "healthy", operations: { worker: { state: "healthy", liveWorkers: 1, staleWorkers: 0 } } });
+
+    await store.recordWorkerHeartbeat({ workerInstanceId: "00000000-0000-4000-8000-000000000098", startedAt: new Date(now.getTime() - WORKER_HEARTBEAT_STALE_MS - 1_000), now: new Date(now.getTime() - WORKER_HEARTBEAT_STALE_MS - 1_000) });
+    const mixed = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(mixed.json()).toMatchObject({ overall: "healthy", operations: { worker: { state: "healthy", liveWorkers: 1, staleWorkers: 1 } } });
+
+    store.workerHeartbeats.clear();
+    await store.recordWorkerHeartbeat({ workerInstanceId: "00000000-0000-4000-8000-000000000097", startedAt: new Date(now.getTime() - WORKER_HEARTBEAT_STALE_MS - 1_000), now: new Date(now.getTime() - WORKER_HEARTBEAT_STALE_MS - 1_000) });
+    const stale = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(stale.json()).toMatchObject({ overall: "attention_required", operations: { worker: { state: "stale", liveWorkers: 0, staleWorkers: 1 } } });
+
+    await store.markWorkerStopped({ workerInstanceId: "00000000-0000-4000-8000-000000000097", now });
+    const stopped = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(stopped.json()).toMatchObject({ overall: "degraded", operations: { worker: { state: "stopped", liveWorkers: 0, staleWorkers: 0 } } });
+
+    store.workerHeartbeats.clear();
+    const unseen = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(unseen.json()).toMatchObject({ overall: "degraded", operations: { worker: { state: "never_seen", liveWorkers: 0, staleWorkers: 0 } } });
+  });
+
+  it("reports stuck work, valid pauses, quota, repair exhaustion, and omits private canaries", async () => {
+    const owner = headersFor("owner-token");
+    const old = new Date(now.getTime() - OPERATIONAL_STUCK_WORK_MS - 1_000);
+    const runId = "00000000-0000-4000-8000-000000000040";
+    await store.startRepositoryReconciliation({ tenantId: "tenant", repositoryId: "repo-opaque", installationId: "installation", defaultBranch: "main", reconciliationRunId: runId, now: old });
+    await store.startGithubDeliveryAudit({ githubAppId: 1, auditRunId: "00000000-0000-4000-8000-000000000041", now: old });
+    const delivery = await store.insertDelivery({ tenantId: "tenant", guid: "00000000-0000-4000-8000-000000000042", eventName: "push", payloadExpiresAt: new Date(now.getTime() + 60_000), now: old });
+    await store.claimDeliveryForProcessing(delivery.record.id, "tenant", old);
+    await store.claimMaintenanceWindow({ task: "active_reconciliation", bucket: "20260828T12", jobKind: "maintenance_active", jobId: "stuck-window", now: old });
+    await store.pauseInstallationApi({ tenantId: "tenant", installationId: "installation", pausedUntil: new Date(now.getTime() + 60_000), reason: "github_primary_rate_limit" });
+    await store.observeGithubDeliveryAttempt({ githubDeliveryGuid: "00000000-0000-4000-8000-000000000043", githubDeliveryId: 43, githubAppId: 1, auditRunId: runId, eventName: "PRIVATE_WEBHOOK_PAYLOAD", statusCode: 500, deliveredAt: now, now });
+    await store.markGithubDeliveryRepair({ guid: "00000000-0000-4000-8000-000000000043", status: "exhausted", errorCode: "repair_exhausted", now });
+
+    const stuck = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(stuck.json()).toMatchObject({
+      overall: "attention_required",
+      operations: {
+        reconciliation: { stuckCount: 1 },
+        githubQuota: { pausedInstallations: 1, earliestResumeAt: new Date(now.getTime() + 60_000).toISOString() },
+        leases: { expiredProcessing: 1, stuckReconciliations: 1, stuckAudits: 1, stuckMaintenanceWindows: 1 },
+        repairs: { exhausted: 1 },
+      },
+    });
+    expect(stuck.body + capture.text()).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_COMMIT_MESSAGE|PRIVATE_PR_TITLE|PRIVATE_WEBHOOK_PAYLOAD|PRIVATE_TOKEN|PRIVATE_SECRET|PRIVATE_REPO_CANARY/);
+
+    store.workerHeartbeats.clear();
+    await store.recordWorkerHeartbeat({ workerInstanceId: "00000000-0000-4000-8000-000000000099", startedAt: now, now });
+    await store.pauseHistoricalStage({ tenantId: "tenant", repositoryId: "repo-opaque", stage: "default_branch_commits", refName: "main", pausedUntil: new Date(now.getTime() + 120_000), errorCode: "github_primary_rate_limit", expectedReconciliationRunId: runId });
+    await store.pauseGithubDeliveryAudit({ githubAppId: 1, auditRunId: "00000000-0000-4000-8000-000000000041", pausedUntil: new Date(now.getTime() + 90_000), errorCode: "github_primary_rate_limit" });
+    const paused = await app.inject({ method: "GET", url: "/api/ops/health", headers: owner });
+    expect(paused.json()).toMatchObject({
+      operations: {
+        leases: { stuckReconciliations: 0, stuckAudits: 0 },
+        githubQuota: { appAuditPaused: true, appAuditResumeAt: new Date(now.getTime() + 90_000).toISOString() },
+      },
+    });
+    expect(paused.json().operations.leases.expiredProcessing).toBe(1);
+    expect(["degraded", "attention_required"]).toContain(paused.json().overall);
   });
 });

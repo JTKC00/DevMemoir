@@ -24,4 +24,5 @@ select { min-width: 260px; padding: 8px; margin: 8px 8px 8px 0; }
 .status-healthy, .status-completed { color: #137333; background: #e6f4ea; }
 .status-degraded, .status-in_progress, .status-running, .status-paused { color: #8a4b00; background: #fef7e0; }
 .status-attention_required, .status-failed, .status-stale, .status-failed_or_incomplete { color: #a50e0e; background: #fce8e6; }
+.status-stopped, .status-never_seen { color: #5f6368; background: #e8eaed; }
 .repair-counts { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 12px 0; }
