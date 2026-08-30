@@ -244,6 +244,22 @@ export type HistoricalStage = (typeof HISTORICAL_STAGES)[number];
 export type HistoricalSourceStage = Exclude<HistoricalStage, "completed">;
 export type HistoricalStageStatus = "pending" | "in_progress" | "paused" | "completed";
 
+/** Opaque M5.5 discovery row. No repository names or private source content. */
+export type QueueRebuildReconciliationTarget = {
+  tenantId: string;
+  repositoryId: string;
+  installationGithubId: number;
+  reconciliationRunId: string;
+  generation: number;
+  completed: boolean;
+  blocked: boolean;
+  stage?: HistoricalStage;
+  status?: HistoricalStageStatus;
+  nextPage?: number;
+  pausedUntil?: Date;
+  installationApiPausedUntil?: Date;
+};
+
 export type HistoricalCursor = {
   nextPage: number;
   [key: string]: unknown;
@@ -475,8 +491,22 @@ export interface M1Store {
   completeMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobId: string; now: Date }): Promise<void>;
   recordMaintenanceWindowError(input: { task: MaintenanceTask; bucket: string; jobId: string; errorCode: string; now: Date }): Promise<void>;
   getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined>;
+  listIncompleteMaintenanceWindows(): Promise<MaintenanceWindow[]>;
+  /**
+   * Queue-loss recovery only. Compare-and-set accepted_job_id when the window is
+   * still incomplete. Never reopens a completed window or changes (task, bucket).
+   */
+  recoverIncompleteMaintenanceWindow(input: {
+    task: MaintenanceTask;
+    bucket: string;
+    expectedAcceptedJobId: string;
+    replacementJobId: string;
+    now: Date;
+  }): Promise<boolean>;
   listMaintenanceOperationalHealth(): Promise<MaintenanceWindow[]>;
   listRepositoryOperationalHealth(tenantId: string): Promise<RepositoryOperationalRecord[]>;
+  listQueueRebuildReconciliationTargets(): Promise<QueueRebuildReconciliationTarget[]>;
+  getQueueRebuildDeliveryAudit(githubAppId: number): Promise<GithubDeliveryAudit | undefined>;
   selectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined>;
   reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult>;
@@ -539,6 +569,37 @@ export interface M1Store {
   listRecoverableGithubDeliveryRepairs(githubAppId: number): Promise<GithubDeliveryRepair[]>;
   getDeliveryRepairStatusCounts(githubAppId: number): Promise<GithubDeliveryRepairStatusCounts>;
   markGithubDeliveryRepair(input: { guid: string; status: GithubDeliveryRepair["status"]; errorCode?: string; now: Date }): Promise<GithubDeliveryRepair | undefined>;
+}
+
+export async function collectQueueRebuildReconciliationTargets(
+  store: Pick<M1Store, "listMaintenanceTargets" | "getCurrentRepositoryReconciliationGeneration" | "listHistoricalProgress" | "getInstallation">,
+): Promise<QueueRebuildReconciliationTarget[]> {
+  const targets: QueueRebuildReconciliationTarget[] = [];
+  for (const target of await store.listMaintenanceTargets()) {
+    const generation = await store.getCurrentRepositoryReconciliationGeneration(target.tenantId, target.repositoryId);
+    if (!generation) continue;
+    const installation = await store.getInstallation(target.installationGithubId);
+    const progress = (await store.listHistoricalProgress(target.tenantId, target.repositoryId)).filter(
+      (row) => row.cursor.reconciliationRunId === generation.reconciliationRunId,
+    );
+    const completed = progress.some((row) => row.stage === "completed" && row.status === "completed");
+    const active = progress.find((row) => row.status === "paused") ?? progress.find((row) => row.status === "in_progress") ?? progress.find((row) => row.status === "pending");
+    targets.push({
+      tenantId: target.tenantId,
+      repositoryId: target.repositoryId,
+      installationGithubId: target.installationGithubId,
+      reconciliationRunId: generation.reconciliationRunId,
+      generation: generation.generation,
+      completed,
+      blocked: Boolean(active?.status === "paused" && !active.pausedUntil),
+      ...(active?.stage ? { stage: active.stage } : {}),
+      ...(active?.status ? { status: active.status } : {}),
+      ...(active ? { nextPage: active.cursor.nextPage } : {}),
+      ...(active?.pausedUntil ? { pausedUntil: active.pausedUntil } : {}),
+      ...(installation?.apiPausedUntil ? { installationApiPausedUntil: installation.apiPausedUntil } : {}),
+    });
+  }
+  return targets;
 }
 
 export class InMemoryM1Store implements M1Store {
@@ -702,6 +763,28 @@ export class InMemoryM1Store implements M1Store {
   async getMaintenanceWindow(task: MaintenanceTask, bucket: string): Promise<MaintenanceWindow | undefined> {
     const window = this.maintenanceWindows.get(`${task}:${bucket}`);
     return window ? { ...window } : undefined;
+  }
+  async listIncompleteMaintenanceWindows(): Promise<MaintenanceWindow[]> {
+    return [...this.maintenanceWindows.values()].filter((window) => !window.completedAt).map((window) => ({ ...window }));
+  }
+  async recoverIncompleteMaintenanceWindow(input: {
+    task: MaintenanceTask;
+    bucket: string;
+    expectedAcceptedJobId: string;
+    replacementJobId: string;
+    now: Date;
+  }): Promise<boolean> {
+    const window = this.maintenanceWindows.get(`${input.task}:${input.bucket}`);
+    if (!window || window.completedAt || window.acceptedJobId !== input.expectedAcceptedJobId) return false;
+    window.acceptedJobId = input.replacementJobId;
+    window.updatedAt = input.now;
+    return true;
+  }
+  async listQueueRebuildReconciliationTargets(): Promise<QueueRebuildReconciliationTarget[]> {
+    return collectQueueRebuildReconciliationTargets(this);
+  }
+  async getQueueRebuildDeliveryAudit(githubAppId: number): Promise<GithubDeliveryAudit | undefined> {
+    return this.getGithubDeliveryAudit(githubAppId);
   }
   async listMaintenanceOperationalHealth(): Promise<MaintenanceWindow[]> {
     const latest = new Map<MaintenanceTask, MaintenanceWindow>();

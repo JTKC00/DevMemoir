@@ -3,14 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": { "./recovery": "./dist/recovery.js" },
+  "exports": { "./recovery": "./dist/recovery.js", "./queue-rebuild": "./dist/queue-rebuild.js" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
     "test": "vitest run --passWithNoTests",
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "ops:queue-rebuild": "tsx src/queue-rebuild-cli.ts"
   },
   "dependencies": {
     "@devmemoir/config": "workspace:*",

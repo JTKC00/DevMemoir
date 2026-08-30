@@ -209,6 +209,13 @@ Suppressed webhook repair, App-JWT-only failed-delivery audit, same-GUID recover
 - [x] Repository reconciliation, delivery-audit retry, and recoverable-repair resume reuse existing durable entrypoints and preserve pauses, cooldowns, attempts, and terminal states.
 - [x] Authorization, health derivation, concurrent idempotency, privacy canaries, and real PostgreSQL aggregation have regression coverage.
 
+### M5.5 completion
+
+- [x] Queue state is treated as non-authoritative; rebuild derives unfinished work from durable PostgreSQL truth only.
+- [x] `pnpm ops:queue-rebuild` and `--dry-run` reconstruct M5.1/M5.2/M5.3 work through existing enqueue entrypoints without GitHub calls.
+- [x] Incomplete maintenance windows transfer lost queue ownership through a bounded CAS; completed windows remain terminal.
+- [x] Real PostgreSQL discovery/CAS tests and a real pg-boss wipe/rebuild/resume integration prove same-generation, same-cursor, pause, repair, and privacy invariants.
+
 ### Risks
 
 Audit/reconcile loops can amplify API load or use the wrong credential; installation lanes, explicit schedules, and endpoint/credential contract tests bound the blast radius.

@@ -77,4 +77,37 @@ describeIntegration("maintenance window claims", () => {
       await pool.end();
     }
   });
+
+  it("compare-and-sets incomplete ownership once and refuses completed windows", async () => {
+    const bucket = `2031${String(1 + (Number.parseInt(randomUUID().replaceAll("-", "").slice(0, 2), 16) % 12)).padStart(2, "0")}${String(1 + (Number.parseInt(randomUUID().replaceAll("-", "").slice(2, 4), 16) % 28)).padStart(2, "0")}T18`;
+    buckets.push(bucket);
+    const poolA = createPool(databaseUrl as string, 2);
+    const poolB = createPool(databaseUrl as string, 2);
+    const storeA = new PostgresM1Store(poolA);
+    const storeB = new PostgresM1Store(poolB);
+    const now = new Date("2026-08-29T12:00:00Z");
+    try {
+      expect(await storeA.claimMaintenanceWindow({ task: "delivery_audit", bucket, jobKind: "maintenance_audit", jobId: "old-job", now })).toBe(true);
+      await storeA.recordMaintenanceWindowError({ task: "delivery_audit", bucket, jobId: "old-job", errorCode: "tick_failed", now });
+      const raced = await Promise.all([
+        storeA.recoverIncompleteMaintenanceWindow({ task: "delivery_audit", bucket, expectedAcceptedJobId: "old-job", replacementJobId: "new-job-a", now }),
+        storeB.recoverIncompleteMaintenanceWindow({ task: "delivery_audit", bucket, expectedAcceptedJobId: "old-job", replacementJobId: "new-job-b", now }),
+      ]);
+      expect(raced.filter(Boolean)).toHaveLength(1);
+      const window = await storeA.getMaintenanceWindow("delivery_audit", bucket);
+      expect(["new-job-a", "new-job-b"]).toContain(window?.acceptedJobId);
+      expect(window?.completedAt).toBeUndefined();
+      expect(window?.lastErrorCode).toBe("tick_failed");
+      expect(window?.bucket).toBe(bucket);
+
+      await storeA.completeMaintenanceWindow({ task: "delivery_audit", bucket, jobId: window?.acceptedJobId ?? "", now });
+      expect(await storeB.recoverIncompleteMaintenanceWindow({ task: "delivery_audit", bucket, expectedAcceptedJobId: window?.acceptedJobId ?? "", replacementJobId: "new-job-c", now })).toBe(false);
+      const completed = await storeB.getMaintenanceWindow("delivery_audit", bucket);
+      expect(completed?.acceptedJobId).toBe(window?.acceptedJobId);
+      expect(completed?.completedAt).toEqual(now);
+    } finally {
+      await poolA.end().catch(() => undefined);
+      await poolB.end().catch(() => undefined);
+    }
+  });
 });

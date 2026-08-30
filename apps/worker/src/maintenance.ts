@@ -85,7 +85,9 @@ export async function processMaintenanceTick(payload: SyncJobPayload, deps: Main
   const task = payload.maintenanceTask ?? MAINTENANCE_SCHEDULES.find((schedule) => schedule.kind === payload.kind)?.task;
   if (!task) throw new Error("Unknown maintenance task");
   const now = currentTime(deps);
-  const bucket = maintenanceWindowBucket(task, now);
+  const bucket = payload.maintenanceBucket && /^\d{8}T\d{2}$|^\d{4}-\d{2}-\d{2}$/.test(payload.maintenanceBucket)
+    ? payload.maintenanceBucket
+    : maintenanceWindowBucket(task, now);
   const jobKind = payload.kind ?? MAINTENANCE_SCHEDULES.find((schedule) => schedule.task === task)?.kind;
   if (!jobKind) throw new Error("Unknown maintenance job kind");
   const claimed = await deps.store.claimMaintenanceWindow({ task, bucket, jobKind, jobId, now });
