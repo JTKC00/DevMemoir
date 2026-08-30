@@ -6,6 +6,7 @@ import {
   githubDeliveryIsExpired,
   isTerminalDeliveryState,
   isTerminalGithubDeliveryRepairStatus,
+  MAINTENANCE_TASKS,
   nextRedeliveryClaimLeaseAt,
   nextRedeliveryEligibleAt,
   projectCanonicalFacts,
@@ -110,6 +111,58 @@ export type MaintenanceWindow = {
   lastErrorCode?: string;
 };
 
+export const WORKER_HEARTBEAT_INTERVAL_MS = 30_000;
+export const WORKER_HEARTBEAT_STALE_MS = 90_000;
+export const WORKER_HEARTBEAT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const OPERATIONAL_STUCK_WORK_MS = 30 * 60 * 1000;
+export const WEBHOOK_PROCESSING_LEASE_MS = 5 * 60 * 1000;
+export const DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD = 25;
+
+export type WorkerHeartbeat = {
+  workerInstanceId: string;
+  startedAt: Date;
+  lastHeartbeatAt: Date;
+  stoppedAt?: Date;
+  updatedAt: Date;
+};
+
+export type WorkerOperationalHealth = {
+  state: "healthy" | "stale" | "stopped" | "never_seen";
+  liveWorkers: number;
+  staleWorkers: number;
+  lastHeartbeatAt?: Date;
+};
+
+export type OperationalLeaseAlerts = {
+  expiredProcessing: number;
+  stuckReconciliations: number;
+  oldestRepositoryReconciliationActivityAt?: Date;
+  stuckAudits: number;
+  stuckMaintenanceWindows: number;
+};
+
+export type GithubQuotaOperationalHealth = {
+  pausedInstallations: number;
+  earliestResumeAt?: Date;
+  latestResumeAt?: Date;
+  appAuditPaused: boolean;
+  appAuditResumeAt?: Date;
+};
+
+export type DeliveryRepairOperationalHealth = {
+  recoverableBacklog: number;
+  pausedRecoverable: number;
+  exhausted: number;
+  oldestRecoverableAt?: Date;
+  oldestReadyRecoverableAt?: Date;
+};
+
+export type MaintenanceOperationalSummary = {
+  task: MaintenanceTask;
+  latestWindow?: MaintenanceWindow;
+  lastCompletedAt?: Date;
+};
+
 export const GITHUB_DELIVERY_REPAIR_STATUSES = ["pending", "requesting", "requested", "skipped_processing", "healthy", "expired", "exhausted", "skipped_terminal"] as const;
 export type GithubDeliveryRepairStatus = (typeof GITHUB_DELIVERY_REPAIR_STATUSES)[number];
 export type GithubDeliveryRepairStatusCounts = Record<GithubDeliveryRepairStatus, number>;
@@ -187,6 +240,7 @@ export type DeliveryRecord = {
   lastReceivedAt: Date;
   receiptCount: number;
   processingAttempts: number;
+  leaseExpiresAt?: Date | null;
   /** A real pg-boss UUID; null clears a stale owner after a restart/race. */
   jobId?: string | null;
   errorCode?: string;
@@ -430,6 +484,8 @@ export type GithubDeliveryRepair = {
   lastGithubStatusCode?: number;
   lastGithubDeliveredAt?: Date;
   sanitizedErrorCode?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
 };
 
 export type GithubDeliveryRepairObservation = {
@@ -487,6 +543,14 @@ export interface M1Store {
   listRepositories(tenantId: string): Promise<RepositoryRecord[]>;
   listRepositoryInventory(tenantId: string, installationId?: string): Promise<RepositoryRecord[]>;
   listMaintenanceTargets(input?: { activeSince?: Date }): Promise<MaintenanceTarget[]>;
+  recordWorkerHeartbeat(input: { workerInstanceId: string; startedAt: Date; now: Date }): Promise<void>;
+  markWorkerStopped(input: { workerInstanceId: string; now: Date }): Promise<void>;
+  pruneOldWorkerHeartbeats(input: { before: Date }): Promise<number>;
+  getWorkerOperationalHealth(input: { now: Date }): Promise<WorkerOperationalHealth>;
+  getOperationalLeaseAlerts(input: { tenantId: string; githubAppId: number; now: Date }): Promise<OperationalLeaseAlerts>;
+  getGithubQuotaOperationalHealth(input: { tenantId: string; githubAppId: number; now: Date }): Promise<GithubQuotaOperationalHealth>;
+  getDeliveryRepairOperationalHealth(input: { githubAppId: number; now: Date }): Promise<DeliveryRepairOperationalHealth>;
+  getMaintenanceOperationalSummary(): Promise<MaintenanceOperationalSummary[]>;
   claimMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobKind: string; jobId: string; now: Date }): Promise<boolean>;
   completeMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobId: string; now: Date }): Promise<void>;
   recordMaintenanceWindowError(input: { task: MaintenanceTask; bucket: string; jobId: string; errorCode: string; now: Date }): Promise<void>;
@@ -516,7 +580,7 @@ export interface M1Store {
   updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void>;
   getDelivery(id: string, tenantId?: string): Promise<DeliveryRecord | undefined>;
   /** Claim one non-terminal delivery without reopening processed/ignored work. */
-  claimDeliveryForProcessing(id: string, tenantId?: string): Promise<DeliveryRecord | undefined>;
+  claimDeliveryForProcessing(id: string, tenantId?: string, now?: Date): Promise<DeliveryRecord | undefined>;
   ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string>;
   setBranchHead(tenantId: string, repositoryId: string, ref: string, headSha: string | null): Promise<void>;
   getBranchHead(tenantId: string, repositoryId: string, ref: string): Promise<string | null>;
@@ -628,6 +692,7 @@ export class InMemoryM1Store implements M1Store {
   readonly githubDeliveryAudits = new Map<number, GithubDeliveryAudit>();
   readonly githubDeliveryRepairs = new Map<string, GithubDeliveryRepair>();
   readonly maintenanceWindows = new Map<string, MaintenanceWindow>();
+  readonly workerHeartbeats = new Map<string, WorkerHeartbeat>();
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
 
@@ -732,6 +797,102 @@ export class InMemoryM1Store implements M1Store {
       }
     }
     return targets;
+  }
+
+  async recordWorkerHeartbeat(input: { workerInstanceId: string; startedAt: Date; now: Date }): Promise<void> {
+    const existing = this.workerHeartbeats.get(input.workerInstanceId);
+    this.workerHeartbeats.set(input.workerInstanceId, {
+      workerInstanceId: input.workerInstanceId,
+      startedAt: existing?.startedAt ?? input.startedAt,
+      lastHeartbeatAt: input.now,
+      updatedAt: input.now,
+    });
+  }
+
+  async markWorkerStopped(input: { workerInstanceId: string; now: Date }): Promise<void> {
+    const existing = this.workerHeartbeats.get(input.workerInstanceId);
+    if (!existing) return;
+    existing.stoppedAt = input.now;
+    existing.updatedAt = input.now;
+  }
+
+  async pruneOldWorkerHeartbeats(input: { before: Date }): Promise<number> {
+    let deleted = 0;
+    for (const [id, heartbeat] of this.workerHeartbeats) {
+      if ((heartbeat.stoppedAt ?? heartbeat.lastHeartbeatAt) < input.before) {
+        this.workerHeartbeats.delete(id);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async getWorkerOperationalHealth(input: { now: Date }): Promise<WorkerOperationalHealth> {
+    const rows = [...this.workerHeartbeats.values()];
+    if (rows.length === 0) return { state: "never_seen", liveWorkers: 0, staleWorkers: 0 };
+    const live = rows.filter((row) => !row.stoppedAt);
+    const staleWorkers = live.filter((row) => input.now.getTime() - row.lastHeartbeatAt.getTime() > WORKER_HEARTBEAT_STALE_MS).length;
+    const liveWorkers = live.length - staleWorkers;
+    const lastHeartbeatAt = rows.reduce<Date | undefined>((latest, row) => !latest || row.lastHeartbeatAt > latest ? row.lastHeartbeatAt : latest, undefined);
+    const state = liveWorkers > 0 ? "healthy" : live.length > 0 ? "stale" : "stopped";
+    return { state, liveWorkers, staleWorkers, ...(lastHeartbeatAt ? { lastHeartbeatAt } : {}) };
+  }
+
+  async getOperationalLeaseAlerts(input: { tenantId: string; githubAppId: number; now: Date }): Promise<OperationalLeaseAlerts> {
+    const cutoff = new Date(input.now.getTime() - OPERATIONAL_STUCK_WORK_MS);
+    const expiredProcessing = [...this.deliveries.values()].filter((row) => row.tenantId === input.tenantId && row.state === "processing" && row.leaseExpiresAt && row.leaseExpiresAt <= input.now).length;
+    let stuckReconciliations = 0;
+    let oldestRepositoryReconciliationActivityAt: Date | undefined;
+    for (const source of await this.listRepositoryOperationalHealth(input.tenantId)) {
+      if (!source.generation) continue;
+      const progress = source.progress.filter((row) => row.cursor.reconciliationRunId === source.generation?.reconciliationRunId);
+      if (progress.some((row) => row.status === "paused" && row.pausedUntil && row.pausedUntil > input.now)) continue;
+      if (!progress.some((row) => row.status === "in_progress")) continue;
+      const activity = [...progress.map((row) => row.lastSuccessAt), ...progress.map((row) => row.startedAt), source.generation.startedAt]
+        .filter((value): value is Date => Boolean(value))
+        .reduce<Date | undefined>((latest, value) => !latest || value > latest ? value : latest, undefined);
+      if (activity && activity < cutoff) {
+        stuckReconciliations += 1;
+        if (!oldestRepositoryReconciliationActivityAt || activity < oldestRepositoryReconciliationActivityAt) oldestRepositoryReconciliationActivityAt = activity;
+      }
+    }
+    const audit = this.githubDeliveryAudits.get(input.githubAppId);
+    const auditActivity = audit?.lastSuccessAt ?? audit?.updatedAt ?? audit?.startedAt;
+    const stuckAudits = audit?.status === "in_progress" && auditActivity && auditActivity < cutoff && !(audit.pausedUntil && audit.pausedUntil > input.now) ? 1 : 0;
+    const stuckMaintenanceWindows = [...this.maintenanceWindows.values()].filter((row) => !row.completedAt && row.updatedAt < cutoff).length;
+    return { expiredProcessing, stuckReconciliations, ...(oldestRepositoryReconciliationActivityAt ? { oldestRepositoryReconciliationActivityAt } : {}), stuckAudits, stuckMaintenanceWindows };
+  }
+
+  async getGithubQuotaOperationalHealth(input: { tenantId: string; githubAppId: number; now: Date }): Promise<GithubQuotaOperationalHealth> {
+    const pauses = [...this.installations.values()].filter((row) => row.tenantId === input.tenantId && row.apiPausedUntil && row.apiPausedUntil > input.now).map((row) => row.apiPausedUntil as Date);
+    const earliestResumeAt = pauses.reduce<Date | undefined>((value, pause) => !value || pause < value ? pause : value, undefined);
+    const latestResumeAt = pauses.reduce<Date | undefined>((value, pause) => !value || pause > value ? pause : value, undefined);
+    const audit = this.githubDeliveryAudits.get(input.githubAppId);
+    const appAuditResumeAt = audit?.status === "paused" && audit.pausedUntil && audit.pausedUntil > input.now ? audit.pausedUntil : undefined;
+    return { pausedInstallations: pauses.length, ...(earliestResumeAt ? { earliestResumeAt } : {}), ...(latestResumeAt ? { latestResumeAt } : {}), appAuditPaused: Boolean(appAuditResumeAt), ...(appAuditResumeAt ? { appAuditResumeAt } : {}) };
+  }
+
+  async getDeliveryRepairOperationalHealth(input: { githubAppId: number; now: Date }): Promise<DeliveryRepairOperationalHealth> {
+    const recoverable = [...this.githubDeliveryRepairs.values()].filter((row) => row.githubAppId === input.githubAppId && !isTerminalGithubDeliveryRepairStatus(row.status));
+    const ready = recoverable.filter((row) => !row.nextEligibleAt || row.nextEligibleAt <= input.now);
+    const pausedRecoverable = recoverable.length - ready.length;
+    const exhausted = [...this.githubDeliveryRepairs.values()].filter((row) => row.githubAppId === input.githubAppId && row.status === "exhausted").length;
+    const oldestOf = (rows: typeof recoverable) => rows
+      .map((row) => row.createdAt ?? row.updatedAt ?? row.lastGithubDeliveredAt)
+      .filter((value): value is Date => Boolean(value))
+      .reduce<Date | undefined>((oldest, value) => !oldest || value < oldest ? value : oldest, undefined);
+    const oldestRecoverableAt = oldestOf(recoverable);
+    const oldestReadyRecoverableAt = oldestOf(ready);
+    return { recoverableBacklog: recoverable.length, pausedRecoverable, exhausted, ...(oldestRecoverableAt ? { oldestRecoverableAt } : {}), ...(oldestReadyRecoverableAt ? { oldestReadyRecoverableAt } : {}) };
+  }
+
+  async getMaintenanceOperationalSummary(): Promise<MaintenanceOperationalSummary[]> {
+    return MAINTENANCE_TASKS.map((task) => {
+      const rows = [...this.maintenanceWindows.values()].filter((row) => row.task === task);
+      const latestWindow = rows.reduce<MaintenanceWindow | undefined>((latest, row) => !latest || row.acceptedAt > latest.acceptedAt ? row : latest, undefined);
+      const lastCompletedAt = rows.map((row) => row.completedAt).filter((value): value is Date => Boolean(value)).reduce<Date | undefined>((latest, value) => !latest || value > latest ? value : latest, undefined);
+      return { task, ...(latestWindow ? { latestWindow: { ...latestWindow } } : {}), ...(lastCompletedAt ? { lastCompletedAt } : {}) };
+    });
   }
   async claimMaintenanceWindow(input: { task: MaintenanceTask; bucket: string; jobKind: string; jobId: string; now: Date }): Promise<boolean> {
     const key = `${input.task}:${input.bucket}`;
@@ -927,17 +1088,19 @@ export class InMemoryM1Store implements M1Store {
     const delivery = [...this.deliveries.values()].find((value) => value.id === id);
     if (!delivery) throw new Error("Delivery not found");
     Object.assign(delivery, patch);
+    if (patch.state !== undefined && patch.state !== "processing") delivery.leaseExpiresAt = null;
   }
   async getDelivery(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> { return [...this.deliveries.values()].find((value) => value.id === id); }
   async getDeliveryByGuid(guid: string, tenantId: string): Promise<DeliveryRecord | undefined> {
     const delivery = this.deliveries.get(guid);
     return delivery && delivery.tenantId === tenantId ? { ...delivery } : undefined;
   }
-  async claimDeliveryForProcessing(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> {
+  async claimDeliveryForProcessing(id: string, _tenantId?: string, now = new Date()): Promise<DeliveryRecord | undefined> {
     const delivery = [...this.deliveries.values()].find((value) => value.id === id);
     if (!delivery || delivery.state === "processed" || delivery.state === "ignored") return undefined;
     delivery.state = "processing";
     delivery.processingAttempts += 1;
+    delivery.leaseExpiresAt = new Date(now.getTime() + WEBHOOK_PROCESSING_LEASE_MS);
     return { ...delivery };
   }
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {
@@ -1448,6 +1611,8 @@ export class InMemoryM1Store implements M1Store {
       lastGithubStatusCode: input.statusCode,
       lastGithubDeliveredAt: input.deliveredAt,
       ...(existing?.sanitizedErrorCode ? { sanitizedErrorCode: existing.sanitizedErrorCode } : {}),
+      createdAt: existing?.createdAt ?? input.now,
+      updatedAt: input.now,
     };
     this.githubDeliveryRepairs.set(input.githubDeliveryGuid, repair);
     return { ...repair };
@@ -1472,6 +1637,7 @@ export class InMemoryM1Store implements M1Store {
     repair.status = "requesting";
     repair.githubDeliveryId = input.githubDeliveryId;
     repair.nextEligibleAt = nextRedeliveryClaimLeaseAt(input.now);
+    repair.updatedAt = input.now;
     return { allowed: true, reason: "claimed", repair: { ...repair }, ...(localDelivery ? { localDelivery: { ...localDelivery } } : {}) };
   }
 
@@ -1483,6 +1649,7 @@ export class InMemoryM1Store implements M1Store {
     repair.attemptCount += 1;
     repair.lastRedeliveryRequestedAt = input.now;
     repair.nextEligibleAt = nextRedeliveryEligibleAt(repair.attemptCount, input.now);
+    repair.updatedAt = input.now;
     return { ...repair };
   }
 
@@ -1492,6 +1659,7 @@ export class InMemoryM1Store implements M1Store {
     repair.status = "requesting";
     repair.nextEligibleAt = input.resumeAt;
     repair.sanitizedErrorCode = input.errorCode;
+    repair.updatedAt = input.now;
     return { ...repair };
   }
 
@@ -1506,6 +1674,7 @@ export class InMemoryM1Store implements M1Store {
     if (!repair) return undefined;
     repair.status = input.status;
     if (input.errorCode) repair.sanitizedErrorCode = input.errorCode;
+    repair.updatedAt = input.now;
     return { ...repair };
   }
 }

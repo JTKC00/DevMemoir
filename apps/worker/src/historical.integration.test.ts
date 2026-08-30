@@ -330,7 +330,7 @@ describeIntegration("M3 PostgreSQL + pg-boss historical restart boundaries", () 
     const firstLane = new InstallationRequestLanes(1, () => nowMs, async (installationId, state) => {
       const installation = await firstStore.getInstallation(installationId);
       if (installation) await firstStore.pauseInstallationApi({ tenantId: installation.tenantId, installationId: installation.id, pausedUntil: state.resumeAt, reason: `github_${state.code}` });
-    });
+    }, () => 0);
     const firstGithub = makeGithub(firstLane);
     const payload: SyncJobPayload = { kind: "repository_backfill", tenantId: scope.tenantId, repositoryId: scope.repositoryId, installationId: scope.installationGithubId };
     const firstDeps = { store: firstStore, jobs: firstBoss, githubForInstallation: () => firstGithub, logger: createLogger(() => undefined), ownerGithubAccountId: scope.accountGithubId, now: () => new Date(nowMs) };
@@ -349,7 +349,7 @@ describeIntegration("M3 PostgreSQL + pg-boss historical restart boundaries", () 
     scope.pools.push(replacementPool);
     scope.bosses.push(replacementBoss);
     await replacementBoss.start();
-    const replacementLane = new InstallationRequestLanes(1, () => nowMs);
+    const replacementLane = new InstallationRequestLanes(1, () => nowMs, undefined, () => 0);
     const replacementGithub = makeGithub(replacementLane);
     const replacementDeps = { store: replacementStore, jobs: replacementBoss, githubForInstallation: () => replacementGithub, logger: createLogger(() => undefined), ownerGithubAccountId: scope.accountGithubId, now: () => new Date(nowMs) };
 

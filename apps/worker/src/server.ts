@@ -6,6 +6,7 @@ import { createLogger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit, resumeGithubDeliveryRepairs } from "./delivery-audit.js";
 import { processQueueJob, type QueueDependencies } from "./jobs.js";
 import { enqueueCurrentMaintenanceTicks, registerMaintenanceSchedules } from "./maintenance.js";
+import { startWorkerHeartbeat } from "./heartbeat.js";
 
 const config = loadConfig();
 const pool = createPool(config.DATABASE_WORKER_URL, config.DATABASE_POOL_MAX);
@@ -23,6 +24,7 @@ const baseGithub = new OctokitGithubClient({
 });
 const jobs = new PgBossJobPort(config.DATABASE_QUEUE_URL);
 const logger = createLogger();
+const heartbeat = await startWorkerHeartbeat({ store, logger });
 await jobs.start();
 await registerMaintenanceSchedules(jobs);
 const dependencies: QueueDependencies = { config, store, jobs, githubForInstallation: (installationId) => createInstallationGithubClient(baseGithub, installationId), githubApp: baseGithub, logger };
@@ -45,9 +47,20 @@ if (existingAudit && (existingAudit.status === "in_progress" || existingAudit.st
 await resumeGithubDeliveryRepairs(config.GITHUB_APP_ID, auditDeps);
 logger.info({ result: "started" });
 
-const shutdown = async () => {
-  await jobs.stop();
-  await pool.end();
+let shutdownPromise: Promise<void> | undefined;
+const shutdown = (): Promise<void> => {
+  shutdownPromise ??= (async () => {
+    try {
+      await jobs.stop();
+    } finally {
+      try {
+        await heartbeat.stop();
+      } finally {
+        await pool.end();
+      }
+    }
+  })();
+  return shutdownPromise;
 };
 process.once("SIGTERM", () => { void shutdown().finally(() => process.exit(0)); });
 process.once("SIGINT", () => { void shutdown().finally(() => process.exit(0)); });

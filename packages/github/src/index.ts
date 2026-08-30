@@ -2,11 +2,13 @@ import { App } from "@octokit/app";
 import { Octokit } from "@octokit/rest";
 import type { CommitFact, GithubActor } from "@devmemoir/domain";
 import { actorKindFromGithub } from "@devmemoir/domain";
+import { randomInt } from "node:crypto";
 import { z } from "zod";
 
 export const API_VERSION = "2022-11-28";
 const DEFAULT_PER_PAGE = 100;
 const SECONDARY_LIMIT_FALLBACK_MS = 60_000;
+const MAX_RATE_LIMIT_JITTER_MS = 5_000;
 
 export function githubRefParameter(ref: string): string {
   const normalized = ref.replace(/^refs\//, "");
@@ -350,6 +352,16 @@ function resetResumeAt(value: string | undefined): number | undefined {
 
 export type GithubRateLimitCode = "primary_rate_limit" | "secondary_rate_limit" | "retry_after";
 export type GithubAccessCode = "unauthorized" | "forbidden" | "not_found";
+/** Returns a jitter duration from zero through maxMs, inclusive. */
+export type GithubRateLimitJitterSource = (maxMs: number) => number;
+
+const randomRateLimitJitter: GithubRateLimitJitterSource = (maxMs) => randomInt(maxMs + 1);
+
+function boundedRateLimitJitter(source: GithubRateLimitJitterSource): number {
+  const value = source(MAX_RATE_LIMIT_JITTER_MS);
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(MAX_RATE_LIMIT_JITTER_MS, Math.max(0, Math.floor(value)));
+}
 
 export class GithubRateLimitPauseError extends Error {
   constructor(readonly code: GithubRateLimitCode, readonly status: number, readonly resumeAt: Date) {
@@ -381,7 +393,11 @@ export class GithubTransientError extends Error {
   }
 }
 
-function pauseFromMetadata(input: { status?: number | undefined; headers?: GithubResponseHeaders | undefined; message?: string | undefined }, now: number): GithubRateLimitPauseError | undefined {
+function pauseFromMetadata(
+  input: { status?: number | undefined; headers?: GithubResponseHeaders | undefined; message?: string | undefined },
+  now: number,
+  jitterSource: GithubRateLimitJitterSource,
+): GithubRateLimitPauseError | undefined {
   const retryAt = retryAfterResumeAt(headerValue(input.headers, "retry-after"), now);
   const remaining = Number(headerValue(input.headers, "x-ratelimit-remaining"));
   const resetAt = resetResumeAt(headerValue(input.headers, "x-ratelimit-reset"));
@@ -390,14 +406,15 @@ function pauseFromMetadata(input: { status?: number | undefined; headers?: Githu
   if (!retryAt && !primary && !secondary) return undefined;
   const code: GithubRateLimitCode = secondary ? "secondary_rate_limit" : primary ? "primary_rate_limit" : "retry_after";
   const fallbackAt = now + SECONDARY_LIMIT_FALLBACK_MS;
-  const resumeAt = Math.max(now, retryAt ?? 0, primary ? (resetAt ?? fallbackAt) : 0, secondary && !retryAt ? fallbackAt : 0);
+  const authoritativeResumeAt = Math.max(now, retryAt ?? 0, primary ? (resetAt ?? fallbackAt) : 0, secondary && !retryAt ? fallbackAt : 0);
+  const resumeAt = authoritativeResumeAt + boundedRateLimitJitter(jitterSource);
   return new GithubRateLimitPauseError(code, input.status ?? 429, new Date(resumeAt));
 }
 
-function classifyRequestError(error: unknown, now: number): Error {
+function classifyRequestError(error: unknown, now: number, jitterSource: GithubRateLimitJitterSource): Error {
   if (error instanceof GithubRateLimitPauseError || error instanceof GithubAccessError || error instanceof GithubTransientError) return error;
   const status = errorStatus(error);
-  const pause = pauseFromMetadata({ status, headers: errorHeaders(error), message: errorMessage(error) }, now);
+  const pause = pauseFromMetadata({ status, headers: errorHeaders(error), message: errorMessage(error) }, now, jitterSource);
   if (pause) return pause;
   if (status === 401) return new GithubAccessError("unauthorized", status);
   if (status === 403) return new GithubAccessError("forbidden", status);
@@ -432,6 +449,7 @@ export class InstallationRequestLanes {
     private readonly concurrency: 1 | 2 = 1,
     private readonly now: () => number = Date.now,
     private readonly onRateLimitState?: GithubRateLimitObserver,
+    private readonly jitterSource: GithubRateLimitJitterSource = randomRateLimitJitter,
   ) {
     if (concurrency !== 1 && concurrency !== 2) throw new RangeError("GitHub installation request concurrency must be 1 or 2");
   }
@@ -461,7 +479,7 @@ export class InstallationRequestLanes {
       }
       lane.active += 1;
       void Promise.resolve().then(task.request).then(async (response) => {
-        const successPause = pauseFromMetadata({ status: response.status, headers: response.headers }, this.now());
+        const successPause = pauseFromMetadata({ status: response.status, headers: response.headers }, this.now(), this.jitterSource);
         if (successPause) {
           lane.pausedUntil = successPause.resumeAt.getTime();
           lane.pauseCode = successPause.code;
@@ -473,7 +491,7 @@ export class InstallationRequestLanes {
         }
         task.resolve(response);
       }).catch((rawError: unknown) => {
-        const error = classifyRequestError(rawError, this.now());
+        const error = classifyRequestError(rawError, this.now(), this.jitterSource);
         if (error instanceof GithubRateLimitPauseError) {
           lane.pausedUntil = error.resumeAt.getTime();
           lane.pauseCode = error.code;
@@ -494,9 +512,9 @@ export class OctokitGithubClient implements GithubClient, GithubAppClient {
   private readonly installationClients = new Map<number, Promise<Requester>>();
   private readonly installationRequestLanes: InstallationRequestLanes;
 
-  constructor(input: { appId: number; privateKey: string; apiVersion?: string; webhookSecret?: string; installationRequestConcurrency?: 1 | 2; onRateLimitState?: GithubRateLimitObserver }) {
+  constructor(input: { appId: number; privateKey: string; apiVersion?: string; webhookSecret?: string; installationRequestConcurrency?: 1 | 2; onRateLimitState?: GithubRateLimitObserver; rateLimitJitterSource?: GithubRateLimitJitterSource }) {
     this.apiVersion = input.apiVersion ?? API_VERSION;
-    this.installationRequestLanes = new InstallationRequestLanes(input.installationRequestConcurrency ?? 1, Date.now, input.onRateLimitState);
+    this.installationRequestLanes = new InstallationRequestLanes(input.installationRequestConcurrency ?? 1, Date.now, input.onRateLimitState, input.rateLimitJitterSource);
     this.app = new App({ appId: input.appId, privateKey: input.privateKey, ...(input.webhookSecret ? { webhooks: { secret: input.webhookSecret } } : {}) });
   }
 
