@@ -1,6 +1,6 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, MAINTENANCE_TASKS, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
-import { collectQueueRebuildReconciliationTargets, emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, OPERATIONAL_STUCK_WORK_MS, repositoryProjectionInputsChanged, RepositorySelectionError, WEBHOOK_PROCESSING_LEASE_MS, WORKER_HEARTBEAT_STALE_MS } from "./store.js";
+import { collectQueueRebuildReconciliationTargets, emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, OPERATIONAL_STUCK_WORK_MS, RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS, RAW_WEBHOOK_PURGE_BATCH_SIZE, RAW_WEBHOOK_STANDARD_RETENTION_MS, repositoryProjectionInputsChanged, RepositorySelectionError, standardPayloadExpiry, WEBHOOK_PROCESSING_LEASE_MS, WORKER_HEARTBEAT_STALE_MS } from "./store.js";
 import type {
   ActivityRecord,
   ActivityQuery,
@@ -37,7 +37,9 @@ import type {
   RepositoryRecord,
   RefSyncContinuation,
   SessionRecord,
+  UnroutedWebhookRecord,
   UserRecord,
+  WebhookPayloadPurgeResult,
   WorkerOperationalHealth,
 } from "./store.js";
 import { HISTORICAL_STAGES } from "./store.js";
@@ -699,9 +701,10 @@ export class PostgresM1Store implements M1Store {
         return { record: { ...existing, lastReceivedAt: input.now, receiptCount: existing.receiptCount + 1 }, created: false, action: deliveryRedeliveryAction(existing.state) };
       }
       const id = createId();
-      await client.query(`insert into webhook_deliveries (id,tenant_id,github_delivery_guid,event_name,action,installation_github_id,repository_github_id,ref,before_sha,after_sha,forced,payload_ciphertext,first_received_at,last_received_at,receipt_count,state,processing_attempts,payload_expires_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,1,'received',0,$14)`, [id, input.tenantId ?? null, input.guid, input.eventName, input.action ?? null, input.installationGithubId ?? null, input.repositoryGithubId ?? null, input.ref ?? null, input.before ?? null, input.after ?? null, input.forced ?? null, input.payloadCiphertext ?? null, input.now, input.payloadExpiresAt]);
+      const payloadExpiresAt = standardPayloadExpiry(input.now);
+      await client.query(`insert into webhook_deliveries (id,tenant_id,github_delivery_guid,event_name,action,installation_github_id,repository_github_id,ref,before_sha,after_sha,forced,payload_ciphertext,first_received_at,last_received_at,receipt_count,state,processing_attempts,payload_expires_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,1,'received',0,$14)`, [id, input.tenantId ?? null, input.guid, input.eventName, input.action ?? null, input.installationGithubId ?? null, input.repositoryGithubId ?? null, input.ref ?? null, input.before ?? null, input.after ?? null, input.forced ?? null, input.payloadCiphertext ?? null, input.now, payloadExpiresAt]);
       await client.query("commit");
-      const record: DeliveryRecord = { ...input, id, state: "received", firstReceivedAt: input.now, lastReceivedAt: input.now, receiptCount: 1, processingAttempts: 0 };
+      const record: DeliveryRecord = { ...input, id, state: "received", firstReceivedAt: input.now, lastReceivedAt: input.now, receiptCount: 1, processingAttempts: 0, payloadExpiresAt };
       return { record, created: true, action: "ensure_job" };
     } catch (error) {
       await client.query("rollback");
@@ -711,15 +714,28 @@ export class PostgresM1Store implements M1Store {
     }
   }
 
-  async recordUnroutedWebhook(record: { guid: string; eventName: string; payloadCiphertext: string; receivedAt: Date; payloadExpiresAt: Date }): Promise<void> {
-    await this.pool.query("insert into unrouted_webhook_deliveries (id,github_delivery_guid,event_name,payload_ciphertext,received_at,payload_expires_at) values ($1,$2,$3,$4,$5,$6) on conflict (github_delivery_guid) do nothing", [createId(), record.guid, record.eventName, record.payloadCiphertext, record.receivedAt, record.payloadExpiresAt]);
+  async recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void> {
+    await this.pool.query("insert into unrouted_webhook_deliveries (id,github_delivery_guid,event_name,payload_ciphertext,received_at,payload_expires_at) values ($1,$2,$3,$4,$5,$6) on conflict (github_delivery_guid) do nothing", [createId(), record.guid, record.eventName, record.payloadCiphertext ?? null, record.receivedAt, standardPayloadExpiry(record.receivedAt)]);
+  }
+
+  async getUnroutedWebhook(guid: string): Promise<UnroutedWebhookRecord | undefined> {
+    const result = await this.pool.query<Row>("select github_delivery_guid,event_name,payload_ciphertext,received_at,payload_expires_at from unrouted_webhook_deliveries where github_delivery_guid=$1", [guid]);
+    const row = result.rows[0];
+    const receivedAt = date(row?.received_at);
+    const payloadExpiresAt = date(row?.payload_expires_at);
+    if (!row || !receivedAt || !payloadExpiresAt) return undefined;
+    return { guid: String(row.github_delivery_guid), eventName: String(row.event_name), ...(row.payload_ciphertext ? { payloadCiphertext: String(row.payload_ciphertext) } : {}), receivedAt, payloadExpiresAt };
   }
 
   async updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void> {
     const fields: string[] = [];
     const values: unknown[] = [];
     const add = (column: string, value: unknown) => { fields.push(`${column}=$${values.length + 1}`); values.push(value); };
-    if (patch.state !== undefined) add("state", patch.state);
+    if (patch.state !== undefined) {
+      add("state", patch.state);
+      fields.push(`payload_expires_at=first_received_at + ($${values.length + 1} * interval '1 millisecond')`);
+      values.push(patch.state === "dead_letter" ? RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS : RAW_WEBHOOK_STANDARD_RETENTION_MS);
+    }
     if (patch.processingAttempts !== undefined) add("processing_attempts", patch.processingAttempts);
     if (patch.jobId !== undefined) add("job_id", patch.jobId);
     if (patch.errorCode !== undefined) add("sanitized_error_code", patch.errorCode);
@@ -732,6 +748,48 @@ export class PostgresM1Store implements M1Store {
       if (tenantId) await this.tenantQuery(tenantId, async (client) => { await client.query(query, [...values, id]); });
       else await this.pool.query(query, [...values, id]);
     }
+  }
+
+  async purgeExpiredWebhookPayloads(input: { now: Date; limit?: number }): Promise<WebhookPayloadPurgeResult> {
+    const limit = input.limit ?? RAW_WEBHOOK_PURGE_BATCH_SIZE;
+    const routed = await this.pool.query<Row>(
+      `with due as (
+         select id from webhook_deliveries
+         where payload_ciphertext is not null and payload_expires_at <= $1
+         order by payload_expires_at, id
+         limit $2
+         for update skip locked
+       )
+       update webhook_deliveries as delivery
+       set payload_ciphertext = null, payload_key_version = null
+       from due
+       where delivery.id = due.id
+       returning delivery.id`,
+      [input.now, limit],
+    );
+    const unrouted = await this.pool.query<Row>(
+      `with due as (
+         select id from unrouted_webhook_deliveries
+         where payload_ciphertext is not null and payload_expires_at <= $1
+         order by payload_expires_at, id
+         limit $2
+         for update skip locked
+       )
+       update unrouted_webhook_deliveries as delivery
+       set payload_ciphertext = null
+       from due
+       where delivery.id = due.id
+       returning delivery.id`,
+      [input.now, limit],
+    );
+    const remaining = await this.pool.query<Row>(
+      `select (
+         exists(select 1 from webhook_deliveries where payload_ciphertext is not null and payload_expires_at <= $1)
+         or exists(select 1 from unrouted_webhook_deliveries where payload_ciphertext is not null and payload_expires_at <= $1)
+       ) as due`,
+      [input.now],
+    );
+    return { routedPurged: routed.rowCount ?? 0, unroutedPurged: unrouted.rowCount ?? 0, remainingDue: Boolean(remaining.rows[0]?.due) };
   }
 
   async getDelivery(id: string, tenantId?: string): Promise<DeliveryRecord | undefined> {

@@ -2,6 +2,7 @@ import type { M1Store, QueueRebuildReconciliationTarget } from "@devmemoir/db";
 import {
   MAINTENANCE_JOB_KINDS,
   MAINTENANCE_SCHEDULES,
+  PRIVACY_PAYLOAD_PURGE_KIND,
   maintenanceTickLogicalKey,
   type JobPort,
   type MaintenanceJobKind,
@@ -9,7 +10,7 @@ import {
 } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit, resumeGithubDeliveryRepairs } from "./delivery-audit.js";
-import { registerMaintenanceSchedules } from "./maintenance.js";
+import { registerOperationalSchedules } from "./maintenance.js";
 import { enqueueRepositoryReconciliation } from "./reconciliation.js";
 
 export type QueueRebuildResult = {
@@ -250,13 +251,13 @@ async function rebuildMaintenanceWindows(deps: QueueRebuildDependencies, result:
 
 async function rebuildSchedules(deps: QueueRebuildDependencies, result: QueueRebuildResult): Promise<number> {
   if (deps.dryRun) {
-    result.schedules.registered = MAINTENANCE_SCHEDULES.length;
+    result.schedules.registered = MAINTENANCE_SCHEDULES.length + 1;
     return 0;
   }
   if (!deps.jobs) throw new Error("Queue rebuild requires a JobPort unless --dry-run");
   try {
-    await registerMaintenanceSchedules(deps.jobs);
-    const names = new Set<string>(MAINTENANCE_JOB_KINDS);
+    await registerOperationalSchedules(deps.jobs);
+    const names = new Set<string>([...MAINTENANCE_JOB_KINDS, PRIVACY_PAYLOAD_PURGE_KIND]);
     result.schedules.registered = (await deps.jobs.getSchedules()).filter((schedule) => names.has(schedule.name)).length;
     return 0;
   } catch (error) {

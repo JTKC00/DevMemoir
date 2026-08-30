@@ -74,9 +74,9 @@ Only `pending`, `requesting`, `requested`, and `skipped_processing` produce reco
 
 ### 4. M5.3 schedules
 
-`registerMaintenanceSchedules` upserts `maintenance_active`, `maintenance_authorized`, and `maintenance_audit` exactly once under existing pg-boss schedule semantics.
+`registerOperationalSchedules` upserts the M5.3 maintenance schedules (`maintenance_active`, `maintenance_authorized`, `maintenance_audit`) and the M6.1 privacy schedule (`privacy_payload_purge` at `17 * * * *` UTC) exactly once under existing pg-boss schedule semantics.
 
-Rebuild does **not** enqueue current-bucket catch-up ticks. That remains worker boot behavior.
+Rebuild does **not** enqueue current-bucket catch-up ticks. That remains worker boot behavior. Privacy purge likewise waits for the next hourly schedule rather than replaying missed hours.
 
 ### 5. Incomplete maintenance windows
 
@@ -121,7 +121,7 @@ The worker package script is `tsx src/queue-rebuild-cli.ts`. The CLI:
 1. loads config (`DATABASE_WORKER_URL` for store, `DATABASE_QUEUE_URL` for pg-boss);
 2. starts pg-boss and creates required queues (skipped on dry-run);
 3. inspects durable truth;
-4. registers maintenance schedules;
+4. registers maintenance and privacy-payload-purge schedules;
 5. enqueues unfinished work sequentially;
 6. prints sanitized aggregate counts;
 7. exits non-zero on `partial` or `failed`.
@@ -135,7 +135,7 @@ reconciliation_resume: 2
 delivery_audit_resume: 1
 delivery_repairs_resume: 4
 maintenance_window_recoveries: 1
-schedules_register: 3
+schedules_register: 4
 blocked: 1
 ```
 

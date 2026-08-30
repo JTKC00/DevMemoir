@@ -142,7 +142,7 @@ describe("M5.5 queue rebuild", () => {
     expect(formatQueueRebuildCounts(result)).toContain("delivery_audit_resume: 1");
     expect(formatQueueRebuildCounts(result)).toContain("delivery_repairs_resume: 4");
     expect(formatQueueRebuildCounts(result)).toContain("maintenance_window_recoveries: 1");
-    expect(formatQueueRebuildCounts(result)).toContain("schedules_register: 3");
+    expect(formatQueueRebuildCounts(result)).toContain("schedules_register: 4");
     expect(jobs.jobs.size).toBe(0);
     expect(await jobs.getSchedules()).toEqual([]);
     expect((await store.getMaintenanceWindow("delivery_audit", "20260829T12"))?.acceptedJobId).toBe("old-job");
@@ -167,7 +167,7 @@ describe("M5.5 queue rebuild", () => {
       deliveryAudit: { enqueued: 1, paused: 0, completedSkipped: 0 },
       deliveryRepairs: { recoverableFound: 4, enqueued: 4, skipped: 0 },
       maintenance: { incompleteFound: 1, ownershipRecovered: 1 },
-      schedules: { registered: 3 },
+      schedules: { registered: 4 },
     });
     expect((await store.getCurrentRepositoryReconciliationGeneration(tenantId, repositoryId))).toMatchObject({ reconciliationRunId: runIds[3], generation: 4 });
     expect([...jobs.jobs.values()].some((job) => job.logicalKey === repositoryReconciliationLogicalKey(repositoryId, runIds[3]))).toBe(true);

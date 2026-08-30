@@ -4,6 +4,7 @@ import type { GithubAppClient } from "@devmemoir/github";
 import { MAINTENANCE_SCHEDULES, maintenanceTickLogicalKey, type JobPort, type SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit } from "./delivery-audit.js";
+import { registerPrivacyPayloadPurgeSchedule } from "./privacy-payload-purge.js";
 import { enqueueRepositoryReconciliation } from "./reconciliation.js";
 
 export type MaintenanceDependencies = {
@@ -23,6 +24,11 @@ export async function registerMaintenanceSchedules(jobs: JobPort): Promise<void>
   for (const schedule of MAINTENANCE_SCHEDULES) {
     await jobs.schedule(schedule.kind, schedule.cron, { kind: schedule.kind, maintenanceTask: schedule.task }, { tz: "UTC" });
   }
+}
+
+export async function registerOperationalSchedules(jobs: JobPort): Promise<void> {
+  await registerMaintenanceSchedules(jobs);
+  await registerPrivacyPayloadPurgeSchedule(jobs);
 }
 
 export async function enqueueCurrentMaintenanceTicks(jobs: JobPort, now = new Date()): Promise<void> {

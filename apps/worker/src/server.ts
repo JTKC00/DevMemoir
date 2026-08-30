@@ -5,7 +5,7 @@ import { PgBossJobPort } from "@devmemoir/jobs";
 import { createLogger } from "@devmemoir/observability";
 import { enqueueGithubDeliveryAudit, resumeGithubDeliveryRepairs } from "./delivery-audit.js";
 import { processQueueJob, type QueueDependencies } from "./jobs.js";
-import { enqueueCurrentMaintenanceTicks, registerMaintenanceSchedules } from "./maintenance.js";
+import { enqueueCurrentMaintenanceTicks, registerOperationalSchedules } from "./maintenance.js";
 import { startWorkerHeartbeat } from "./heartbeat.js";
 
 const config = loadConfig();
@@ -26,7 +26,7 @@ const jobs = new PgBossJobPort(config.DATABASE_QUEUE_URL);
 const logger = createLogger();
 const heartbeat = await startWorkerHeartbeat({ store, logger });
 await jobs.start();
-await registerMaintenanceSchedules(jobs);
+await registerOperationalSchedules(jobs);
 const dependencies: QueueDependencies = { config, store, jobs, githubForInstallation: (installationId) => createInstallationGithubClient(baseGithub, installationId), githubApp: baseGithub, logger };
 await jobs.work("webhook_delivery", async (job) => processQueueJob(job, dependencies));
 await jobs.work("repository_backfill", async (job) => processQueueJob(job, dependencies));
@@ -38,6 +38,7 @@ await jobs.work("github_delivery_audit_recovery", async (job) => processQueueJob
 await jobs.work("maintenance_active", async (job) => processQueueJob(job, dependencies));
 await jobs.work("maintenance_authorized", async (job) => processQueueJob(job, dependencies));
 await jobs.work("maintenance_audit", async (job) => processQueueJob(job, dependencies));
+await jobs.work("privacy_payload_purge", async (job) => processQueueJob(job, dependencies));
 await enqueueCurrentMaintenanceTicks(jobs);
 const existingAudit = await store.getGithubDeliveryAudit(config.GITHUB_APP_ID);
 const auditDeps = { store, jobs, githubApp: baseGithub, logger };

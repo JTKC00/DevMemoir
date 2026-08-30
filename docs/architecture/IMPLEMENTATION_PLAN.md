@@ -224,7 +224,7 @@ Suppressed webhook repair, App-JWT-only failed-delivery audit, same-GUID recover
 - [x] Owner-only `/ops` and `GET /api/ops/health` expose opaque worker, reconciliation-age, quota-pause, lease, and repair metrics; structured warnings are throttled; private canaries stay out.
 - [x] InMemory and PostgreSQL coverage, plus M5.1–M5.5 regressions, keep Milestone 5 closed.
 
-Milestone 5 is complete: repository reconciliation, failed-delivery audit/repair, periodic maintenance, owner operational health, queue rebuild, worker heartbeat, stuck-work alerts, and GitHub quota/backoff policy are all implemented. M6 is not started in this slice.
+Milestone 5 is complete: repository reconciliation, failed-delivery audit/repair, periodic maintenance, owner operational health, queue rebuild, worker heartbeat, stuck-work alerts, and GitHub quota/backoff policy are all implemented.
 
 ### Risks
 
@@ -264,6 +264,15 @@ Clock-driven 7/30-day expiry, uninstall/disconnect/delete under running jobs, se
 ### Risks
 
 Deletion and restore are destructive/high-trust operations; isolate targets, preserve audit evidence without content, and never promise provider-backup erasure before retention expires.
+
+### M6.1 completion
+
+- [x] Routed and unrouted raw payloads expire from first receipt (7 days ordinary, 30-day dead-letter hard cap); processing, retries, and same-GUID redelivery never move the clock.
+- [x] Dead-letter recovery returns to first-receipt + 7 days; purged ciphertext never rehydrates; delivery metadata and normalized facts remain.
+- [x] Worker-only bounded hourly `privacy_payload_purge` (`17 * * * *` UTC) is registered on boot and queue rebuild; web/API cannot restore payloads.
+- [x] InMemory and PostgreSQL retention, race, tombstone, privilege, and privacy-canary coverage is in place.
+
+Milestone 6 is not complete. Remaining slices are disconnect/delete, secret/key rotation, and PITR/Gate A evidence.
 
 ## Milestone 7 — Soak, quality, and dashboard
 

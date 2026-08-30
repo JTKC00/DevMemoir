@@ -8,7 +8,7 @@ import type { GithubClient } from "@devmemoir/github";
 import type { JobPort } from "@devmemoir/jobs";
 import { deliveryAuditRecoveryLogicalKey, deliveryLogicalKey, historicalBackfillLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
-import { RepositorySelectionError, type M1Store, type SessionRecord } from "@devmemoir/db";
+import { RepositorySelectionError, standardPayloadExpiry, type M1Store, type SessionRecord } from "@devmemoir/db";
 import { enqueueRepositoryReconciliation, resumeGithubDeliveryRepairs } from "@devmemoir/worker/recovery";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
 import { deriveOwnerOperationalHealth, emitOperationalWarnings } from "./ops-health.js";
@@ -391,8 +391,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     const installation = parsed.installationGithubId ? await deps.store.getInstallation(parsed.installationGithubId) : undefined;
     const payloadCiphertext = encryptSecret(raw.toString("utf8"), deps.config.ENCRYPTION_KEY_BASE64);
     const tenantId = installation?.tenantId;
+    const receivedAt = now();
     if (!tenantId) {
-      await deps.store.recordUnroutedWebhook({ guid, eventName, payloadCiphertext, receivedAt: now(), payloadExpiresAt: new Date(now().getTime() + 7 * 24 * 60 * 60 * 1000) });
+      await deps.store.recordUnroutedWebhook({ guid, eventName, payloadCiphertext, receivedAt, payloadExpiresAt: standardPayloadExpiry(receivedAt) });
       return reply.code(202).send({ accepted: true, state: "ignored" });
     }
     const delivery = await deps.store.insertDelivery({
@@ -404,8 +405,8 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
       ...(parsed.repositoryGithubId ? { repositoryGithubId: parsed.repositoryGithubId } : {}),
       ...(parsed.push ? { ref: parsed.push.ref, before: parsed.push.before, after: parsed.push.after, forced: parsed.push.forced } : {}),
       payloadCiphertext,
-      payloadExpiresAt: new Date(now().getTime() + 7 * 24 * 60 * 60 * 1000),
-      now: now(),
+      payloadExpiresAt: standardPayloadExpiry(receivedAt),
+      now: receivedAt,
     });
     const canonicalPush = Boolean(delivery.record.ref && delivery.record.after);
     if (ignored && (delivery.created || !canonicalPush)) {

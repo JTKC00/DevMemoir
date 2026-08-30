@@ -1,10 +1,12 @@
 import PgBoss from "pg-boss";
 import type { DeliveryState, MaintenanceTask } from "@devmemoir/domain";
 
-export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit" | "github_delivery_audit_recovery" | "maintenance_active" | "maintenance_authorized" | "maintenance_audit";
-export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit", "github_delivery_audit_recovery", "maintenance_active", "maintenance_authorized", "maintenance_audit"];
+export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit" | "github_delivery_audit_recovery" | "maintenance_active" | "maintenance_authorized" | "maintenance_audit" | "privacy_payload_purge";
+export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit", "github_delivery_audit_recovery", "maintenance_active", "maintenance_authorized", "maintenance_audit", "privacy_payload_purge"];
 export const MAINTENANCE_JOB_KINDS = ["maintenance_active", "maintenance_authorized", "maintenance_audit"] as const;
 export type MaintenanceJobKind = (typeof MAINTENANCE_JOB_KINDS)[number];
+export const PRIVACY_PAYLOAD_PURGE_KIND = "privacy_payload_purge" as const;
+export const PRIVACY_PAYLOAD_PURGE_CRON = "17 * * * *";
 
 export const MAINTENANCE_SCHEDULES: ReadonlyArray<{ kind: MaintenanceJobKind; cron: string; task: MaintenanceTask }> = [
   { kind: "maintenance_active", cron: "0 */6 * * *", task: "active_reconciliation" },
