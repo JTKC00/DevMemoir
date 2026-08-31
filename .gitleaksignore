@@ -1,0 +1,4 @@
+# Human-adjudicated false positive: GitHub webhook HMAC synthetic test fixture.
+# File: apps/api/src/webhook.test.ts. Not a production credential.
+# Exact Gitleaks v8.30.1 fingerprint only; do not broaden this ignore.
+07351c1a4029b6f18d6d934edbc6da89888185d5:apps/api/src/webhook.test.ts:generic-api-key:9

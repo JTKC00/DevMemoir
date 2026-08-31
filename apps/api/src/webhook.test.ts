@@ -1,3 +1,4 @@
+// Synthetic webhook secrets used only for HMAC verification tests.
 import { describe, expect, it } from "vitest";
 import { createHmac } from "node:crypto";
 import { verifyGithubSignature } from "./webhook.js";
