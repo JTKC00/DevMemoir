@@ -32,7 +32,7 @@ A new routed webhook stores `payload_expires_at = first_received_at + 7 days`. A
 
 Same-GUID redelivery updates `last_received_at` and `receipt_count` only. It does not move `payload_expires_at` and does not restore `payload_ciphertext` after purge.
 
-`received`, `processing`, `failed`, `processed`, and `ignored` never extend the deadline. `claimDeliveryForProcessing` does not write `payload_expires_at`. Processing leases are unrelated to privacy retention.
+`received`, `processing`, `failed`, `processed`, and `ignored` never extend the deadline. `claimDeliveryForProcessing` is itself an ordinary-state transition, so it sets `payload_expires_at = first_received_at + 7 days`. Processing leases are unrelated to privacy retention.
 
 ## Dead-letter hard cap
 
@@ -56,7 +56,9 @@ payload_expires_at = first_received_at + 7 days
 
 Recovery on day 20 therefore has an already-past deadline. The next purge removes remaining ciphertext immediately. Recovery never grants a fresh seven days.
 
-State mutation is centralized in `updateDelivery`: callers do not compute expiry.
+`dead_letter` → `processing` through `claimDeliveryForProcessing` is the normal recovery path and immediately restores standard retention.
+
+State mutation is centralized in `updateDelivery` and `claimDeliveryForProcessing`: callers do not compute expiry.
 
 ## Routed and unrouted tombstones
 

@@ -1162,6 +1162,7 @@ export class InMemoryM1Store implements M1Store {
     delivery.state = "processing";
     delivery.processingAttempts += 1;
     delivery.leaseExpiresAt = new Date(now.getTime() + WEBHOOK_PROCESSING_LEASE_MS);
+    delivery.payloadExpiresAt = standardPayloadExpiry(delivery.firstReceivedAt);
     return { ...delivery };
   }
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {

@@ -804,10 +804,11 @@ export class PostgresM1Store implements M1Store {
 
   async claimDeliveryForProcessing(id: string, tenantId?: string, now = new Date()): Promise<DeliveryRecord | undefined> {
     const leaseExpiresAt = new Date(now.getTime() + WEBHOOK_PROCESSING_LEASE_MS);
-    const sql = "update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1,lease_expires_at=$2 where id=$1 and state not in ('processed','ignored') returning *";
-    const run = async (client: PoolClient) => deliveryFromRow((await client.query<Row>(sql, [id, leaseExpiresAt])).rows[0]);
+    const sql = "update webhook_deliveries set state='processing',processing_attempts=processing_attempts+1,lease_expires_at=$2,payload_expires_at=first_received_at + ($3 * interval '1 millisecond') where id=$1 and state not in ('processed','ignored') returning *";
+    const values = [id, leaseExpiresAt, RAW_WEBHOOK_STANDARD_RETENTION_MS];
+    const run = async (client: PoolClient) => deliveryFromRow((await client.query<Row>(sql, values)).rows[0]);
     if (tenantId) return this.tenantQuery(tenantId, run);
-    const result = await this.pool.query<Row>(sql, [id, leaseExpiresAt]);
+    const result = await this.pool.query<Row>(sql, values);
     return deliveryFromRow(result.rows[0]);
   }
 

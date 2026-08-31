@@ -4,6 +4,7 @@ import {
   RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS,
   RAW_WEBHOOK_PURGE_BATCH_SIZE,
   RAW_WEBHOOK_STANDARD_RETENTION_MS,
+  WEBHOOK_PROCESSING_LEASE_MS,
   deadLetterPayloadHardCap,
   standardPayloadExpiry,
 } from "./store.js";
@@ -86,6 +87,39 @@ describe("M6.1 InMemory raw webhook payload retention", () => {
     expect((await store.getDelivery(recovered.record.id))?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
     expect((await store.purgeExpiredWebhookPayloads({ now: at(20 * 24 * 60 * 60 * 1000) })).routedPurged).toBe(1);
     expect((await store.getDelivery(recovered.record.id))?.payloadCiphertext).toBeUndefined();
+  });
+
+  it("shortens a dead-letter claim to first receipt + 7 days without changing lease semantics", async () => {
+    const store = new InMemoryM1Store();
+    const first = await routed(store, { guid: "00000000-0000-4000-8000-000000000103" });
+    await store.updateDelivery(first.record.id, { state: "dead_letter" }, "tenant-a");
+    expect((await store.getDelivery(first.record.id))?.payloadExpiresAt).toEqual(deadLetterPayloadHardCap(t0));
+
+    const claimTime = at(20 * 24 * 60 * 60 * 1000);
+    const claimed = await store.claimDeliveryForProcessing(first.record.id, "tenant-a", claimTime);
+    expect(claimed?.state).toBe("processing");
+    expect(claimed?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
+    expect(claimed?.processingAttempts).toBe(1);
+    expect(claimed?.leaseExpiresAt).toEqual(new Date(claimTime.getTime() + WEBHOOK_PROCESSING_LEASE_MS));
+    expect(claimed?.payloadCiphertext).toBe(PRIVATE);
+  });
+
+  it("keeps failed retries on first-receipt retention and never rehydrates a purged dead-letter claim", async () => {
+    const store = new InMemoryM1Store();
+    const failed = await routed(store, { guid: "00000000-0000-4000-8000-000000000104" });
+    await store.updateDelivery(failed.record.id, { state: "failed" }, "tenant-a");
+    const failedClaim = await store.claimDeliveryForProcessing(failed.record.id, "tenant-a", at(5 * 24 * 60 * 60 * 1000));
+    expect(failedClaim?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
+
+    const purged = await routed(store, { guid: "00000000-0000-4000-8000-000000000105" });
+    await store.updateDelivery(purged.record.id, { state: "dead_letter" }, "tenant-a");
+    await store.purgeExpiredWebhookPayloads({ now: at(RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS) });
+    expect((await store.getDelivery(purged.record.id))?.payloadCiphertext).toBeUndefined();
+
+    const recovered = await store.claimDeliveryForProcessing(purged.record.id, "tenant-a", at(RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS + 60_000));
+    expect(recovered?.state).toBe("processing");
+    expect(recovered?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
+    expect(recovered?.payloadCiphertext).toBeUndefined();
   });
 
   it("keeps unrouted tombstones and does not rehydrate them", async () => {

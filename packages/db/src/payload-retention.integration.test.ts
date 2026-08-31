@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { createPool } from "./client.js";
 import { PostgresM1Store } from "./postgres-store.js";
-import { RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS, RAW_WEBHOOK_STANDARD_RETENTION_MS, deadLetterPayloadHardCap, standardPayloadExpiry } from "./store.js";
+import { RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS, RAW_WEBHOOK_STANDARD_RETENTION_MS, WEBHOOK_PROCESSING_LEASE_MS, deadLetterPayloadHardCap, standardPayloadExpiry } from "./store.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (process.env.CI && !databaseUrl) throw new Error("TEST_DATABASE_URL is required for M6.1 PostgreSQL payload-retention tests");
@@ -12,6 +12,61 @@ const PRIVATE = "PRIVATE_REPOSITORY_NAME PRIVATE_COMMIT_MESSAGE PRIVATE_PR_TITLE
 const t0 = new Date("2099-01-01T10:00:00Z");
 
 describeIntegration("M6.1 PostgreSQL raw webhook payload retention", () => {
+  it("restores standard retention on the real dead-letter claim path and immediately purges a Day 20 recovery", async () => {
+    const tenantId = randomUUID();
+    const userId = randomUUID();
+    const githubUserId = 940_000 + Number.parseInt(tenantId.replaceAll("-", "").slice(0, 6), 16);
+    const pool = createPool(databaseUrl as string, 2);
+    const admin = createPool(databaseUrl as string, 2);
+    const store = new PostgresM1Store(pool);
+    try {
+      await store.upsertUser({ userId, tenantId, githubAccountId: githubUserId, login: "retention-owner", displayName: "Retention Owner" });
+
+      const recovered = await store.insertDelivery({ tenantId, guid: randomUUID(), eventName: "push", payloadCiphertext: PRIVATE, payloadExpiresAt: t0, now: t0 });
+      await store.updateDelivery(recovered.record.id, { state: "dead_letter" }, tenantId);
+      expect((await store.getDelivery(recovered.record.id, tenantId))?.payloadExpiresAt).toEqual(deadLetterPayloadHardCap(t0));
+
+      const claimTime = new Date(t0.getTime() + 20 * 24 * 60 * 60 * 1000);
+      const claimed = await store.claimDeliveryForProcessing(recovered.record.id, tenantId, claimTime);
+      const expectedLease = new Date(claimTime.getTime() + WEBHOOK_PROCESSING_LEASE_MS);
+      expect(claimed?.state).toBe("processing");
+      expect(claimed?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
+      expect(claimed?.processingAttempts).toBe(1);
+      expect(claimed?.leaseExpiresAt).toEqual(expectedLease);
+      expect(claimed?.payloadCiphertext).toBe(PRIVATE);
+
+      expect(await store.purgeExpiredWebhookPayloads({ now: claimTime })).toMatchObject({ routedPurged: 1 });
+      const afterPurge = await store.getDelivery(recovered.record.id, tenantId);
+      expect(afterPurge?.payloadCiphertext).toBeUndefined();
+      expect(afterPurge?.state).toBe("processing");
+      expect(afterPurge?.leaseExpiresAt).toEqual(expectedLease);
+      expect(afterPurge?.processingAttempts).toBe(1);
+
+      const failed = await store.insertDelivery({ tenantId, guid: randomUUID(), eventName: "push", payloadCiphertext: PRIVATE, payloadExpiresAt: t0, now: t0 });
+      await store.updateDelivery(failed.record.id, { state: "failed" }, tenantId);
+      const failedClaim = await store.claimDeliveryForProcessing(failed.record.id, tenantId, new Date(t0.getTime() + 5 * 24 * 60 * 60 * 1000));
+      expect(failedClaim?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
+
+      const purged = await store.insertDelivery({ tenantId, guid: randomUUID(), eventName: "push", payloadCiphertext: PRIVATE, payloadExpiresAt: t0, now: t0 });
+      await store.updateDelivery(purged.record.id, { state: "dead_letter" }, tenantId);
+      await store.purgeExpiredWebhookPayloads({ now: new Date(t0.getTime() + RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS) });
+      expect((await store.getDelivery(purged.record.id, tenantId))?.payloadCiphertext).toBeUndefined();
+      const purgedClaim = await store.claimDeliveryForProcessing(purged.record.id, tenantId, new Date(t0.getTime() + RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS + 60_000));
+      expect(purgedClaim?.state).toBe("processing");
+      expect(purgedClaim?.payloadExpiresAt).toEqual(standardPayloadExpiry(t0));
+      expect(purgedClaim?.payloadCiphertext).toBeUndefined();
+    } finally {
+      await admin.query("delete from webhook_deliveries where tenant_id=$1", [tenantId]);
+      await admin.query("delete from github_identities where user_id=$1", [userId]);
+      await admin.query("delete from tenant_members where tenant_id=$1", [tenantId]);
+      await admin.query("delete from users where id=$1", [userId]);
+      await admin.query("delete from github_accounts where github_account_id=$1", [githubUserId]);
+      await admin.query("delete from tenants where id=$1", [tenantId]);
+      await pool.end();
+      await admin.end();
+    }
+  });
+
   it("enforces first-receipt deadlines, tombstones, normalized-fact survival, and bounded concurrent purge", async () => {
     const tenantId = randomUUID();
     const userId = randomUUID();
