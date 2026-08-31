@@ -1,4 +1,4 @@
-name: M4 CI
+name: DevMemoir CI
 
 on:
   push:
@@ -40,6 +40,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Public repository current-tree check
+        run: pnpm audit:public
       - name: Assert PostgreSQL integration configuration
         run: test -n "$TEST_DATABASE_URL"
       - name: Apply empty/upgrade-safe migrations
