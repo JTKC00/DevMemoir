@@ -10,6 +10,7 @@
     "dev": "pnpm --parallel --filter @devmemoir/web --filter @devmemoir/api --filter @devmemoir/worker dev",
     "lint": "pnpm -r --if-present lint",
     "test": "pnpm build && pnpm -r --if-present test",
+    "audit:public": "node scripts/public-readiness-check.mjs --self-test && node scripts/public-readiness-check.mjs",
     "test:watch": "pnpm -r --if-present test:watch",
     "typecheck": "pnpm build && pnpm -r --if-present typecheck",
     "db:generate": "pnpm --filter @devmemoir/db db:generate",
