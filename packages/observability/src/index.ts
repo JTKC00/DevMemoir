@@ -27,6 +27,8 @@ export const ALLOWED_LOG_KEYS = new Set([
   "maintenance_count",
   "blocked_count",
   "count",
+  "routed_count",
+  "unrouted_count",
 ]);
 
 export type SafeLogValue = string | number | boolean | null;

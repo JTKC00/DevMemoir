@@ -54,6 +54,8 @@ describeIntegration("M2 PostgreSQL RLS", () => {
     await admin.query(await readFile(resolve(migrationsDir, "0006_m5_delivery_repair.sql"), "utf8"));
     await admin.query(await readFile(resolve(migrationsDir, "0007_m5_delivery_repair_requesting.sql"), "utf8"));
     await admin.query(await readFile(resolve(migrationsDir, "0008_m5_maintenance_windows.sql"), "utf8"));
+    await admin.query(await readFile(resolve(migrationsDir, "0009_m5_worker_health.sql"), "utf8"));
+    await admin.query(await readFile(resolve(migrationsDir, "0010_m6_payload_retention.sql"), "utf8"));
     for (const [capability, roleName] of Object.entries(runtimeRoleNames)) {
       const capabilityRole = capability === "api" ? "devmemoir_api" : capability === "worker" ? "devmemoir_worker" : "devmemoir_web";
       await admin.query(`create role "${roleName}" login password '${rolePassword}'`);

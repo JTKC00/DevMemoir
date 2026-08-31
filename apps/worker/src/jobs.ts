@@ -10,6 +10,7 @@ import { ensureInstallationApiAvailable, guardInstallationGithub } from "./durab
 import { processRepositoryReconciliation } from "./reconciliation.js";
 import { enqueueGithubDeliveryAudit, processGithubDeliveryAudit } from "./delivery-audit.js";
 import { processMaintenanceTick } from "./maintenance.js";
+import { processPrivacyPayloadPurge } from "./privacy-payload-purge.js";
 
 export type QueueDependencies = {
   store: M1Store;
@@ -197,6 +198,10 @@ export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): 
   }
   if (kind.kind === "maintenance_active" || kind.kind === "maintenance_authorized" || kind.kind === "maintenance_audit") {
     await processMaintenanceTick(kind.payload as SyncJobPayload, deps, kind.id);
+    return;
+  }
+  if (kind.kind === "privacy_payload_purge") {
+    await processPrivacyPayloadPurge(deps);
     return;
   }
   await processBackfill(kind.payload as SyncJobPayload, deps);

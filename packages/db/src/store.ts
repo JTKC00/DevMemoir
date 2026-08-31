@@ -117,6 +117,27 @@ export const WORKER_HEARTBEAT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const OPERATIONAL_STUCK_WORK_MS = 30 * 60 * 1000;
 export const WEBHOOK_PROCESSING_LEASE_MS = 5 * 60 * 1000;
 export const DELIVERY_REPAIR_LARGE_BACKLOG_THRESHOLD = 25;
+export const RAW_WEBHOOK_STANDARD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const RAW_WEBHOOK_PURGE_BATCH_SIZE = 500;
+
+export function standardPayloadExpiry(firstReceivedAt: Date): Date {
+  return new Date(firstReceivedAt.getTime() + RAW_WEBHOOK_STANDARD_RETENTION_MS);
+}
+
+export function deadLetterPayloadHardCap(firstReceivedAt: Date): Date {
+  return new Date(firstReceivedAt.getTime() + RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS);
+}
+
+export function payloadExpiryForDeliveryState(state: DeliveryState, firstReceivedAt: Date): Date {
+  return state === "dead_letter" ? deadLetterPayloadHardCap(firstReceivedAt) : standardPayloadExpiry(firstReceivedAt);
+}
+
+export type WebhookPayloadPurgeResult = {
+  routedPurged: number;
+  unroutedPurged: number;
+  remainingDue: boolean;
+};
 
 export type WorkerHeartbeat = {
   workerInstanceId: string;
@@ -246,6 +267,7 @@ export type DeliveryRecord = {
   errorCode?: string;
   processedAt?: Date;
   payloadExpiresAt: Date;
+  payloadKeyVersion?: string | null;
 };
 
 export type ActivityRecord = DevelopmentEvent & {
@@ -272,7 +294,7 @@ export type DeliveryInsertResult = {
 export type UnroutedWebhookRecord = {
   guid: string;
   eventName: string;
-  payloadCiphertext: string;
+  payloadCiphertext?: string;
   receivedAt: Date;
   payloadExpiresAt: Date;
 };
@@ -577,7 +599,9 @@ export interface M1Store {
   updateInstallationLifecycle(githubInstallationId: number, status: InstallationLifecycleStatus, now: Date): Promise<void>;
   insertDelivery(input: Omit<DeliveryRecord, "id" | "state" | "firstReceivedAt" | "lastReceivedAt" | "receiptCount" | "processingAttempts"> & { now: Date }): Promise<DeliveryInsertResult>;
   recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void>;
+  getUnroutedWebhook(guid: string): Promise<UnroutedWebhookRecord | undefined>;
   updateDelivery(id: string, patch: Partial<DeliveryRecord>, tenantId?: string): Promise<void>;
+  purgeExpiredWebhookPayloads(input: { now: Date; limit?: number }): Promise<WebhookPayloadPurgeResult>;
   getDelivery(id: string, tenantId?: string): Promise<DeliveryRecord | undefined>;
   /** Claim one non-terminal delivery without reopening processed/ignored work. */
   claimDeliveryForProcessing(id: string, tenantId?: string, now?: Date): Promise<DeliveryRecord | undefined>;
@@ -1077,18 +1101,55 @@ export class InMemoryM1Store implements M1Store {
       lastReceivedAt: input.now,
       receiptCount: 1,
       processingAttempts: 0,
+      payloadExpiresAt: standardPayloadExpiry(input.now),
     };
     this.deliveries.set(record.guid, record);
     return { record: { ...record }, created: true, action: "ensure_job" };
   }
 
-  async recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void> { if (!this.unroutedWebhooks.has(record.guid)) this.unroutedWebhooks.set(record.guid, { ...record }); }
+  async recordUnroutedWebhook(record: UnroutedWebhookRecord): Promise<void> {
+    if (this.unroutedWebhooks.has(record.guid)) return;
+    this.unroutedWebhooks.set(record.guid, { ...record, payloadExpiresAt: standardPayloadExpiry(record.receivedAt) });
+  }
+
+  async getUnroutedWebhook(guid: string): Promise<UnroutedWebhookRecord | undefined> {
+    const record = this.unroutedWebhooks.get(guid);
+    return record ? { ...record } : undefined;
+  }
 
   async updateDelivery(id: string, patch: Partial<DeliveryRecord>, _tenantId?: string): Promise<void> {
     const delivery = [...this.deliveries.values()].find((value) => value.id === id);
     if (!delivery) throw new Error("Delivery not found");
-    Object.assign(delivery, patch);
+    const safePatch = { ...patch };
+    delete safePatch.payloadCiphertext;
+    delete safePatch.payloadExpiresAt;
+    delete safePatch.payloadKeyVersion;
+    Object.assign(delivery, safePatch);
+    if (patch.state !== undefined) delivery.payloadExpiresAt = payloadExpiryForDeliveryState(patch.state, delivery.firstReceivedAt);
     if (patch.state !== undefined && patch.state !== "processing") delivery.leaseExpiresAt = null;
+  }
+
+  async purgeExpiredWebhookPayloads(input: { now: Date; limit?: number }): Promise<WebhookPayloadPurgeResult> {
+    const limit = input.limit ?? RAW_WEBHOOK_PURGE_BATCH_SIZE;
+    const routedDue = [...this.deliveries.values()]
+      .filter((row) => row.payloadCiphertext && row.payloadExpiresAt <= input.now)
+      .sort((left, right) => left.payloadExpiresAt.getTime() - right.payloadExpiresAt.getTime() || left.id.localeCompare(right.id));
+    const unroutedDue = [...this.unroutedWebhooks.values()]
+      .filter((row) => row.payloadCiphertext && row.payloadExpiresAt <= input.now)
+      .sort((left, right) => left.payloadExpiresAt.getTime() - right.payloadExpiresAt.getTime() || left.guid.localeCompare(right.guid));
+    let routedPurged = 0;
+    for (const row of routedDue.slice(0, limit)) {
+      delete row.payloadCiphertext;
+      delete row.payloadKeyVersion;
+      routedPurged += 1;
+    }
+    let unroutedPurged = 0;
+    for (const row of unroutedDue.slice(0, limit)) {
+      delete row.payloadCiphertext;
+      unroutedPurged += 1;
+    }
+    const remainingDue = routedDue.length > routedPurged || unroutedDue.length > unroutedPurged;
+    return { routedPurged, unroutedPurged, remainingDue };
   }
   async getDelivery(id: string, _tenantId?: string): Promise<DeliveryRecord | undefined> { return [...this.deliveries.values()].find((value) => value.id === id); }
   async getDeliveryByGuid(guid: string, tenantId: string): Promise<DeliveryRecord | undefined> {
@@ -1101,6 +1162,7 @@ export class InMemoryM1Store implements M1Store {
     delivery.state = "processing";
     delivery.processingAttempts += 1;
     delivery.leaseExpiresAt = new Date(now.getTime() + WEBHOOK_PROCESSING_LEASE_MS);
+    delivery.payloadExpiresAt = standardPayloadExpiry(delivery.firstReceivedAt);
     return { ...delivery };
   }
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {

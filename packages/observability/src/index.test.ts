@@ -40,6 +40,22 @@ describe("allowlist logger", () => {
     expect(capture.text()).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_TOKEN/);
   });
 
+  it("emits payload purge counts and drops private fields", () => {
+    const capture = createCanarySink();
+    const logger = createLogger(capture.sink);
+    logger.info({
+      event_type: "payload_retention_purge",
+      result: "completed",
+      routed_count: 3,
+      unrouted_count: 1,
+      repository_name: "PRIVATE_REPOSITORY_NAME",
+      token: "PRIVATE_TOKEN",
+    });
+    expect(capture.text()).toContain("\"routed_count\":3");
+    expect(capture.text()).toContain("\"unrouted_count\":1");
+    expect(capture.text()).not.toMatch(/PRIVATE_REPOSITORY_NAME|PRIVATE_TOKEN/);
+  });
+
   it("emits opaque operational warning counts and drops private fields", () => {
     const capture = createCanarySink();
     const logger = createLogger(capture.sink);

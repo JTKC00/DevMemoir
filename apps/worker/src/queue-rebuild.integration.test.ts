@@ -299,7 +299,7 @@ describeIntegration("M5.5 pg-boss wipe, rebuild, and resume", () => {
     expect(result.deliveryAudit.enqueued).toBe(1);
     expect(result.deliveryRepairs.enqueued).toBe(1);
     expect(result.maintenance.ownershipRecovered).toBe(1);
-    expect(result.schedules.registered).toBe(3);
+    expect(result.schedules.registered).toBe(4);
     expect((await scope.store.getCurrentRepositoryReconciliationGeneration(scope.tenantId, scope.repositoryId))).toMatchObject({ reconciliationRunId: seeded.runId, generation: 4 });
     expect((await scope.store.getGithubDeliveryAudit(scope.githubAppId))).toMatchObject({ currentRunId: seeded.auditRunId, generation: 6, pageNumber: 4, listCursor: "cursor-x" });
     expect((await scope.store.getGithubDeliveryRepair(seeded.guid))?.attemptCount).toBe(seeded.attemptCount);

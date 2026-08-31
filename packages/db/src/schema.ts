@@ -363,7 +363,7 @@ export const unroutedWebhookDeliveries = pgTable("unrouted_webhook_deliveries", 
   id: id(),
   githubDeliveryGuid: varchar("github_delivery_guid", { length: 128 }).notNull(),
   eventName: varchar("event_name", { length: 80 }).notNull(),
-  payloadCiphertext: text("payload_ciphertext").notNull(),
+  payloadCiphertext: text("payload_ciphertext"),
   receivedAt: time("received_at"),
   payloadExpiresAt: time("payload_expires_at"),
 }, (table) => [uniqueIndex("unrouted_webhook_deliveries_guid_unique").on(table.githubDeliveryGuid)]);
