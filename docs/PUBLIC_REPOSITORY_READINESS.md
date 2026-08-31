@@ -1,15 +1,15 @@
 # Public Repository Readiness
 
 Audit date: 2026-08-31
-Audited commit SHA: `97c50d5dd7b9a7131268518c416ad1045dec19f1` (`main`)
+Audited commit SHA: `7d6efc5ceb3000c4bbb417b2494bb209c13df678` (`main`, PR #11 merge commit)
 Source-scan target SHA: `e2f11d6fa0b45eed513fe34dc1869a8bc514a60c`
-Source tree relation: `main` and the source-scan target have the same tree SHA (`31e3125a9e7256e9de66b782db764940272e7b04`).
+Source tree relation: the source-scan target has tree SHA `31e3125a9e7256e9de66b782db764940272e7b04`, matching the pre-merge `main` parent `97c50d5dd7b9a7131268518c416ad1045dec19f1`; the merged `main` tree is now `1dbc3dca6f5b1acdfac04dc5a9a11efda1a3431b`. The source scan is retained as historical supplemental evidence and is not treated as a complete scan of the merged PR #11 tree.
 
-The local checkout could not update `.git/index` to switch branches because of the managed workspace permission boundary. The source tree was verified identical to the merged `main` tree before this working-tree audit. Repository visibility was not changed and no merge was performed.
+This follow-up correction was created from the post-merge PR #11 `main` baseline. Repository visibility was not changed and no merge was performed by this correction.
 
 ## Current tree
 
-PASS — 157 public-tree files (tracked files plus non-ignored working-tree files) were checked along with configuration examples, workflow source, and privacy patterns. `.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible check is `pnpm audit:public`.
+PASS — PR #11 GitHub Actions CI reported `156 public-tree files scanned` from the committed tree. `git ls-files` and `git ls-tree -r` both report 156 files for merged `main`. The earlier local audit reported 157; it is a separate local filesystem snapshot, not the CI count. In the current local workspace, the additional path is the ignored generated file `apps/web/tsconfig.tsbuildinfo` (confirmed by `git check-ignore` and `git clean -ndX`), which the checker’s filesystem walk includes. This is the verifiable explanation for the local/CI difference without treating the historical local snapshot as identical to CI. `.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible check is `pnpm audit:public`.
 
 ## Full Git history secret scan
 
@@ -43,6 +43,8 @@ The history contains one non-noreply personal address in addition to a GitHub no
 
 `workflow_source: PASS` — the workflow has explicit `permissions: contents: read`, uses only local PostgreSQL test credentials, does not echo secret values, and contains no shell tracing or environment-dump command around secret-bearing operations.
 
+`current_ci: PASS` — the PR #11 GitHub Actions run used its PostgreSQL service container and completed the repository verification successfully, including `pnpm audit:public` (156 public-tree files scanned), PostgreSQL integration tests, projection/RLS tests, pg-boss restart integration tests, typecheck, lint, unit/regression tests, and build. This current CI result is stronger readiness evidence than the historical local integration skip recorded below.
+
 `historical_logs: BLOCKED`
 `historical_artifacts: BLOCKED`
 
@@ -62,12 +64,20 @@ PENDING OWNER DECISION — no `LICENSE` file was added. Options are recorded in 
 
 ## Verification
 
-- `pnpm audit:public`: PASS, including deterministic self-tests and current-tree scan.
+Historical local verification record:
+
+- `pnpm audit:public`: PASS, including deterministic self-tests and a 157-file local filesystem snapshot; see the Current tree note above for why this is distinct from the 156-file CI snapshot.
 - `pnpm typecheck`: PASS, including workspace build and all package typechecks.
 - `pnpm lint`: PASS.
 - `pnpm test`: PASS; unit/regression suites passed. PostgreSQL, RLS, and pg-boss integration suites were conditionally skipped because Docker/Podman and local PostgreSQL were unavailable.
 - `pnpm build`: PASS as exercised by `pnpm typecheck` and `pnpm test`.
 - `git diff --check`: PASS; only expected line-ending normalization warnings were emitted.
+
+Formal merged-PR CI verification:
+
+- PR #11 GitHub Actions used a PostgreSQL service container and passed the PostgreSQL integration tests, projection/RLS tests, and pg-boss restart integration tests.
+- The same CI passed typecheck, lint, unit/regression tests, build, and `pnpm audit:public` with `156 public-tree files scanned`.
+- The successful CI result is the stronger readiness evidence for these checks; the local integration skip is historical context, not the final verification state.
 
 ## Publication blockers
 
