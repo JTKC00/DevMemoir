@@ -74,4 +74,4 @@ Please read [`SECURITY.md`](./SECURITY.md). Do not report vulnerabilities or inc
 
 ## License
 
-No open-source license has been selected yet. Public visibility and copyright permission are separate decisions; see [`docs/PUBLICATION_LICENSE_DECISION.md`](./docs/PUBLICATION_LICENSE_DECISION.md).
+This repository is source-visible. No open-source license is granted. All rights reserved; see [`docs/PUBLICATION_LICENSE_DECISION.md`](./docs/PUBLICATION_LICENSE_DECISION.md).

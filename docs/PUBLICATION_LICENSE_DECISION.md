@@ -1,20 +1,26 @@
 # Publication License Decision
 
-Public repository visibility and copyright permission are separate decisions. No `LICENSE` file is present, and this document records the choices without selecting one for the owner.
+Public repository visibility and copyright permission are separate decisions. This document records the repository owner's explicit publication decision for DevMemoir. No `LICENSE`, `LICENSE.md`, or `COPYING` file is present or will be added as part of this decision.
 
-## Option A — Source-visible / all rights reserved
+## Owner decision: Source-visible / All Rights Reserved
 
-The repository is public for portfolio and transparency purposes. No open-source license is granted.
+The owner has selected the following publication model:
 
-Implications:
+- Publication model: **Source-visible**
+- Copyright posture: **All Rights Reserved**
+- Open-source license: **None**
 
-- people can view and fork through GitHub platform mechanics;
-- copyright permissions are not broadly granted for reuse, redistribution, or derivative works;
-- contributors and users should not infer permission from public visibility alone.
+DevMemoir may be made publicly visible for portfolio, transparency, engineering demonstration, and review purposes. Public visibility means that the source may be viewed by the public; it does not grant permission to copy, modify, redistribute, or create derivative works. GitHub platform mechanics such as viewing or forking do not change this copyright posture.
 
-## Option B — Open source
+No open-source license is granted at publication time. All rights remain reserved unless the owner later grants additional permissions in writing or adopts an explicit license. This decision can be revisited in a future dedicated licensing change.
 
-Choose and add a license file only after the owner makes an explicit decision.
+## Background retained for future licensing review
+
+The following background on open-source options is retained for reference only. It does not represent the current owner decision.
+
+### Open-source option (not selected)
+
+Choose and add a license file only after the owner makes a separate, explicit licensing decision.
 
 ### MIT
 
@@ -24,4 +30,4 @@ MIT is short, simple, and permissive. It is easy for downstream users to underst
 
 Apache-2.0 is more detailed and includes an express patent license and patent-termination protections, along with additional notice and attribution requirements. It can be preferable when patent protection matters, at the cost of a longer and more operationally specific license.
 
-The owner should record the selected option in a follow-up change. Until then, the README accurately states that no open-source license has been selected.
+MIT, Apache-2.0, GPL, and other OSS licenses are not selected at publication time. A future dedicated licensing change would be required before any open-source license is granted.
