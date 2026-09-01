@@ -11,7 +11,13 @@ Gitleaks publication-gate follow-up: 2026-08-31, from `main` `dfab175ddf86fd2dbd
 
 ## Current tree
 
-PASS — PR #11 GitHub Actions CI reported `156 public-tree files scanned` from the committed tree. `git ls-files` and `git ls-tree -r` both report 156 files for merged `main`. The earlier local audit reported 157; it is a separate local filesystem snapshot, not the CI count. In the current local workspace, the additional path is the ignored generated file `apps/web/tsconfig.tsbuildinfo` (confirmed by `git check-ignore` and `git clean -ndX`), which the checker’s filesystem walk includes. This is the verifiable explanation for the local/CI difference without treating the historical local snapshot as identical to CI. `.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible check is `pnpm audit:public`.
+PASS — the evidence contains three distinct tree snapshots:
+
+- Historical PR #11 GitHub Actions CI: `156 public-tree files scanned` from the committed tree. `git ls-files` and `git ls-tree -r` reported 156 files for merged `main` at that time.
+- Historical local snapshot around PR #11 / #12: the local checker reported 157 files because its filesystem walk included the ignored generated path `apps/web/tsconfig.tsbuildinfo` (confirmed by `git check-ignore` and `git clean -ndX`). This was not a committed-tree count.
+- Current PR #13 GitHub Actions Run #48: `157 public-tree files scanned` from the committed/public tree after PR #13 added the tracked file `.gitleaksignore`. This committed 157 is separate evidence from the earlier local 157, which had a different cause.
+
+`.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible current-tree check remains `pnpm audit:public`.
 
 ## Full Git history secret scan
 
