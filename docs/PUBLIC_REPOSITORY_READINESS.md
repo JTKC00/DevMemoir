@@ -7,25 +7,66 @@ Source tree relation: the source-scan target has tree SHA `31e3125a9e7256e9de66b
 
 This follow-up correction was created from the post-merge PR #11 `main` baseline. Repository visibility was not changed and no merge was performed by this correction.
 
+Gitleaks publication-gate follow-up: 2026-08-31, from `main` `dfab175ddf86fd2dbdfeb5d57286d930dfb35595` (PR #12 merge). The Full Git history section below records the later Gitleaks v8.30.1 scan and supersedes the earlier BLOCKED scanner status. Repository visibility was not changed by this follow-up.
+
 ## Current tree
 
-PASS — PR #11 GitHub Actions CI reported `156 public-tree files scanned` from the committed tree. `git ls-files` and `git ls-tree -r` both report 156 files for merged `main`. The earlier local audit reported 157; it is a separate local filesystem snapshot, not the CI count. In the current local workspace, the additional path is the ignored generated file `apps/web/tsconfig.tsbuildinfo` (confirmed by `git check-ignore` and `git clean -ndX`), which the checker’s filesystem walk includes. This is the verifiable explanation for the local/CI difference without treating the historical local snapshot as identical to CI. `.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible check is `pnpm audit:public`.
+PASS — the evidence contains three distinct tree snapshots:
+
+- Historical PR #11 GitHub Actions CI: `156 public-tree files scanned` from the committed tree. `git ls-files` and `git ls-tree -r` reported 156 files for merged `main` at that time.
+- Historical local snapshot around PR #11 / #12: the local checker reported 157 files because its filesystem walk included the ignored generated path `apps/web/tsconfig.tsbuildinfo` (confirmed by `git check-ignore` and `git clean -ndX`). This was not a committed-tree count.
+- Current PR #13 GitHub Actions Run #48: `157 public-tree files scanned` from the committed/public tree after PR #13 added the tracked file `.gitleaksignore`. This committed 157 is separate evidence from the earlier local 157, which had a different cause.
+
+`.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible current-tree check remains `pnpm audit:public`.
 
 ## Full Git history secret scan
 
-BLOCKED — scanner/version: no approved mature scanner was available. `gitleaks`, TruffleHog, detect-secrets, git-secrets, and equivalent local executables were unavailable. No scanner was installed and no network download was attempted.
+PASS — Gitleaks v8.30.1 full-history publication scan completed 2026-08-31. This is not a “never had a finding” result: one `generic-api-key` candidate was reported, human-adjudicated as a synthetic test fixture, and then ignored by exact fingerprint. The gate is clean after that disposition.
 
-Supplemental sanitized audit: `git rev-list --all --objects` covered 51 commits and 948 reachable objects, with textual pattern checks over every commit tree. A local `git fsck --full --no-reflogs --unreachable` check also found one 20-byte unreachable blob; it contained none of the audited secret/privacy patterns. The supplemental checks found:
+Scanner: official Gitleaks v8.30.1 `darwin_arm64` release binary (checksum-verified from GitHub Releases). Command coverage matched the prior merge-aware audit and was not reduced:
 
-- private-key markers: none;
-- GitHub token-shaped values: none; matches were test canary prefixes or regular-expression examples;
-- database URLs: localhost, `unused`, placeholders, or documentation/test examples only;
-- bearer/authorization values: no token-shaped value;
-- cloud credential patterns: none.
+```text
+gitleaks git . --log-opts="--all --reflog --full-history -m" --redact --report-format=json --report-path=<repo-external temp path>
+```
 
-No real secret was found by the available checks. The release/publication operator must still run and retain the output of an approved mature full-history scanner before changing visibility.
+Scan inventory:
 
-The completed Codex Security standard source scan for the committed baseline reported zero reportable findings. Its canonical artifacts and generated report are retained by the security workbench; this result covers the original committed snapshot, while the publication documents and current-tree checker were audited separately in the working tree.
+- all refs, reflog, full history, merge-aware (`-m`)
+- 17 merge commits throughout
+- pre-disposition scan on `main` `dfab175`: Gitleaks reported `55 commits scanned`; `git rev-list --all` was 55
+- the earlier audit counted 22 refs; this clone also has local Codex checkpoint refs and the working branch, so `git for-each-ref` is higher
+- final rerun after the exact-fingerprint ignore commit: Gitleaks reported `56 commits scanned`; `git rev-list --all` was 56
+
+Original result before disposition:
+
+- Gitleaks exit code `1`
+- 1 unreviewed finding
+- Rule: `generic-api-key`
+- File: `apps/api/src/webhook.test.ts`
+- Commit: `07351c1a4029b6f18d6d934edbc6da89888185d5` (`feat: implement DevMemoir milestone 1`)
+- Exact Fingerprint: `07351c1a4029b6f18d6d934edbc6da89888185d5:apps/api/src/webhook.test.ts:generic-api-key:9`
+
+Human adjudication of that finding:
+
+- GitHub webhook HMAC synthetic test fixture used only by unit tests
+- Not a production credential
+- No rotation or revocation required
+- 0 confirmed real secrets
+
+Disposition:
+
+- `.gitleaksignore` contains only that exact fingerprint
+- No path-wide ignore, no whole-file ignore, no `generic-api-key` rule disable, and no extra regex allowlist
+- Production webhook verification logic was not changed
+- Raw JSON reports were written outside the repository and deleted after verification; matched secret text is not recorded here
+
+Final result after fingerprint disposition and rerun of the same coverage:
+
+- Gitleaks exit code `0`
+- 0 unreviewed findings
+- 0 confirmed real secrets
+
+Historical original-audit note (before a mature scanner was available on this machine): `gitleaks` and equivalent local executables were initially unavailable, so the first publication document recorded BLOCKED. Supplemental sanitized checks (`git rev-list --all --objects` over 51 commits / 948 reachable objects at that time, plus `git fsck --full --no-reflogs --unreachable`) found no private-key markers, no GitHub token-shaped values except test canaries / regex examples, only localhost/`unused`/placeholder database URLs, no token-shaped bearer values, and no cloud credential patterns. Those checks remain historical supplemental evidence. The Codex Security standard source scan for the earlier committed snapshot also reported zero reportable findings; its artifacts stay in the security workbench and do not replace this Gitleaks result.
 
 ## Private data scan
 
@@ -81,7 +122,6 @@ Formal merged-PR CI verification:
 
 ## Publication blockers
 
-- Run an approved mature full-history secret scanner and retain a clean result.
 - Complete the owner decision for historical personal-email exposure.
 - Complete the owner decision for source-visible/all-rights-reserved versus an open-source license.
 - Review historical GitHub Actions logs/artifacts and PR/issue discussion through an authenticated operator account; delete stale sensitive artifacts if any are found.
@@ -90,4 +130,4 @@ Formal merged-PR CI verification:
 
 CONDITIONAL
 
-It is not safe to change the repository to Public yet. The available source/history checks found no known secret or private-data leak, but the mature full-history scan, historical GitHub review, and owner privacy/license decisions remain outstanding.
+It is not safe to change the repository to Public yet. The mature full-history Gitleaks scan is PASS after one human-adjudicated synthetic test-fixture false positive. Historical GitHub review and owner privacy/license decisions remain outstanding. Repository visibility must not be changed until those remaining blockers are cleared.
