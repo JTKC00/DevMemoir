@@ -4,17 +4,37 @@ This is an operator checklist for the irreversible private-to-public transition.
 
 ## Before public
 
-- [ ] Full-history secret scan is clean with an approved mature scanner.
-- [ ] No real private GitHub content exists in current files or any reachable history.
-- [ ] The historical personal-email decision is made and recorded.
-- [ ] Existing Actions logs and artifacts have been reviewed; stale sensitive artifacts are deleted if necessary.
-- [ ] README is updated for a public audience.
-- [ ] `SECURITY.md` is present and does not publish an unapproved personal email address.
-- [x] The license decision is recorded: the repository is intentionally source-visible/all-rights-reserved without an OSS license.
-- [ ] `.env.example` contains placeholders, empty values, or localhost-only development values.
-- [ ] The default-branch CI is green, including the current-tree public-readiness check.
-- [ ] Existing pull-request bodies/comments and issue history have been checked for secrets or private repository content.
-- [ ] Production deployment identifiers are classified; no credential-bearing URL or private admin endpoint remains.
+- [ ] **Final publication-candidate full-history secret scan** is clean with the approved mature scanner. The previous Gitleaks v8.30.1 baseline is PASS, but the exact ultimate post-merge `main` must be recertified before visibility changes.
+- [x] No real private GitHub content exists in current files or reachable history based on the repository publication audit.
+- [x] The historical personal-email decision is made and recorded: historical exposure is **ACCEPTED BY OWNER**; no history rewrite is required for this reason.
+- [x] Existing authenticated GitHub Actions surfaces were reviewed to publication-gate scope: PR-triggered runs/logs, complete push-to-main run inventory, all failed push-run logs, and currently visible audited artifacts. No sensitive artifact required deletion.
+- [x] README is updated for a public audience.
+- [x] `SECURITY.md` is present and does not publish an unapproved personal email address.
+- [x] The license decision is recorded: the repository is intentionally source-visible / All Rights Reserved without an OSS license.
+- [x] `.env.example` contains placeholders, empty values, or localhost-only development values; no tracked real `.env` or private-key file was identified.
+- [x] The latest merged default-branch CI baseline is green, including the current-tree public-readiness check. This final documentation PR must also pass CI, and post-merge `main` must remain green before the final Gitleaks recertification.
+- [x] Existing pull-request bodies/discussion surfaces and issue history were checked for secrets or private repository content; no standalone Issues were found.
+- [x] Production deployment identifiers are classified; no credential-bearing URL or private admin endpoint remains in the publication-audited tree/history.
+- [x] Releases and release assets were reviewed: 0 Releases and 0 release assets at the final hosted-surface audit.
+
+### Historical hosted-surface coverage note
+
+The authenticated final audit found 25 `push` → `main` Actions runs: 21 successful, 4 failed, 0 cancelled, and 0 timed out. All four failed-run logs were fully reviewed because failure diagnostics have the highest accidental-disclosure risk. The successful push runs were completely inventoried but were not each re-read byte-for-byte during the final pass; prior PR-triggered runs using the same workflow, failed-run review, current successful CI, workflow-source review, and retained-artifact checks provide the publication-gate evidence recorded in `PUBLIC_REPOSITORY_READINESS.md`.
+
+GitHub-hosted logs or artifacts that have already expired or been deleted cannot be retroactively inspected. Do not interpret an empty current artifact listing as proof that an artifact never existed; it proves only that no currently visible sensitive artifact required action in the audited surfaces.
+
+## Final private-state gate sequence
+
+Before changing visibility:
+
+1. Merge the final readiness-evidence PR after its CI passes.
+2. Confirm the resulting `main` default-branch CI is green.
+3. Fetch/checkout that exact final `main` without adding another readiness commit.
+4. Rerun the approved Gitleaks v8.30.1 full-history command with the same merge-aware coverage and redacted repo-external report path.
+5. Require Gitleaks exit code `0`, `0 unreviewed findings`, and `0 confirmed real secrets`.
+6. Delete the repo-external raw JSON report after verification.
+7. Do not commit a post-scan “READY” evidence edit; that would create a new unscanned commit. Treat the scanned SHA itself as the publication candidate.
+8. Change repository visibility manually from Private to Public only after all steps above are satisfied.
 
 ## GitHub security settings after public
 
@@ -41,4 +61,4 @@ Contributors can create their own GitHub App for local development. The producti
 
 ## Immediate operator follow-up
 
-After the owner clears every pre-public item, change visibility manually in GitHub, then re-check the public repository page, default-branch Actions visibility, security settings, forks, and published documentation. This repository-publication slice does not perform that visibility change.
+After the final full-history scan clears the last unchecked pre-public item, change visibility manually in GitHub. Then re-check the public repository page, default-branch Actions visibility, GitHub security settings, rulesets/branch protection, forks, and published documentation.
