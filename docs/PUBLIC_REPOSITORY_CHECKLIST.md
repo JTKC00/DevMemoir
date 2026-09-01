@@ -36,18 +36,22 @@ Before changing visibility:
 7. Do not commit a post-scan “READY” evidence edit; that would create a new unscanned commit. Treat the scanned SHA itself as the publication candidate.
 8. Change repository visibility manually from Private to Public only after all steps above are satisfied.
 
-## GitHub security settings after public
+## Post-public GitHub security settings (manual operator checklist)
 
-Enable if available:
+The repository is now Public. These settings are controlled in GitHub's UI/API and are not enabled by this source change. Before this hardening PR, no repository rulesets were observed and `main` branch protection was not enabled.
 
-- [ ] Secret scanning.
-- [ ] Push protection.
-- [ ] Dependabot alerts.
-- [ ] Dependabot security updates.
-- [ ] CodeQL or default code scanning setup.
-- [ ] Private vulnerability reporting.
-- [ ] Branch protection or rulesets for `main`.
-- [ ] Required CI checks before merge.
+- [ ] Secret scanning is enabled.
+- [ ] Push protection is enabled.
+- [ ] Dependabot alerts are enabled.
+- [ ] Dependabot security updates are enabled where supported by GitHub for the repository's package-manager metadata.
+- [ ] CodeQL/code scanning is enabled and has a successful run after this workflow is merged.
+- [ ] Private vulnerability reporting is enabled if available.
+- [ ] A ruleset or branch protection rule is configured for `main`.
+- [ ] The required CI status check includes `DevMemoir CI / verify`.
+- [ ] Force-pushes to `main` are blocked.
+- [ ] Deletion of `main` is blocked.
+
+Dependabot version-update configuration currently covers GitHub Actions and Docker Compose only. The repository uses `pnpm@11.19.0`; GitHub Dependabot does not yet officially support pnpm 11 for package version updates, so the root pnpm workspace is intentionally omitted from `.github/dependabot.yml`. Revisit this when GitHub adds pnpm 11 support. Do not treat the current Dependabot configuration as package-update coverage for the pnpm workspace.
 
 Review workflow permissions after enabling any integration. Keep `contents: read` unless a specific current requirement justifies another permission; do not grant broad write or OIDC permissions by default.
 
