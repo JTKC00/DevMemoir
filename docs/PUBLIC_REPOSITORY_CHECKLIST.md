@@ -51,6 +51,8 @@ The repository is now Public. These settings are controlled in GitHub's UI/API a
 - [ ] Force-pushes to `main` are blocked.
 - [ ] Deletion of `main` is blocked.
 
+Dependabot version-update configuration currently covers GitHub Actions and Docker Compose only. The repository uses `pnpm@11.19.0`; GitHub Dependabot does not yet officially support pnpm 11 for package version updates, so the root pnpm workspace is intentionally omitted from `.github/dependabot.yml`. Revisit this when GitHub adds pnpm 11 support. Do not treat the current Dependabot configuration as package-update coverage for the pnpm workspace.
+
 Review workflow permissions after enabling any integration. Keep `contents: read` unless a specific current requirement justifies another permission; do not grant broad write or OIDC permissions by default.
 
 ## Fork and privacy warning
