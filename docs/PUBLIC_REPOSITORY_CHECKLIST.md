@@ -43,7 +43,7 @@ The repository is now Public. These settings are controlled in GitHub's UI/API a
 - [ ] Secret scanning is enabled.
 - [ ] Push protection is enabled.
 - [ ] Dependabot alerts are enabled.
-- [ ] Dependabot security updates are enabled.
+- [ ] Dependabot security updates are enabled where supported by GitHub for the repository's package-manager metadata.
 - [ ] CodeQL/code scanning is enabled and has a successful run after this workflow is merged.
 - [ ] Private vulnerability reporting is enabled if available.
 - [ ] A ruleset or branch protection rule is configured for `main`.
