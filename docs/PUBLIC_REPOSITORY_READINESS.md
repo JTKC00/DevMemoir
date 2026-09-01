@@ -101,7 +101,7 @@ PASS — `README.md` now uses public-audience structure and accurate M5/M6.1/Gat
 
 ## License
 
-PENDING OWNER DECISION — no `LICENSE` file was added. Options are recorded in [`PUBLICATION_LICENSE_DECISION.md`](./PUBLICATION_LICENSE_DECISION.md), including source-visible/all-rights-reserved, MIT, and Apache-2.0 tradeoffs.
+PASS — Owner decision recorded: **Source-visible / All Rights Reserved**. No open-source license is granted at publication time, and no `LICENSE`, `LICENSE.md`, or `COPYING` file was added. Public visibility does not grant permission to copy, modify, redistribute, or create derivative works. Background tradeoffs for MIT and Apache-2.0 remain in [`PUBLICATION_LICENSE_DECISION.md`](./PUBLICATION_LICENSE_DECISION.md) for future reference.
 
 ## Verification
 
@@ -123,11 +123,10 @@ Formal merged-PR CI verification:
 ## Publication blockers
 
 - Complete the owner decision for historical personal-email exposure.
-- Complete the owner decision for source-visible/all-rights-reserved versus an open-source license.
 - Review historical GitHub Actions logs/artifacts and PR/issue discussion through an authenticated operator account; delete stale sensitive artifacts if any are found.
 
 ## Final status
 
 CONDITIONAL
 
-It is not safe to change the repository to Public yet. The mature full-history Gitleaks scan is PASS after one human-adjudicated synthetic test-fixture false positive. Historical GitHub review and owner privacy/license decisions remain outstanding. Repository visibility must not be changed until those remaining blockers are cleared.
+It is not safe to change the repository to Public yet. The mature full-history Gitleaks scan is PASS after one human-adjudicated synthetic test-fixture false positive. Historical GitHub review and the owner privacy decision remain outstanding. Repository visibility must not be changed until those remaining blockers are cleared.

@@ -10,7 +10,7 @@ This is an operator checklist for the irreversible private-to-public transition.
 - [ ] Existing Actions logs and artifacts have been reviewed; stale sensitive artifacts are deleted if necessary.
 - [ ] README is updated for a public audience.
 - [ ] `SECURITY.md` is present and does not publish an unapproved personal email address.
-- [ ] The license decision is made/recorded, or the repository is intentionally source-visible/all-rights-reserved without an OSS license.
+- [x] The license decision is recorded: the repository is intentionally source-visible/all-rights-reserved without an OSS license.
 - [ ] `.env.example` contains placeholders, empty values, or localhost-only development values.
 - [ ] The default-branch CI is green, including the current-tree public-readiness check.
 - [ ] Existing pull-request bodies/comments and issue history have been checked for secrets or private repository content.
