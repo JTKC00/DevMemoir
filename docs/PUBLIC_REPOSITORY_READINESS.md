@@ -1,41 +1,42 @@
 # Public Repository Readiness
 
 Audit date: 2026-08-31
-Audited commit SHA: `7d6efc5ceb3000c4bbb417b2494bb209c13df678` (`main`, PR #11 merge commit)
-Source-scan target SHA: `e2f11d6fa0b45eed513fe34dc1869a8bc514a60c`
-Source tree relation: the source-scan target has tree SHA `31e3125a9e7256e9de66b782db764940272e7b04`, matching the pre-merge `main` parent `97c50d5dd7b9a7131268518c416ad1045dec19f1`; the merged `main` tree is now `1dbc3dca6f5b1acdfac04dc5a9a11efda1a3431b`. The source scan is retained as historical supplemental evidence and is not treated as a complete scan of the merged PR #11 tree.
+Final pre-public evidence update: 2026-09-01
+Current publication-candidate baseline before this documentation PR: `9332ef3668c02554fc7f2dc67343d0b8a0a257d2` (`main`, PR #14 merge commit)
 
-This follow-up correction was created from the post-merge PR #11 `main` baseline. Repository visibility was not changed and no merge was performed by this correction.
-
-Gitleaks publication-gate follow-up: 2026-08-31, from `main` `dfab175ddf86fd2dbdfeb5d57286d930dfb35595` (PR #12 merge). The Full Git history section below records the later Gitleaks v8.30.1 scan and supersedes the earlier BLOCKED scanner status. Repository visibility was not changed by this follow-up.
+This document records publication-readiness evidence only. Repository visibility is still private and must not be changed by a documentation or security-audit commit.
 
 ## Current tree
 
-PASS — the evidence contains three distinct tree snapshots:
+PASS — the reproducible committed-tree check is `pnpm audit:public`.
 
-- Historical PR #11 GitHub Actions CI: `156 public-tree files scanned` from the committed tree. `git ls-files` and `git ls-tree -r` reported 156 files for merged `main` at that time.
-- Historical local snapshot around PR #11 / #12: the local checker reported 157 files because its filesystem walk included the ignored generated path `apps/web/tsconfig.tsbuildinfo` (confirmed by `git check-ignore` and `git clean -ndX`). This was not a committed-tree count.
-- Current PR #13 GitHub Actions Run #48: `157 public-tree files scanned` from the committed/public tree after PR #13 added the tracked file `.gitleaksignore`. This committed 157 is separate evidence from the earlier local 157, which had a different cause.
+Historical evidence remains useful for explaining count changes:
 
-`.env` and `.env.*` are ignored with `.env.example` explicitly allowed; no `.env` or private-key file is tracked. The reproducible current-tree check remains `pnpm audit:public`.
+- PR #11 GitHub Actions CI scanned 156 committed public-tree files.
+- A local PR #11 / #12 filesystem snapshot reported 157 because it included ignored generated `apps/web/tsconfig.tsbuildinfo`; that was not a committed-tree count.
+- PR #13 GitHub Actions later scanned 157 committed public-tree files after tracked `.gitleaksignore` was added.
+
+`.env` and `.env.*` are ignored with `.env.example` explicitly allowed. No tracked `.env` or private-key file was identified by the readiness audit.
+
+The latest merged default-branch run before this documentation PR is GitHub Actions Run #52 on `main` `9332ef3668c02554fc7f2dc67343d0b8a0a257d2`; it completed successfully after PR #14 merged.
 
 ## Full Git history secret scan
 
-PASS — Gitleaks v8.30.1 full-history publication scan completed 2026-08-31. This is not a “never had a finding” result: one `generic-api-key` candidate was reported, human-adjudicated as a synthetic test fixture, and then ignored by exact fingerprint. The gate is clean after that disposition.
+PASS for the previously scanned baseline, with one final pre-public recertification still required on the ultimate publication-candidate `main`.
 
-Scanner: official Gitleaks v8.30.1 `darwin_arm64` release binary (checksum-verified from GitHub Releases). Command coverage matched the prior merge-aware audit and was not reduced:
+Gitleaks v8.30.1 full-history publication scanning completed on 2026-08-31. This is not a “never had a finding” result: one `generic-api-key` candidate was reported, human-adjudicated as a synthetic test fixture, and ignored only by its exact historical fingerprint.
+
+Scanner: official checksum-verified Gitleaks v8.30.1 binary. Coverage matched the merge-aware audit:
 
 ```text
 gitleaks git . --log-opts="--all --reflog --full-history -m" --redact --report-format=json --report-path=<repo-external temp path>
 ```
 
-Scan inventory:
+Historical scan inventory:
 
 - all refs, reflog, full history, merge-aware (`-m`)
-- 17 merge commits throughout
-- pre-disposition scan on `main` `dfab175`: Gitleaks reported `55 commits scanned`; `git rev-list --all` was 55
-- the earlier audit counted 22 refs; this clone also has local Codex checkpoint refs and the working branch, so `git for-each-ref` is higher
-- final rerun after the exact-fingerprint ignore commit: Gitleaks reported `56 commits scanned`; `git rev-list --all` was 56
+- pre-disposition `main` `dfab175`: Gitleaks and `git rev-list --all` both reported 55 commits
+- final rerun after the exact-fingerprint disposition commit: Gitleaks and `git rev-list --all` both reported 56 commits
 
 Original result before disposition:
 
@@ -43,90 +44,138 @@ Original result before disposition:
 - 1 unreviewed finding
 - Rule: `generic-api-key`
 - File: `apps/api/src/webhook.test.ts`
-- Commit: `07351c1a4029b6f18d6d934edbc6da89888185d5` (`feat: implement DevMemoir milestone 1`)
+- Commit: `07351c1a4029b6f18d6d934edbc6da89888185d5`
 - Exact Fingerprint: `07351c1a4029b6f18d6d934edbc6da89888185d5:apps/api/src/webhook.test.ts:generic-api-key:9`
 
-Human adjudication of that finding:
+Human adjudication:
 
-- GitHub webhook HMAC synthetic test fixture used only by unit tests
-- Not a production credential
-- No rotation or revocation required
+- synthetic GitHub webhook HMAC unit-test fixture
+- not a production credential
+- no rotation or revocation required
 - 0 confirmed real secrets
 
 Disposition:
 
 - `.gitleaksignore` contains only that exact fingerprint
-- No path-wide ignore, no whole-file ignore, no `generic-api-key` rule disable, and no extra regex allowlist
-- Production webhook verification logic was not changed
-- Raw JSON reports were written outside the repository and deleted after verification; matched secret text is not recorded here
+- no path-wide ignore, whole-file ignore, rule disable, or broad regex allowlist
+- production webhook verification logic was not changed
+- raw JSON reports were written outside the repository and deleted after verification; matched secret text is not recorded here
 
-Final result after fingerprint disposition and rerun of the same coverage:
+Historical clean rerun result:
 
 - Gitleaks exit code `0`
 - 0 unreviewed findings
 - 0 confirmed real secrets
 
-Historical original-audit note (before a mature scanner was available on this machine): `gitleaks` and equivalent local executables were initially unavailable, so the first publication document recorded BLOCKED. Supplemental sanitized checks (`git rev-list --all --objects` over 51 commits / 948 reachable objects at that time, plus `git fsck --full --no-reflogs --unreachable`) found no private-key markers, no GitHub token-shaped values except test canaries / regex examples, only localhost/`unused`/placeholder database URLs, no token-shaped bearer values, and no cloud credential patterns. Those checks remain historical supplemental evidence. The Codex Security standard source scan for the earlier committed snapshot also reported zero reportable findings; its artifacts stay in the security workbench and do not replace this Gitleaks result.
+Because later readiness and owner-decision commits now exist, this historical PASS does not by itself certify the ultimate publication SHA. After this final readiness-evidence PR is merged and the resulting `main` CI is green, rerun the exact same full-history Gitleaks coverage on that ultimate `main`. Publication requires exit code 0, 0 unreviewed findings, and 0 confirmed real secrets. Do not make another repository commit after that final scan solely to record the scan result, otherwise a new unscanned commit would be introduced.
 
 ## Private data scan
 
-PASS — no real imported private repository names, private commit messages, PR/issue bodies, raw webhook exports, database dumps, or private dashboard screenshots were found in the current tree or reachable history. Test data uses synthetic owners/repositories, `.example` domains, and explicit privacy canaries.
+PASS — no real imported private repository names, private commit messages, PR/issue bodies, raw webhook exports, database dumps, or private dashboard screenshots were found in the current tree or reachable history during the repository audit. Test data uses synthetic owners/repositories, `.example` domains, and explicit privacy canaries.
 
 ## Commit metadata privacy
 
 `personal_email_history: yes`
 `noreply_email_detected: yes`
-`decision: pending`
+`decision: ACCEPTED BY OWNER`
 
-The history contains one non-noreply personal address in addition to a GitHub noreply address. This is a privacy decision, not automatically a security incident. The owner must choose between accepting historical exposure or rewriting history before publication. No history rewrite was performed. Future local commits should use a GitHub noreply address, configured locally with `git config user.email "<github-noreply-address>"`; the repository does not hard-code a developer's address.
+The history contains a non-noreply personal address in addition to GitHub noreply metadata. The owner explicitly accepts this historical metadata exposure for publication and does not require a destructive history rewrite for this reason. This is a privacy decision, not a credential incident.
 
-## GitHub Actions
+Future local commits should continue using a GitHub noreply address. The repository does not hard-code the developer's personal address.
 
-`workflow_source: PASS` — the workflow has explicit `permissions: contents: read`, uses only local PostgreSQL test credentials, does not echo secret values, and contains no shell tracing or environment-dump command around secret-bearing operations.
+## Authenticated GitHub hosted-surface review
 
-`current_ci: PASS` — the PR #11 GitHub Actions run used its PostgreSQL service container and completed the repository verification successfully, including `pnpm audit:public` (156 public-tree files scanned), PostgreSQL integration tests, projection/RLS tests, pg-boss restart integration tests, typecheck, lint, unit/regression tests, and build. This current CI result is stronger readiness evidence than the historical local integration skip recorded below.
+PASS — the historical GitHub publication blocker is cleared based on an authenticated review completed 2026-09-01.
 
-`historical_logs: BLOCKED`
-`historical_artifacts: BLOCKED`
+### Pull requests and issues
 
-The local GitHub CLI is installed but unauthenticated, so historical run logs, artifacts, and PR/issue discussion history could not be inspected through the GitHub API. The operator must review those items privately and delete any sensitive historical artifact before publication; do not copy secrets into this document.
+- 13 historical pull requests (#1 through #13) were inventoried; all were closed and merged.
+- Connector-visible PR discussion surfaces contained no comments or review discussion requiring remediation.
+- No standalone Issues were found in the repository issue search.
+- No secret, private repository content, or other publication-sensitive material was identified in the reviewed PR bodies/discussion surfaces.
+
+### Pull-request-triggered Actions
+
+- PR-triggered workflow runs for PRs #1 through #13 were inventoried; all completed successfully.
+- Their currently visible artifact listings were empty.
+- Job logs for the historical PR-triggered verification runs were reviewed. GitHub auth values were masked, database URLs were localhost CI values, and logged identifiers/payload fixtures were synthetic test data.
+- No production database endpoint, GitHub App private key, production webhook secret, PAT/bearer credential, private personal-email value, raw private repository content, or raw webhook body was identified in those reviewed logs.
+- PR #10 payload-retention coverage was checked specifically: SQL logging showed parameterized payload-ciphertext handling, not raw webhook payload contents.
+
+### Push-to-main Actions
+
+The authenticated run inventory for `event=push`, `branch=main` contained 25 historical runs at review time:
+
+- 21 successful
+- 4 failed
+- 0 cancelled
+- 0 timed out
+
+The four failed runs were fully reviewed because failure diagnostics carry the highest accidental-disclosure risk. Their failures were early TypeScript/PostgreSQL integration defects, including module-resolution, locking, UUID/test typing, and timestamp-casting errors. Credentials remained masked; database configuration was localhost-only; no production secret, raw webhook body, private repository payload, or production deployment identifier was identified.
+
+Currently visible artifact listings for all four failed push runs were empty. The latest publication-candidate baseline run, Run #52 on `9332ef3668c02554fc7f2dc67343d0b8a0a257d2`, also completed successfully with an empty artifact listing.
+
+The 21 successful push runs were completely inventoried but were not each re-read byte-for-byte during this final pass. This is an explicit coverage note rather than a claim of exhaustive successful-run log transcription. Risk coverage is supported by the previously reviewed PR-triggered runs using the same workflow, complete failed-run review, current successful default-branch CI, and the absence of a workflow path that intentionally dumps secret-bearing environment data.
+
+### Releases and retained artifacts
+
+- Releases: 0
+- Release assets: 0
+- No currently visible sensitive artifact required deletion in the audited surfaces.
+
+Historical logs or artifacts that GitHub has already expired or deleted cannot be retroactively inspected. This retention limitation does not create evidence that sensitive content existed; it is recorded as a scope limitation.
+
+## GitHub Actions workflow source
+
+PASS — the workflow uses explicit least-privilege `permissions: contents: read`, local PostgreSQL test credentials, and no intentional environment-dump or shell-tracing step around secret-bearing operations.
 
 ## Production identifiers
 
-PASS — provider names and links in architecture documents are generic documentation references. No project-specific deployment hostname, private admin endpoint, credential-bearing production URL, Neon host, Railway app host, callback domain, or cloud credential was found in the current tree or reachable history.
+PASS — provider names and links in architecture documents are generic documentation references. No project-specific deployment hostname, private admin endpoint, credential-bearing production URL, Neon host, Railway app host, callback domain, or cloud credential was found in the current tree or reachable history during the publication audit.
 
 ## Documentation
 
-PASS — `README.md` now uses public-audience structure and accurate M5/M6.1/Gate A wording. `SECURITY.md`, `CONTRIBUTING.md`, the publication checklist, and this evidence document are present. Detailed milestone contracts remain under `docs/architecture/`.
+PASS — `README.md` is structured for a public audience. `SECURITY.md`, `CONTRIBUTING.md`, the publication checklist, and this evidence document are present. Detailed milestone contracts remain under `docs/architecture/`.
 
 ## License
 
-PASS — Owner decision recorded: **Source-visible / All Rights Reserved**. No open-source license is granted at publication time, and no `LICENSE`, `LICENSE.md`, or `COPYING` file was added. Public visibility does not grant permission to copy, modify, redistribute, or create derivative works. Background tradeoffs for MIT and Apache-2.0 remain in [`PUBLICATION_LICENSE_DECISION.md`](./PUBLICATION_LICENSE_DECISION.md) for future reference.
+PASS — owner decision recorded: **Source-visible / All Rights Reserved**.
 
-## Verification
+No open-source license is granted at publication time, and no `LICENSE`, `LICENSE.md`, or `COPYING` file is added for an OSS license. Public visibility does not grant permission to copy, modify, redistribute, or create derivative works. Background tradeoffs for MIT and Apache-2.0 remain in [`PUBLICATION_LICENSE_DECISION.md`](./PUBLICATION_LICENSE_DECISION.md) for future reference.
 
-Historical local verification record:
+## Verification summary
 
-- `pnpm audit:public`: PASS, including deterministic self-tests and a 157-file local filesystem snapshot; see the Current tree note above for why this is distinct from the 156-file CI snapshot.
-- `pnpm typecheck`: PASS, including workspace build and all package typechecks.
-- `pnpm lint`: PASS.
-- `pnpm test`: PASS; unit/regression suites passed. PostgreSQL, RLS, and pg-boss integration suites were conditionally skipped because Docker/Podman and local PostgreSQL were unavailable.
-- `pnpm build`: PASS as exercised by `pnpm typecheck` and `pnpm test`.
-- `git diff --check`: PASS; only expected line-ending normalization warnings were emitted.
+Historical repository verification includes successful typecheck, lint, unit/regression tests, build, current-tree readiness checks, PostgreSQL integration/projection/RLS tests, and pg-boss restart integration tests in GitHub Actions.
 
-Formal merged-PR CI verification:
+Latest merged baseline before this documentation PR:
 
-- PR #11 GitHub Actions used a PostgreSQL service container and passed the PostgreSQL integration tests, projection/RLS tests, and pg-boss restart integration tests.
-- The same CI passed typecheck, lint, unit/regression tests, build, and `pnpm audit:public` with `156 public-tree files scanned`.
-- The successful CI result is the stronger readiness evidence for these checks; the local integration skip is historical context, not the final verification state.
+- `main`: `9332ef3668c02554fc7f2dc67343d0b8a0a257d2`
+- GitHub Actions: Run #52
+- event: `push` to `main`
+- conclusion: success
+
+This documentation PR must also pass its own CI before merge. After merge, the resulting `main` must remain green before the final Gitleaks recertification.
 
 ## Publication blockers
 
-- Complete the owner decision for historical personal-email exposure.
-- Review historical GitHub Actions logs/artifacts and PR/issue discussion through an authenticated operator account; delete stale sensitive artifacts if any are found.
+Only one technical gate remains:
+
+- Rerun the exact mature full-history Gitleaks scan on the ultimate post-merge `main` publication candidate. Required result: exit code 0, 0 unreviewed findings, 0 confirmed real secrets.
+
+Cleared blockers:
+
+- historical personal-email owner decision — ACCEPTED BY OWNER
+- publication license decision — Source-visible / All Rights Reserved
+- authenticated GitHub PR/issue discussion review — PASS
+- PR-triggered Actions logs/currently visible artifacts review — PASS
+- push-to-main Actions inventory and failed-run log review — PASS
+- Releases / release assets review — PASS
+- current default-branch CI — PASS
 
 ## Final status
 
-CONDITIONAL
+CONDITIONAL — ONE FINAL TECHNICAL GATE REMAINS.
 
-It is not safe to change the repository to Public yet. The mature full-history Gitleaks scan is PASS after one human-adjudicated synthetic test-fixture false positive. Historical GitHub review and the owner privacy decision remain outstanding. Repository visibility must not be changed until those remaining blockers are cleared.
+The repository is not yet authorized for a Private → Public visibility change. Once this final readiness-evidence PR is merged, the resulting `main` CI is green, and the exact full-history Gitleaks recertification returns exit code 0 with 0 unreviewed findings and 0 confirmed real secrets, that exact `main` SHA may be designated **READY FOR PUBLICATION**.
+
+Do not create an additional repository commit after the final scan merely to record the READY label. Preserve the scanned SHA as the publication candidate, change visibility manually, and then perform the documented post-public GitHub security follow-up.
