@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   verify:
+    name: DevMemoir CI / verify
     runs-on: ubuntu-latest
     services:
       postgres:
