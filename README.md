@@ -36,7 +36,9 @@ The design uses GitHub App least privilege, signed webhook verification, separat
 
 ## Local development
 
-Use a local PostgreSQL instance or the included Docker Compose service. Production credentials and GitHub App material must remain outside the repository.
+The supported local and CI database baseline is **PostgreSQL 18** (`postgres:18-alpine`). Use a local PostgreSQL 18 instance or the included Docker Compose service. Production credentials and GitHub App material must remain outside the repository.
+
+An existing PostgreSQL 16 data directory must not be opened by the PostgreSQL 18 image. See [`docs/POSTGRES.md`](./docs/POSTGRES.md) for the volume layout, reset steps, and rollback.
 
 ```powershell
 Copy-Item .env.example .env

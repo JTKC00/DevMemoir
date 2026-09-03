@@ -1,14 +1,18 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: devmemoir
       POSTGRES_PASSWORD: devmemoir
       POSTGRES_DB: devmemoir
+      # postgres:18+ defaults PGDATA to /var/lib/postgresql/18/docker and VOLUME
+      # to /var/lib/postgresql (docker-library/postgres#1259). Do not mount a
+      # PostgreSQL 16 data directory here.
+      PGDATA: /var/lib/postgresql/18/docker
     ports:
       - "5432:5432"
     volumes:
-      - ./docker-data/postgres:/var/lib/postgresql/data
+      - ./docker-data/postgres-18:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U devmemoir -d devmemoir"]
       interval: 5s

@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_USER: devmemoir
           POSTGRES_PASSWORD: devmemoir
@@ -45,6 +45,20 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Public repository current-tree check
         run: pnpm audit:public
+      - name: Assert PostgreSQL 18
+        run: |
+          IMAGE="$(docker inspect --format '{{.Config.Image}}' "${{ job.services.postgres.id }}")"
+          VERSION="$(docker exec "${{ job.services.postgres.id }}" psql -U devmemoir -d devmemoir -tAc 'SHOW server_version')"
+          echo "PostgreSQL image: ${IMAGE}"
+          echo "PostgreSQL server_version: ${VERSION}"
+          case "${IMAGE}" in
+            *postgres:18-alpine*) ;;
+            *) echo "Expected image postgres:18-alpine, got ${IMAGE}" >&2; exit 1 ;;
+          esac
+          case "${VERSION}" in
+            18.*) ;;
+            *) echo "Expected PostgreSQL 18, got ${VERSION}" >&2; exit 1 ;;
+          esac
       - name: Assert PostgreSQL integration configuration
         run: test -n "$TEST_DATABASE_URL"
       - name: Apply empty/upgrade-safe migrations
