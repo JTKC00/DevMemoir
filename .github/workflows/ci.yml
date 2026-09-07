@@ -63,15 +63,13 @@ jobs:
         run: test -n "$TEST_DATABASE_URL"
       - name: Apply empty/upgrade-safe migrations
         run: pnpm db:migrate
-      - name: Typecheck
-        run: pnpm typecheck
-      - name: Lint
-        run: pnpm lint
-      - name: Unit and M1-M4 regression tests
-        run: pnpm test
-      - name: PostgreSQL integration, projection, and RLS tests
-        run: pnpm --filter @devmemoir/db test
-      - name: pg-boss restart integration tests
-        run: pnpm --filter @devmemoir/jobs test && pnpm --filter @devmemoir/worker test
       - name: Build
         run: pnpm build
+      - name: Typecheck
+        run: pnpm -r --if-present typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Unit, PostgreSQL integration, projection, RLS, and queue recovery tests
+        run: pnpm -r --if-present test
+      - name: Synthetic owner journey through API and worker
+        run: pnpm test:journey

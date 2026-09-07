@@ -14,7 +14,7 @@ Historical imports and reconciliation preserve observed facts and explicit known
 
 ## Current status
 
-Active development. Milestone 5 is complete and M6.1 is complete. Milestone 6 / Gate A is not complete.
+Active development. Milestone 5 and M6.1 are complete. Local lifecycle controls and synthetic recovery rehearsals are implemented; Milestone 6 / Gate A still requires provider evidence.
 
 Core ingestion, reconciliation, recovery, operational health, and encrypted raw-webhook retention are implemented. Gate A privacy, lifecycle, backup/restore, and recovery work is still in progress. DevMemoir is not presented as production-ready, fully secure, or privacy-compliance complete.
 
@@ -64,7 +64,7 @@ PostgreSQL is the system of record for normalized facts, cursors, delivery state
 
 ## Project status / roadmap
 
-Milestones 1–5 and M6.1 are represented in the current implementation. Gate A remains open. Account deletion, disconnect lifecycle, session revocation, secret rotation, isolated restore evidence, and later multi-user or AI features are outside this slice and are not implied by the current status.
+Milestones 1–5 and M6.1 are represented in the current implementation. Gate A remains open. Local disconnect/account-deletion controls, session revocation, and synthetic rotation/restore rehearsals are now implemented; see the [lifecycle and recovery evidence](./docs/architecture/M6_LIFECYCLE_AND_RECOVERY.md). Provider rotation, backup/PITR, retention evidence and later multi-user or AI features remain outside the verified scope.
 
 ## Contributing
 

@@ -38,6 +38,28 @@ export async function refreshInventory(): Promise<void> {
   redirect("/connect?refreshed=1");
 }
 
+export async function disconnectInstallation(): Promise<void> {
+  const response = await fetch(`${apiOrigin()}/connect/disconnect`, { method: "POST", headers: await forwardedHeaders(), cache: "no-store" });
+  if (!response.ok) redirect("/connect?error=disconnect_failed");
+  redirect("/connect?disconnected=1");
+}
+
+export async function deleteAccount(formData: FormData): Promise<void> {
+  if (formData.get("confirm") !== "delete_account") redirect("/connect?error=deletion_confirmation_required");
+  let response: Response;
+  try {
+    response = await fetch(`${apiOrigin()}/account/delete`, {
+      method: "POST", headers: { ...await forwardedHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ confirm: "delete_account" }), cache: "no-store",
+    });
+  } catch { redirect("/connect?error=account_deletion_failed"); }
+  if (response.status !== 202) redirect("/connect?error=account_deletion_failed");
+  const jar = await cookies();
+  jar.set("__Host-devmemoir_session", "", { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
+  jar.set("devmemoir_csrf", "", { httpOnly: false, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
+  redirect("/account/deletion-requested");
+}
+
 export async function connectRepository(formData: FormData): Promise<void> {
   const fullName = String(formData.get("fullName") ?? "");
   const repositoryId = String(formData.get("repositoryId") ?? "");

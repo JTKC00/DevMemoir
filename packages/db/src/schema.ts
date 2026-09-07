@@ -12,6 +12,13 @@ export const tenants = pgTable("tenants", {
   deletionRequestedAt: nullableTime("deletion_requested_at"),
 }, (table) => [uniqueIndex("tenants_slug_unique").on(table.slug)]);
 
+export const tenantLifecycles = pgTable("tenant_lifecycles", {
+  tenantId: uuid("tenant_id").primaryKey().references(() => tenants.id, { onDelete: "cascade" }),
+  version: integer("version").notNull().default(0),
+  state: varchar("state", { length: 30 }).notNull().default("active"),
+  changedAt: time("changed_at").defaultNow(),
+});
+
 export const users = pgTable("users", {
   id: id(),
   primaryTenantId: uuid("primary_tenant_id").notNull().references(() => tenants.id),

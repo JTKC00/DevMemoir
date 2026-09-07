@@ -168,10 +168,10 @@ describe("worker delivery contract", () => {
     const jobs = new InMemoryJobPort();
     await store.upsertUser({ userId: "user-1", tenantId: "tenant-1", githubAccountId: 7, login: "owner", displayName: "owner" });
     await store.saveInstallation({ id: "installation-1", tenantId: "tenant-1", githubInstallationId: 22, accountGithubAccountId: 7 });
-    await store.updateInstallationLifecycle(22, "deleted", new Date());
     const delivery = await store.insertDelivery({ tenantId: "tenant-1", guid: "stale-after-delete", eventName: "installation_repositories", action: "removed", installationGithubId: 22, payloadExpiresAt: new Date(Date.now() + 60_000), now: new Date() });
+    await store.updateInstallationLifecycle(22, "deleted", new Date());
     await processDelivery({ deliveryId: delivery.record.id, payload: { tenantId: "tenant-1", deliveryId: delivery.record.id, eventName: "installation_repositories", action: "removed", installationGithubId: 22 } }, { config, store, jobs, githubForInstallation: () => ({}) as GithubClient, logger: createLogger() });
-    expect(store.deliveries.get("stale-after-delete")).toMatchObject({ state: "ignored", processingAttempts: 1, processedAt: expect.any(Date) });
+    expect(store.deliveries.get("stale-after-delete")).toMatchObject({ state: "ignored", processingAttempts: 0, processedAt: expect.any(Date) });
     expect(jobs.jobs.size).toBe(0);
   });
 

@@ -26,3 +26,17 @@ select { min-width: 260px; padding: 8px; margin: 8px 8px 8px 0; }
 .status-attention_required, .status-failed, .status-stale, .status-failed_or_incomplete { color: #a50e0e; background: #fce8e6; }
 .status-stopped, .status-never_seen { color: #5f6368; background: #e8eaed; }
 .repair-counts { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 12px 0; }
+.activity-filters { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+.activity-filters label { display: grid; gap: 4px; }
+.activity-filters select { min-width: 0; max-width: 100%; margin: 0; }
+.activity-filters .checkbox-label { display: flex; align-items: center; align-self: center; }
+.event-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.event p { overflow-wrap: anywhere; white-space: pre-wrap; }
+details { margin-top: 12px; }
+summary { cursor: pointer; }
+.card h2 { margin-top: 0; overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  main { padding: 24px 16px; }
+  header { flex-direction: column; gap: 16px; }
+  select { min-width: 0; max-width: 100%; }
+}

@@ -1,4 +1,5 @@
 import type { HistoricalSourceStage, M1Store } from "@devmemoir/db";
+import { assertTenantWork, LifecycleRevokedError, withTenantWork } from "@devmemoir/db";
 import { GithubAccessError, GithubRateLimitPauseError, type GithubAppClient, type GithubClient } from "@devmemoir/github";
 import { commitSyncLogicalKey, installationInventoryLogicalKey, type JobPort, type QueueJob, type SyncJobPayload } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
@@ -95,7 +96,7 @@ export async function processBackfill(payload: SyncJobPayload, deps: QueueDepend
         nextPage: result.nextPage,
       };
       const logicalKey = commitSyncLogicalKey(repository.id, ref, after, result.nextPage);
-      await deps.store.ensureJob(logicalKey, { kind: "sync_commits", ...continuationPayload });
+      await deps.store.ensureJob(logicalKey, continuationPayload as Record<string, unknown>);
       await deps.jobs.enqueue("sync_commits", logicalKey, continuationPayload);
       if (payload.deliveryId) await deps.store.updateDelivery(payload.deliveryId, { state: "received" }, payload.tenantId);
       return;
@@ -167,6 +168,20 @@ export async function processInstallationInventory(payload: SyncJobPayload, deps
 }
 
 export async function processQueueJob(kind: QueueJob, deps: QueueDependencies): Promise<void> {
+  const payload = kind.payload as SyncJobPayload;
+  if (!payload.tenantId) return processAuthorizedQueueJob(kind, deps);
+  try {
+    const lifecycle = await deps.store.getTenantLifecycle(payload.tenantId);
+    const expected = { tenantId: payload.tenantId, version: payload.lifecycleVersion ?? 0 };
+    assertTenantWork(lifecycle, expected);
+    await withTenantWork(expected, () => processAuthorizedQueueJob(kind, deps));
+  } catch (error) {
+    if (!(error instanceof LifecycleRevokedError)) throw error;
+    deps.logger.info({ event_type: "tenant_work", state: "ignored", error_code: "lifecycle_revoked" });
+  }
+}
+
+async function processAuthorizedQueueJob(kind: QueueJob, deps: QueueDependencies): Promise<void> {
   if (kind.kind === "webhook_delivery") {
     const payload = kind.payload as SyncJobPayload;
     if (!payload.deliveryId) throw new Error("Webhook job is missing delivery id");

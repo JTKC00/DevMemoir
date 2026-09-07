@@ -29,6 +29,7 @@ export class AuthService {
 
   async startLogin(returnPath = "/"): Promise<AuthStartResult> {
     if (!returnPath.startsWith("/") || returnPath.startsWith("//") || returnPath.includes("\\")) throw new AuthFlowError("Invalid return path", 400);
+    if ((await this.store.getUserByGithubAccountId(this.config.OWNER_GITHUB_USER_ID))?.deletedAt) throw new AuthFlowError("Account deletion requested", 403);
     const state = createOpaqueToken(32);
     const { verifier, challenge } = createPkcePair();
     const stateHash = hashOpaqueToken(state, this.config.SESSION_SECRET);
@@ -50,6 +51,7 @@ export class AuthService {
     const githubUser = await this.github.getUser(token.accessToken);
     if (githubUser.id !== this.config.OWNER_GITHUB_USER_ID || githubUser.type && githubUser.type !== "User") throw new AuthFlowError("GitHub account is not allowlisted", 403);
     const existing = await this.store.getUserByGithubAccountId(githubUser.id);
+    if (existing?.deletedAt) throw new AuthFlowError("Account deletion requested", 403);
     const user: UserRecord = existing ?? { userId: createId(), tenantId: createId(), githubAccountId: githubUser.id, login: githubUser.login, displayName: githubUser.login };
     await this.store.attachAuthUser(stateHash, user);
     const handoffCode = createOpaqueToken(32);

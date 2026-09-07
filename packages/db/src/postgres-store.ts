@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResultRow } from "pg";
-import { canonicalLogicalEventKey, createId, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, MAINTENANCE_TASKS, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
+import { canonicalLogicalEventKey, createId, tenantWorkLogicalKey, deliveryRedeliveryAction, githubDeliveryAttemptSucceeded, githubDeliveryIsExpired, isTerminalDeliveryState, isTerminalGithubDeliveryRepairStatus, MAINTENANCE_TASKS, nextRedeliveryClaimLeaseAt, nextRedeliveryEligibleAt, projectCanonicalFacts, PROJECTION_VERSION, repositoryAccessIsAvailable, type CanonicalProjectionInput, type CommitFact, type DevelopmentEvent, type MaintenanceTask, type RepositoryAccessStatus } from "@devmemoir/domain";
 import { collectQueueRebuildReconciliationTargets, emptyInventoryReconcileResult, GITHUB_DELIVERY_REPAIR_STATUSES, InstallationResolutionError, OPERATIONAL_STUCK_WORK_MS, RAW_WEBHOOK_DEAD_LETTER_RETENTION_MS, RAW_WEBHOOK_PURGE_BATCH_SIZE, RAW_WEBHOOK_STANDARD_RETENTION_MS, repositoryProjectionInputsChanged, RepositorySelectionError, standardPayloadExpiry, WEBHOOK_PROCESSING_LEASE_MS, WORKER_HEARTBEAT_STALE_MS } from "./store.js";
 import type {
   ActivityRecord,
@@ -43,6 +43,7 @@ import type {
   WorkerOperationalHealth,
 } from "./store.js";
 import { HISTORICAL_STAGES } from "./store.js";
+import { assertTenantWork, currentTenantWork, LifecycleRevokedError, type TenantLifecycle } from "./lifecycle.js";
 
 type Row = QueryResultRow & Record<string, unknown>;
 
@@ -64,6 +65,7 @@ function userFromRow(row: Row | undefined): UserRecord | undefined {
     githubAccountId: Number(row.github_account_id),
     login: String(row.login),
     displayName: String(row.display_name),
+    ...(date(row.deleted_at) ? { deletedAt: date(row.deleted_at)! } : {}),
   };
 }
 
@@ -293,11 +295,14 @@ function deliveryFromRow(row: Row | undefined): DeliveryRecord | undefined {
 export class PostgresM1Store implements M1Store {
   constructor(private readonly pool: Pool) {}
 
-  private async tenantQuery<T>(tenantId: string, operation: (client: PoolClient) => Promise<T>): Promise<T> {
+  private async tenantQuery<T>(tenantId: string, operation: (client: PoolClient) => Promise<T>, exclusive = false): Promise<T> {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
       await client.query("select set_config('app.tenant_id', $1, true)", [tenantId]);
+      await client.query(exclusive ? "select pg_advisory_xact_lock(174031, hashtext($1))" : "select pg_advisory_xact_lock_shared(174031, hashtext($1))", [tenantId]);
+      const expected = currentTenantWork();
+      if (expected) assertTenantWork(await this.readLifecycle(client, tenantId), expected);
       const value = await operation(client);
       await client.query("commit");
       return value;
@@ -307,6 +312,36 @@ export class PostgresM1Store implements M1Store {
     } finally {
       client.release();
     }
+  }
+
+  private async readLifecycle(client: PoolClient, tenantId: string): Promise<TenantLifecycle> {
+    const row = (await client.query<Row>("select version,state,changed_at from tenant_lifecycles where tenant_id=$1", [tenantId])).rows[0];
+    return { tenantId, version: row ? Number(row.version) : 0, state: row ? row.state as TenantLifecycle["state"] : "active", ...(date(row?.changed_at) ? { changedAt: date(row?.changed_at)! } : {}) };
+  }
+
+  async getTenantLifecycle(tenantId: string): Promise<TenantLifecycle> {
+    return this.tenantQuery(tenantId, (client) => this.readLifecycle(client, tenantId));
+  }
+
+  async disconnectTenant(tenantId: string, now: Date): Promise<TenantLifecycle> {
+    return this.tenantQuery(tenantId, async (client) => {
+      await client.query("select devmemoir_disconnect_tenant($1,$2)", [tenantId, now]);
+      return this.readLifecycle(client, tenantId);
+    }, true);
+  }
+
+  async requestAccountDeletion(tenantId: string, userId: string, now: Date): Promise<TenantLifecycle> {
+    return this.tenantQuery(tenantId, async (client) => {
+      await client.query("select devmemoir_request_account_deletion($1,$2,$3)", [tenantId, userId, now]);
+      return this.readLifecycle(client, tenantId);
+    }, true);
+  }
+  async listPendingAccountDeletions(limit: number): Promise<string[]> {
+    const result = await this.pool.query<Row>("select tenant_id from devmemoir_pending_account_deletions($1)", [limit]);
+    return result.rows.map((row) => String(row.tenant_id));
+  }
+  async purgeAccountDeletion(tenantId: string, now: Date): Promise<void> {
+    await this.tenantQuery(tenantId, async (client) => { await client.query("select devmemoir_purge_account_deletion($1,$2)", [tenantId, now]); }, true);
   }
 
   async createAuthTransaction(record: AuthTransactionRecord): Promise<void> {
@@ -353,10 +388,17 @@ export class PostgresM1Store implements M1Store {
   }
 
   async createSession(session: SessionRecord): Promise<void> {
-    await this.pool.query(
-      `insert into application_sessions (id,user_id,token_hash,csrf_token_hash,created_at,expires_at,revoked_at,last_seen_at) values ($1,$2,$3,$4,now(),$5,$6,now()) on conflict (token_hash) do nothing`,
-      [createId(), session.userId, session.tokenHash, session.csrfTokenHash, session.expiresAt, session.revokedAt ?? null],
-    );
+    await this.tenantQuery(session.tenantId, async (client) => {
+      if (!(await client.query("select 1 from users where id=$1 and primary_tenant_id=$2 and deleted_at is null", [session.userId, session.tenantId])).rowCount) throw new LifecycleRevokedError();
+      await client.query(
+        `insert into application_sessions (id,user_id,token_hash,csrf_token_hash,created_at,expires_at,revoked_at,last_seen_at) values ($1,$2,$3,$4,now(),$5,$6,now()) on conflict (token_hash) do nothing`,
+        [createId(), session.userId, session.tokenHash, session.csrfTokenHash, session.expiresAt, session.revokedAt ?? null],
+      );
+    });
+  }
+
+  async revokeSessions(input: { userId: string; tokenHash?: string; now: Date }): Promise<void> {
+    await this.pool.query("update application_sessions set revoked_at=$3 where user_id=$1 and ($2::text is null or token_hash=$2) and revoked_at is null", [input.userId, input.tokenHash ?? null, input.now]);
   }
 
   async getSession(tokenHash: string, now: Date): Promise<SessionRecord | undefined> {
@@ -373,6 +415,10 @@ export class PostgresM1Store implements M1Store {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
+      await client.query("select set_config('app.tenant_id',$1,true)", [user.tenantId]);
+      await client.query("select pg_advisory_xact_lock_shared(174031,hashtext($1))", [user.tenantId]);
+      if (["deleted", "deletion_requested"].includes((await this.readLifecycle(client, user.tenantId)).state)) throw new LifecycleRevokedError();
+      if ((await client.query("select 1 from users u join github_identities gi on gi.user_id=u.id join github_accounts ga on ga.id=gi.github_account_id where ga.github_account_id=$1 and u.deleted_at is not null", [user.githubAccountId])).rowCount) throw new LifecycleRevokedError();
       await client.query("insert into tenants (id,slug,created_at) values ($1,$2,now()) on conflict (id) do nothing", [user.tenantId, `owner-${user.githubAccountId}`]);
       const account = await client.query<Row>("insert into github_accounts (id,github_account_id,account_type,actor_kind,login) values ($1,$2,'User','user',$3) on conflict (github_account_id) do update set login=excluded.login returning id", [createId(), user.githubAccountId, user.login]);
       const accountId = account.rows[0]?.id;
@@ -394,7 +440,7 @@ export class PostgresM1Store implements M1Store {
   }
 
   async getUserByGithubAccountId(githubAccountId: number): Promise<UserRecord | undefined> {
-    const result = await this.pool.query<Row>("select u.id as user_id,u.primary_tenant_id as tenant_id,ga.github_account_id,ga.login,u.display_name from users u join github_identities gi on gi.user_id=u.id join github_accounts ga on ga.id=gi.github_account_id where ga.github_account_id=$1 and u.deleted_at is null", [githubAccountId]);
+    const result = await this.pool.query<Row>("select u.id as user_id,u.primary_tenant_id as tenant_id,ga.github_account_id,ga.login,u.display_name,u.deleted_at from users u join github_identities gi on gi.user_id=u.id join github_accounts ga on ga.id=gi.github_account_id where ga.github_account_id=$1", [githubAccountId]);
     return userFromRow(result.rows[0]);
   }
 
@@ -405,10 +451,13 @@ export class PostgresM1Store implements M1Store {
 
   async saveInstallation(installation: InstallationRecord): Promise<void> {
     await this.tenantQuery(installation.tenantId, async (client) => {
+      const lifecycle = await this.readLifecycle(client, installation.tenantId);
+      if (lifecycle.state === "deletion_requested" || lifecycle.state === "deleted") throw new LifecycleRevokedError();
+      if (lifecycle.state === "disconnected") await client.query("update tenant_lifecycles set state='active',version=version+1,changed_at=now() where tenant_id=$1", [installation.tenantId]);
       const accountId = await this.ensureGithubAccount(client, installation.accountGithubAccountId);
       await client.query(`insert into github_installations (id,tenant_id,github_installation_id,account_github_account_id,status,permissions,repository_selection,suspended_at,deleted_at,created_at,updated_at) values ($1,$2,$3,$4,'active',$5,$6,null,null,now(),now()) on conflict (github_installation_id) do update set tenant_id=excluded.tenant_id,account_github_account_id=excluded.account_github_account_id,permissions=case when $5::jsonb = '{}'::jsonb then github_installations.permissions else excluded.permissions end,repository_selection=coalesce(excluded.repository_selection,github_installations.repository_selection),status='active',suspended_at=null,deleted_at=null,updated_at=now()`, [installation.id, installation.tenantId, installation.githubInstallationId, accountId, JSON.stringify(installation.permissions ?? {}), installation.repositorySelection ?? null]);
       await client.query(`insert into installation_routes (github_installation_id,tenant_id,created_at,updated_at) values ($1,$2,now(),now()) on conflict (github_installation_id) do update set tenant_id=excluded.tenant_id,updated_at=now()`, [installation.githubInstallationId, installation.tenantId]);
-    });
+    }, true);
   }
 
   async updateInstallationSnapshot(input: { tenantId: string; githubInstallationId: number; permissions?: Record<string, string>; repositorySelection?: string }): Promise<void> {
@@ -625,12 +674,13 @@ export class PostgresM1Store implements M1Store {
       const row = current.rows[0];
       if (!row) return undefined;
       if (row.access_status && !repositoryAccessIsAvailable(row.access_status as RepositoryAccessStatus)) {
-        await client.query("update repository_access set selected=false where tenant_id=$1 and repository_id=$2 and installation_id=$3", [tenantId, repositoryId, row.installation_id]);
+        if (row.selected === true) await client.query("insert into tenant_lifecycles (tenant_id,version,state,changed_at) values ($1,1,'active',now()) on conflict (tenant_id) do update set version=tenant_lifecycles.version+1,changed_at=now()", [tenantId]);
+      await client.query("update repository_access set selected=false where tenant_id=$1 and repository_id=$2 and installation_id=$3", [tenantId, repositoryId, row.installation_id]);
         return repositoryFromRow({ ...row, selected: false });
       }
       await client.query("update repository_access set access_status='accessible',selected=false where tenant_id=$1 and repository_id=$2 and installation_id=$3", [tenantId, repositoryId, row.installation_id]);
       return repositoryFromRow({ ...row, access_status: "accessible", selected: false });
-    });
+    }, true);
   }
 
   async reconcileInstallationInventory(input: { tenantId: string; githubInstallationId: number; repositories: RepositoryRecord[]; observedAt: Date }): Promise<InventoryReconcileResult> {
@@ -675,6 +725,10 @@ export class PostgresM1Store implements M1Store {
     const tenantId = route.rows[0]?.tenant_id;
     if (!tenantId) return;
     await this.tenantQuery(String(tenantId), async (client) => {
+      if (status === "deleted" || status === "disconnected") {
+        await client.query("select devmemoir_remove_installation($1,$2,$3)", [tenantId, githubInstallationId, now]);
+        return;
+      }
       if (status === "suspended") {
         await client.query("update github_installations set status='suspended',suspended_at=$2::timestamptz,deleted_at=null,updated_at=now() where tenant_id=$1 and github_installation_id=$3", [tenantId, now, githubInstallationId]);
       } else if (status === "active") {
@@ -685,7 +739,7 @@ export class PostgresM1Store implements M1Store {
       const accessStatus = status === "suspended" ? "installation_suspended" : status === "active" ? "unavailable" : "disconnected";
       if (status === "active") await client.query("update repository_access set access_status='unavailable',selected=false where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$2)", [tenantId, githubInstallationId]);
       else await client.query("update repository_access set access_status=$2,selected=false,revoked_at=$3 where tenant_id=$1 and installation_id=(select id from github_installations where tenant_id=$1 and github_installation_id=$4)", [tenantId, accessStatus, now, githubInstallationId]);
-    });
+    }, true);
   }
 
   async insertDelivery(input: Omit<DeliveryRecord, "id" | "state" | "firstReceivedAt" | "lastReceivedAt" | "receiptCount" | "processingAttempts"> & { now: Date }): Promise<DeliveryInsertResult> {
@@ -693,6 +747,10 @@ export class PostgresM1Store implements M1Store {
     try {
       await client.query("begin");
       if (input.tenantId) await client.query("select set_config('app.tenant_id', $1, true)", [input.tenantId]);
+      if (input.tenantId) {
+        await client.query("select pg_advisory_xact_lock_shared(174031, hashtext($1))", [input.tenantId]);
+        assertTenantWork(await this.readLifecycle(client, input.tenantId));
+      }
       const existingResult = await client.query<Row>("select * from webhook_deliveries where github_delivery_guid=$1 for update", [input.guid]);
       const existing = deliveryFromRow(existingResult.rows[0]);
       if (existing) {
@@ -814,6 +872,11 @@ export class PostgresM1Store implements M1Store {
 
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {
     const run = async (client: PoolClient) => {
+      const lifecycle = await this.readLifecycle(client, String(payload.tenantId));
+      assertTenantWork(lifecycle);
+      if (payload.lifecycleVersion !== undefined && payload.lifecycleVersion !== lifecycle.version) throw new LifecycleRevokedError();
+      payload.lifecycleVersion = lifecycle.version;
+      logicalKey = tenantWorkLogicalKey(logicalKey, payload);
       const inserted = await client.query<Row>("insert into sync_jobs (id,tenant_id,kind,logical_key,payload,scheduled_at) values ($1,$2,$3,$4,$5,now()) on conflict (logical_key) do nothing returning id", [createId(), String(payload.tenantId), String(payload.kind ?? "webhook_delivery"), logicalKey, payload]);
       if (inserted.rows[0]?.id) return String(inserted.rows[0].id);
       const existing = await client.query<Row>("select id from sync_jobs where logical_key=$1", [logicalKey]);
@@ -1269,6 +1332,7 @@ export class PostgresM1Store implements M1Store {
 
   async listActivity(tenantId: string, repositoryId?: string, query?: ActivityQuery): Promise<ActivityRecord[]> {
     return this.tenantQuery(tenantId, async (client) => {
+      if ((await this.readLifecycle(client, tenantId)).state !== "active") return [];
       const contextClause = query?.context && query.context !== "default" ? ` and e.context_kind=$${repositoryId ? 3 : 2}` : "";
       const botClause = query && !query.includeBots ? " and e.actor_kind <> 'bot'" : "";
       const params = repositoryId ? [tenantId, repositoryId] : [tenantId];

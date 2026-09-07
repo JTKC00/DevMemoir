@@ -3,3 +3,4 @@ export * from "./client.js";
 export * from "./store.js";
 export * from "./postgres-store.js";
 export * from "./migration-config.js";
+export * from "./lifecycle.js";

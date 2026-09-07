@@ -9,6 +9,7 @@ import type { JobPort } from "@devmemoir/jobs";
 import { deliveryAuditRecoveryLogicalKey, deliveryLogicalKey, historicalBackfillLogicalKey, installationInventoryLogicalKey } from "@devmemoir/jobs";
 import type { Logger } from "@devmemoir/observability";
 import { RepositorySelectionError, standardPayloadExpiry, type M1Store, type SessionRecord } from "@devmemoir/db";
+import { LifecycleRevokedError } from "@devmemoir/db";
 import { enqueueRepositoryReconciliation, resumeGithubDeliveryRepairs } from "@devmemoir/worker/recovery";
 import { AuthFlowError, AuthService, readBearerOrCookie } from "./auth.js";
 import { deriveOwnerOperationalHealth, emitOperationalWarnings } from "./ops-health.js";
@@ -240,6 +241,35 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     return { authenticated: true, tenantId: session.tenantId, csrfRequired: true };
   });
 
+  app.post("/auth/logout", async (request, reply) => {
+    const session = await requireCsrf(request as RequestWithSession, reply);
+    if (!session) return;
+    await deps.store.revokeSessions({ userId: session.userId, tokenHash: session.tokenHash, now: now() });
+    return reply.code(204).send();
+  });
+
+  app.post("/auth/sessions/revoke", async (request, reply) => {
+    const session = await requireCsrf(request as RequestWithSession, reply);
+    if (!session) return;
+    await deps.store.revokeSessions({ userId: session.userId, now: now() });
+    return reply.code(204).send();
+  });
+
+  app.post("/connect/disconnect", async (request, reply) => {
+    const session = await requireOwner(request as RequestWithSession, reply, true);
+    if (!session) return;
+    await deps.store.disconnectTenant(session.tenantId, now());
+    return reply.code(204).send();
+  });
+
+  app.post("/account/delete", async (request, reply) => {
+    const session = await requireOwner(request as RequestWithSession, reply, true);
+    if (!session) return;
+    if ((request.body as { confirm?: string } | undefined)?.confirm !== "delete_account") return reply.code(400).send({ error: "deletion_confirmation_required" });
+    await deps.store.requestAccountDeletion(session.tenantId, session.userId, now());
+    return reply.code(202).send({ state: "deletion_requested", liveData: "pending_purge", backups: "retention_not_verified" });
+  });
+
   app.post("/connect/start", async (request, reply) => {
     const session = await requireCsrf(request as RequestWithSession, reply);
     if (!session) return;
@@ -389,6 +419,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     // refresh. Their embedded repository arrays are never treated as truth.
     const ignored = (!inventorySignal && parsed.kind !== "push") || !knownAction;
     const installation = parsed.installationGithubId ? await deps.store.getInstallation(parsed.installationGithubId) : undefined;
+    if (installation && (await deps.store.getTenantLifecycle(installation.tenantId)).state !== "active") return reply.code(202).send({ accepted: true, state: "ignored" });
     const payloadCiphertext = encryptSecret(raw.toString("utf8"), deps.config.ENCRYPTION_KEY_BASE64);
     const tenantId = installation?.tenantId;
     const receivedAt = now();
@@ -447,7 +478,10 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     const includeBots = request.query.includeBots === "true";
     const repositories = await deps.store.listRepositories(session.tenantId);
     const canonicalEvents = await deps.store.listActivity(session.tenantId, request.query.repositoryId, { context: requestedContext as "default" | "personal" | "project" | "unknown", includeBots });
-    const events = requestedContext === "default" ? defaultTimelineEvents(canonicalEvents, deps.config.OWNER_GITHUB_USER_ID) : canonicalEvents;
+    const events = requestedContext === "default"
+      ? [...defaultTimelineEvents(canonicalEvents, deps.config.OWNER_GITHUB_USER_ID), ...(includeBots ? canonicalEvents.filter((event) => event.actorKind === "bot") : [])]
+        .sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime() || a.id.localeCompare(b.id))
+      : canonicalEvents;
     const selected = repositories[0];
     return {
       completeness: "Newest 100 commits currently reachable from the default branch of this connected repository.",
@@ -457,6 +491,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   });
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof LifecycleRevokedError) return request.url.startsWith("/webhooks/github")
+      ? reply.code(202).send({ accepted: true, state: "ignored" })
+      : reply.code(409).send({ error: "lifecycle_revoked" });
     deps.logger.error({ request_id: request.id, result: "error" }, error);
     const statusCode = typeof error === "object" && error !== null && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
     return reply.code(statusCode >= 400 && statusCode < 500 ? statusCode : 500).send({ error: statusCode === 413 ? "payload_too_large" : "internal_error" });

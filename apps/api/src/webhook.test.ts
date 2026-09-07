@@ -14,4 +14,15 @@ describe("GitHub webhook signature", () => {
   it("rejects malformed signatures", () => {
     expect(verifyGithubSignature(Buffer.from("{}"), "sha256=bad", "current-secret-123456")).toBe(false);
   });
+
+  it("accepts both signers during overlap, then only the current signer after restart", () => {
+    const raw = Buffer.from('{"zen":"synthetic rotation rehearsal"}');
+    const oldSecret = "fixture-old-webhook-secret";
+    const newSecret = "fixture-new-webhook-secret";
+    const sign = (secret: string) => `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}`;
+    for (const secret of [oldSecret, newSecret]) expect(verifyGithubSignature(raw, sign(secret), newSecret, oldSecret)).toBe(true);
+    expect(verifyGithubSignature(raw, sign(oldSecret), newSecret)).toBe(false);
+    expect(verifyGithubSignature(raw, sign(newSecret), newSecret)).toBe(true);
+    expect(verifyGithubSignature(Buffer.from("changed"), sign(newSecret), newSecret)).toBe(false);
+  });
 });
