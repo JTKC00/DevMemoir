@@ -97,6 +97,13 @@ async function pauseAndWake(payload: SyncJobPayload, error: GithubRateLimitPause
 async function requestRedelivery(guid: string, githubDeliveryId: number, auditRunId: string, deps: DeliveryAuditDependencies): Promise<"requested" | "skipped"> {
   const now = currentTime(deps);
   const existing = await deps.store.getGithubDeliveryRepair(guid);
+  if (existing?.installationGithubId) {
+    const installation = await deps.store.getInstallation(existing.installationGithubId);
+    if (installation && ((await deps.store.getTenantLifecycle(installation.tenantId)).state !== "active" || installation.status === "disconnected" || installation.status === "deleted")) {
+      await deps.store.markGithubDeliveryRepair({ guid, status: "skipped_terminal", errorCode: "lifecycle_revoked", now });
+      return "skipped";
+    }
+  }
   if (existing && isTerminalGithubDeliveryRepairStatus(existing.status)) {
     deps.logger.info({ delivery_guid: guid, audit_run_id: auditRunId, state: existing.status, result: "terminal", attempt: existing.attemptCount });
     return "skipped";

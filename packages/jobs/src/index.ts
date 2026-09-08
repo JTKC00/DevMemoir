@@ -1,5 +1,6 @@
 import PgBoss from "pg-boss";
 import type { DeliveryState, MaintenanceTask } from "@devmemoir/domain";
+import { tenantWorkLogicalKey } from "@devmemoir/domain";
 
 export type JobKind = "webhook_delivery" | "sync_commits" | "repository_backfill" | "installation_inventory" | "repository_reconciliation" | "github_delivery_audit" | "github_delivery_audit_recovery" | "maintenance_active" | "maintenance_authorized" | "maintenance_audit" | "privacy_payload_purge";
 export const JOB_KINDS: JobKind[] = ["webhook_delivery", "sync_commits", "repository_backfill", "installation_inventory", "repository_reconciliation", "github_delivery_audit", "github_delivery_audit_recovery", "maintenance_active", "maintenance_authorized", "maintenance_audit", "privacy_payload_purge"];
@@ -19,6 +20,7 @@ export type SyncJobPayload = {
   deliveryId?: string;
   deliveryGuid?: string;
   tenantId?: string;
+  lifecycleVersion?: number;
   repositoryId?: string;
   repositoryGithubId?: number;
   installationId?: number;
@@ -103,6 +105,7 @@ export class InMemoryJobPort implements JobPort {
   async has(jobId: string, kind: JobKind): Promise<boolean> { return this.jobs.get(jobId)?.kind === kind; }
 
   async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string> {
+    logicalKey = tenantWorkLogicalKey(logicalKey, payload);
     const existing = [...this.jobs.values()].find((job) => job.kind === kind && job.logicalKey === logicalKey);
     if (existing) return existing.id;
     const id = `job-${++this.sequence}`;
@@ -159,6 +162,7 @@ export class PgBossJobPort implements JobPort {
   }
 
   async enqueue<T>(kind: JobKind, logicalKey: string, payload: T, options?: { startAfter?: Date }): Promise<string | undefined> {
+    logicalKey = tenantWorkLogicalKey(logicalKey, payload);
     const logicalMapKey = `${kind}:${logicalKey}`;
     const knownId = this.jobIdsByLogicalKey.get(logicalMapKey);
     if (knownId && await this.has(knownId, kind)) return knownId;

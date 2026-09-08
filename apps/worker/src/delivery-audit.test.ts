@@ -356,6 +356,16 @@ describe("M5.2 GitHub App failed-delivery audit", () => {
     expect(resumed.record.id).toBe(first.record.id);
   });
 
+  it("does not request redelivery after tenant disconnection", async () => {
+    const app = appClient({});
+    const scope = await setup(app);
+    await scope.store.disconnectTenant(tenantId, now());
+    await enqueueGithubDeliveryAudit({ githubAppId, auditRunId }, scope.deps);
+    await processGithubDeliveryAudit({ kind: "github_delivery_audit", githubAppId, auditRunId, page: 1 }, scope.deps);
+    expect(app.redelivered).toEqual([]);
+    expect((await scope.store.getGithubDeliveryRepair(guid))?.status).toBe("skipped_terminal");
+  });
+
   it("re-checks terminal local state on a recovered retry and does not POST", async () => {
     const app = appClient({ redeliverErrors: [new Error("injected_worker_crash")] });
     const scope = await setup(app);

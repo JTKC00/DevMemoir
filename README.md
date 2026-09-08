@@ -14,7 +14,7 @@ Historical imports and reconciliation preserve observed facts and explicit known
 
 ## Current status
 
-Active development. Milestone 5 is complete and M6.1 is complete. Milestone 6 / Gate A is not complete.
+Active development. Milestone 5 and M6.1 are complete. Local lifecycle controls and synthetic recovery rehearsals are implemented; Milestone 6 / Gate A still requires provider evidence.
 
 Core ingestion, reconciliation, recovery, operational health, and encrypted raw-webhook retention are implemented. Gate A privacy, lifecycle, backup/restore, and recovery work is still in progress. DevMemoir is not presented as production-ready, fully secure, or privacy-compliance complete.
 
@@ -33,6 +33,8 @@ The only temporary content-sensitive exception is encrypted raw webhook payload 
 ## Security model
 
 The design uses GitHub App least privilege, signed webhook verification, separate database runtime roles, row-level security, an owner allowlist, opaque queue payloads, durable rate-limit/reconciliation state, worker-only privacy purge, and secret-manager runtime configuration. These controls reduce exposure and support recovery; they do not eliminate every possible vulnerability or deployment mistake.
+
+The API also limits incoming requests to 120 per minute per peer IP (IPv6 /64), shared across routes in each process, before session lookup or body parsing. Excess requests return `429` with `Retry-After`. Forwarded IP headers are not trusted; clients behind the web server or a proxy share its budget. This in-memory limit resets on restart and is not shared across replicas. Deployment must account for proxy traffic and webhook bursts, and provide shared ingress limits when scaling out. The synthetic browser fixture inherits the limit and skips background queue draining for rejected requests.
 
 ## Local development
 
@@ -64,7 +66,7 @@ PostgreSQL is the system of record for normalized facts, cursors, delivery state
 
 ## Project status / roadmap
 
-Milestones 1–5 and M6.1 are represented in the current implementation. Gate A remains open. Account deletion, disconnect lifecycle, session revocation, secret rotation, isolated restore evidence, and later multi-user or AI features are outside this slice and are not implied by the current status.
+Milestones 1–5 and M6.1 are represented in the current implementation. Gate A remains open. Local disconnect/account-deletion controls, session revocation, and synthetic rotation/restore rehearsals are now implemented; see the [lifecycle and recovery evidence](./docs/architecture/M6_LIFECYCLE_AND_RECOVERY.md). Provider rotation, backup/PITR, retention evidence and later multi-user or AI features remain outside the verified scope.
 
 ## Contributing
 

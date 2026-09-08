@@ -1,6 +1,7 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { claimInstallation, connectRepository, refreshInventory, resumeBackfill, startInstallation, unselectRepository } from "./actions";
+import { logout, revokeAllSessions } from "../session-actions";
+import { claimInstallation, connectRepository, deleteAccount, disconnectInstallation, refreshInventory, resumeBackfill, startInstallation, unselectRepository } from "./actions";
 
 type HistoricalStatus = {
   status: string;
@@ -41,7 +42,14 @@ export default async function ConnectPage({ searchParams }: { searchParams: Prom
 
   return <main>
     <header><h1>Connect GitHub</h1><a href="/">Back to activity</a></header>
-    {errorText ? <section className="card"><p>{errorText}</p></section> : null}
+    {errorText ? <section className="card"><p>{params.error === "session_revocation_failed" ? "Sessions could not be revoked. Please try again." : errorText}</p></section> : null}
+    <section className="card">
+      <h2>Signed-in sessions</h2>
+      <form action={logout}><button type="submit">Sign out on this device</button></form>
+      <p className="muted">Signing out everywhere also ends this session. Repository tracking continues.</p>
+      <form action={revokeAllSessions}><button type="submit">Sign out everywhere</button></form>
+      <details><summary>Delete DevMemoir account</summary><p>Revokes access immediately and queues removal of imported activity and profile data. This cannot be undone through the app. Minimal identity and installation records remain to reject late requests. Backup deletion is not verified.</p><form action={deleteAccount}><label><input type="checkbox" name="confirm" value="delete_account" required /> I understand and want to delete this account.</label><button type="submit">Request account deletion</button></form></details>
+    </section>
     {params.claim && params.installation_id ? <section className="card">
       <h2>Claim this installation</h2>
       <p>GitHub returned without a one-time state value. Confirm that this installation belongs to your allowlisted GitHub account.</p>
@@ -57,6 +65,7 @@ export default async function ConnectPage({ searchParams }: { searchParams: Prom
       <p className="muted">GitHub App access and DevMemoir tracking are separate. This inventory is authoritative only after a complete GitHub pagination run.</p>
       <p className="muted">{options.lastInventoryAt ? `Last synchronized: ${new Date(options.lastInventoryAt).toLocaleString()}` : "Inventory refresh is pending."}</p>
       <form action={refreshInventory}><button type="submit">Refresh repository access</button></form>
+      <details><summary>Disconnect GitHub</summary><p>Stops GitHub reads and tracking in DevMemoir. Imported history is retained but hidden until you reconnect. This does not uninstall the GitHub App or delete your account.</p><form action={disconnectInstallation}><button type="submit">Disconnect GitHub</button></form></details>
       {options.repositories.length === 0 ? <p className="muted">No accessible repositories are recorded yet.</p> : <div className="repository-list">
         {options.repositories.map((repository) => {
           const accessible = repository.accessStatus === "accessible";

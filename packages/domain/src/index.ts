@@ -12,6 +12,14 @@ export const DELIVERY_STATES = [
 ] as const;
 export type DeliveryState = (typeof DELIVERY_STATES)[number];
 
+/** Version zero preserves pre-lifecycle job keys during migration. */
+export function tenantWorkLogicalKey(logicalKey: string, payload: unknown): string {
+  if (!payload || typeof payload !== "object" || !("lifecycleVersion" in payload)) return logicalKey;
+  const version = payload.lifecycleVersion;
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0) throw new Error("Invalid tenant lifecycle version");
+  return version === 0 ? logicalKey : `${logicalKey}:lifecycle:${version}`;
+}
+
 export const TERMINAL_DELIVERY_STATES = new Set<DeliveryState>(["processed", "ignored"]);
 
 export const REPOSITORY_ACCESS_STATUSES = [

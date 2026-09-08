@@ -1,5 +1,6 @@
 import {
   createId,
+  tenantWorkLogicalKey,
   canonicalLogicalEventKey,
   deliveryRedeliveryAction,
   githubDeliveryAttemptSucceeded,
@@ -20,6 +21,7 @@ import {
   type MaintenanceTask,
   type RepositoryAccessStatus,
 } from "@devmemoir/domain";
+import { assertTenantWork, currentTenantWork, LifecycleRevokedError, MemoryTransaction, type TenantLifecycle } from "./lifecycle.js";
 
 export type AuthTransactionRecord = {
   id: string;
@@ -40,6 +42,7 @@ export type UserRecord = {
   githubAccountId: number;
   login: string;
   displayName: string;
+  deletedAt?: Date;
 };
 
 export type SessionRecord = {
@@ -543,12 +546,18 @@ function nextHistoricalStage(stage: HistoricalSourceStage): HistoricalStage {
 }
 
 export interface M1Store {
+  getTenantLifecycle(tenantId: string): Promise<TenantLifecycle>;
+  disconnectTenant(tenantId: string, now: Date): Promise<TenantLifecycle>;
+  requestAccountDeletion(tenantId: string, userId: string, now: Date): Promise<TenantLifecycle>;
+  listPendingAccountDeletions(limit: number): Promise<string[]>;
+  purgeAccountDeletion(tenantId: string, now: Date): Promise<void>;
   createAuthTransaction(record: AuthTransactionRecord): Promise<void>;
   consumeAuthState(stateHash: string, now: Date): Promise<AuthTransactionRecord | undefined>;
   attachAuthUser(stateHash: string, user: UserRecord): Promise<void>;
   createHandoff(stateHash: string, handoffHash: string, expiresAt?: Date): Promise<void>;
   consumeHandoff(handoffHash: string, now: Date): Promise<UserRecord | undefined>;
   createSession(session: SessionRecord): Promise<void>;
+  revokeSessions(input: { userId: string; tokenHash?: string; now: Date }): Promise<void>;
   getSession(tokenHash: string, now: Date): Promise<SessionRecord | undefined>;
   upsertUser(user: UserRecord): Promise<void>;
   getUserById(userId: string): Promise<UserRecord | undefined>;
@@ -691,6 +700,88 @@ export async function collectQueueRebuildReconciliationTargets(
 }
 
 export class InMemoryM1Store implements M1Store {
+  readonly tenantLifecycles = new Map<string, TenantLifecycle>();
+  constructor() {
+    const transaction = new MemoryTransaction();
+    const wrappers = new Map<Function, Function>();
+    // Serialize each store operation, not the worker's network request. This
+    // mirrors a PostgreSQL transaction and permits revocation between calls.
+    return new Proxy(this, {
+      get(target, key, receiver) {
+        const value: unknown = Reflect.get(target, key, receiver);
+        if (typeof value !== "function" || value.constructor.name !== "AsyncFunction") return value;
+        let wrapped = wrappers.get(value);
+        if (!wrapped) {
+          wrapped = (...args: unknown[]) => transaction.run(async () => {
+            const scope = currentTenantWork();
+            if (scope) assertTenantWork(target.tenantLifecycles.get(scope.tenantId) ?? { tenantId: scope.tenantId, state: "active", version: 0 });
+            return Reflect.apply(value, receiver, args);
+          });
+          wrappers.set(value, wrapped);
+        }
+        return wrapped;
+      },
+    });
+  }
+  async getTenantLifecycle(tenantId: string): Promise<TenantLifecycle> { return { ...(this.tenantLifecycles.get(tenantId) ?? { tenantId, state: "active", version: 0 }) }; }
+  async disconnectTenant(tenantId: string, now: Date): Promise<TenantLifecycle> {
+    const current = await this.getTenantLifecycle(tenantId);
+    if (current.state !== "active") return current;
+    const lifecycle: TenantLifecycle = { tenantId, version: current.version + 1, state: "disconnected", changedAt: now };
+    this.tenantLifecycles.set(tenantId, lifecycle);
+    for (const installation of this.installations.values()) if (installation.tenantId === tenantId) {
+      installation.status = "disconnected";
+      installation.deletedAt = now;
+    }
+    for (const repository of this.repositories.values()) if (repository.tenantId === tenantId) {
+      repository.selected = false; repository.accessStatus = "disconnected"; repository.revokedAt = now;
+    }
+    for (const delivery of this.deliveries.values()) if (delivery.tenantId === tenantId) {
+      delivery.state = "ignored"; delivery.processedAt = now;
+      delete delivery.payloadCiphertext; delete delivery.payloadKeyVersion;
+    }
+    return { ...lifecycle };
+  }
+  async requestAccountDeletion(tenantId: string, userId: string, now: Date): Promise<TenantLifecycle> {
+    const user = this.users.get(userId);
+    if (!user || user.tenantId !== tenantId) throw new LifecycleRevokedError();
+    const current = await this.getTenantLifecycle(tenantId);
+    if (current.state === "deletion_requested" || current.state === "deleted") return current;
+    await this.disconnectTenant(tenantId, now);
+    const lifecycle: TenantLifecycle = { tenantId, version: (await this.getTenantLifecycle(tenantId)).version + 1, state: "deletion_requested", changedAt: now };
+    this.tenantLifecycles.set(tenantId, lifecycle);
+    user.deletedAt = now;
+    for (const session of this.sessions.values()) if (session.userId === userId) session.revokedAt ??= now;
+    for (const [key, transaction] of this.authTransactions) if (!transaction.userId || transaction.userId === userId) this.authTransactions.delete(key);
+    return { ...lifecycle };
+  }
+  async listPendingAccountDeletions(limit: number): Promise<string[]> {
+    return [...this.tenantLifecycles.values()].filter((row) => row.state === "deletion_requested").slice(0, Math.max(0, Math.min(100, limit))).map((row) => row.tenantId);
+  }
+  async purgeAccountDeletion(tenantId: string, now: Date): Promise<void> {
+    const lifecycle = await this.getTenantLifecycle(tenantId);
+    if (lifecycle.state !== "deletion_requested") return;
+    const repositoryIds = new Set([...this.repositories.values()].filter((row) => row.tenantId === tenantId).map((row) => row.id));
+    const prefix = `${tenantId}:`;
+    for (const map of [this.repositories, this.branchHeads, this.commits, this.refSyncContinuations, this.commitReachability, this.historicalProgress, this.historicalBranches, this.historicalTags, this.historicalPullRequests, this.historicalIssues, this.historicalReleases, this.reconciliationGenerations]) {
+      for (const key of map.keys()) if (key.startsWith(prefix)) map.delete(key);
+    }
+    const removed = this.events.filter((event) => repositoryIds.has(event.repositoryId));
+    for (const event of removed) if (event.logicalEventKey) this.eventKeys.delete(event.logicalEventKey);
+    this.events.splice(0, this.events.length, ...this.events.filter((event) => !repositoryIds.has(event.repositoryId)));
+    this.repositoryNameHistory.splice(0, this.repositoryNameHistory.length, ...this.repositoryNameHistory.filter((row) => row.tenantId !== tenantId));
+    for (const [key, row] of this.deliveries) if (row.tenantId === tenantId) this.deliveries.delete(key);
+    for (const [key, row] of this.jobs) if (row.payload.tenantId === tenantId) this.jobs.delete(key);
+    const installations = [...this.installations.values()].filter((row) => row.tenantId === tenantId);
+    for (const [key, row] of this.githubDeliveryRepairs) if (installations.some((installation) => installation.githubInstallationId === row.installationGithubId)) this.githubDeliveryRepairs.delete(key);
+    for (const installation of installations) this.installations.set(installation.githubInstallationId, { id: installation.id, tenantId, githubInstallationId: installation.githubInstallationId, accountGithubAccountId: installation.accountGithubAccountId, status: "disconnected", deletedAt: now });
+    for (const user of this.users.values()) if (user.tenantId === tenantId) {
+      user.login = ""; user.displayName = ""; user.deletedAt ??= now;
+      for (const [key, session] of this.sessions) if (session.userId === user.userId) this.sessions.delete(key);
+      for (const [key, transaction] of this.authTransactions) if (transaction.userId === user.userId) this.authTransactions.delete(key);
+    }
+    this.tenantLifecycles.set(tenantId, { ...lifecycle, state: "deleted", changedAt: now });
+  }
   readonly authTransactions = new Map<string, AuthTransactionRecord>();
   readonly users = new Map<string, UserRecord>();
   readonly sessions = new Map<string, SessionRecord>();
@@ -718,7 +809,7 @@ export class InMemoryM1Store implements M1Store {
   readonly maintenanceWindows = new Map<string, MaintenanceWindow>();
   readonly workerHeartbeats = new Map<string, WorkerHeartbeat>();
 
-  async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { this.authTransactions.set(record.stateHash, { ...record }); }
+  async createAuthTransaction(record: AuthTransactionRecord): Promise<void> { if (record.userId && !await this.getUserById(record.userId)) throw new LifecycleRevokedError(); this.authTransactions.set(record.stateHash, { ...record }); }
 
   async consumeAuthState(stateHash: string, now: Date): Promise<AuthTransactionRecord | undefined> {
     const transaction = this.authTransactions.get(stateHash);
@@ -746,19 +837,27 @@ export class InMemoryM1Store implements M1Store {
     const transaction = [...this.authTransactions.values()].find((value) => value.handoffHash === handoffHash);
     if (!transaction || transaction.handoffConsumedAt || transaction.expiresAt <= now || !transaction.userId) return undefined;
     transaction.handoffConsumedAt = now;
-    return this.users.get(transaction.userId);
+    return this.getUserById(transaction.userId);
   }
 
-  async createSession(session: SessionRecord): Promise<void> { this.sessions.set(session.tokenHash, { ...session }); }
+  async createSession(session: SessionRecord): Promise<void> { if (!await this.getUserById(session.userId)) throw new LifecycleRevokedError(); this.sessions.set(session.tokenHash, { ...session }); }
+  async revokeSessions(input: { userId: string; tokenHash?: string; now: Date }): Promise<void> {
+    for (const session of this.sessions.values()) {
+      if (session.userId === input.userId && (input.tokenHash === undefined || session.tokenHash === input.tokenHash) && !session.revokedAt) session.revokedAt = input.now;
+    }
+  }
   async getSession(tokenHash: string, now: Date): Promise<SessionRecord | undefined> {
     const session = this.sessions.get(tokenHash);
     if (!session || session.revokedAt || session.expiresAt <= now) return undefined;
     return { ...session };
   }
-  async upsertUser(user: UserRecord): Promise<void> { this.users.set(user.userId, { ...user }); }
-  async getUserById(userId: string): Promise<UserRecord | undefined> { return this.users.get(userId); }
+  async upsertUser(user: UserRecord): Promise<void> { if ((await this.getUserByGithubAccountId(user.githubAccountId))?.deletedAt || ["deleted", "deletion_requested"].includes((await this.getTenantLifecycle(user.tenantId)).state)) throw new LifecycleRevokedError(); this.users.set(user.userId, { ...user }); }
+  async getUserById(userId: string): Promise<UserRecord | undefined> { const user = this.users.get(userId); return user?.deletedAt ? undefined : user; }
   async getUserByGithubAccountId(githubAccountId: number): Promise<UserRecord | undefined> { return [...this.users.values()].find((user) => user.githubAccountId === githubAccountId); }
   async saveInstallation(installation: InstallationRecord): Promise<void> {
+    const lifecycle = await this.getTenantLifecycle(installation.tenantId);
+    if (lifecycle.state === "deletion_requested" || lifecycle.state === "deleted") throw new LifecycleRevokedError();
+    if (lifecycle.state === "disconnected") this.tenantLifecycles.set(installation.tenantId, { tenantId: installation.tenantId, version: lifecycle.version + 1, state: "active", changedAt: new Date() });
     const previous = this.installations.get(installation.githubInstallationId);
     const saved: InstallationRecord = {
       ...previous,
@@ -1008,6 +1107,10 @@ export class InMemoryM1Store implements M1Store {
   async unselectRepository(tenantId: string, repositoryId: string): Promise<RepositoryRecord | undefined> {
     const repository = await this.getRepositoryById(tenantId, repositoryId);
     if (!repository) return undefined;
+    if (repository.selected === true) {
+      const current = await this.getTenantLifecycle(tenantId);
+      this.tenantLifecycles.set(tenantId, { ...current, version: current.version + 1, changedAt: new Date() });
+    }
     if (repository.accessStatus && !repositoryAccessIsAvailable(repository.accessStatus)) {
       const updated = { ...repository, selected: false };
       this.repositories.set(`${tenantId}:${repository.githubRepositoryId}`, updated);
@@ -1072,7 +1175,12 @@ export class InMemoryM1Store implements M1Store {
   async updateInstallationLifecycle(githubInstallationId: number, status: InstallationLifecycleStatus, now: Date): Promise<void> {
     const installation = this.installations.get(githubInstallationId);
     if (!installation) return;
-    const updatedInstallation: InstallationRecord = { ...installation, status, ...(status === "suspended" ? { suspendedAt: now } : {}), ...(status === "deleted" || status === "disconnected" ? { deletedAt: now } : {}) };
+    if (status === "deleted" || status === "disconnected") {
+      await this.disconnectTenant(installation.tenantId, now);
+      installation.status = "deleted";
+      return;
+    }
+    const updatedInstallation: InstallationRecord = { ...installation, status, ...(status === "suspended" ? { suspendedAt: now } : {}) };
     if (status === "active") {
       delete updatedInstallation.suspendedAt;
       delete updatedInstallation.deletedAt;
@@ -1087,6 +1195,7 @@ export class InMemoryM1Store implements M1Store {
   }
 
   async insertDelivery(input: Omit<DeliveryRecord, "id" | "state" | "firstReceivedAt" | "lastReceivedAt" | "receiptCount" | "processingAttempts"> & { now: Date }): Promise<DeliveryInsertResult> {
+    if (input.tenantId) assertTenantWork(await this.getTenantLifecycle(input.tenantId));
     const existing = this.deliveries.get(input.guid);
     if (existing) {
       existing.lastReceivedAt = input.now;
@@ -1166,6 +1275,11 @@ export class InMemoryM1Store implements M1Store {
     return { ...delivery };
   }
   async ensureJob(logicalKey: string, payload: Record<string, unknown>): Promise<string> {
+    const lifecycle = await this.getTenantLifecycle(String(payload.tenantId));
+    assertTenantWork(lifecycle);
+    if (payload.lifecycleVersion !== undefined && payload.lifecycleVersion !== lifecycle.version) throw new LifecycleRevokedError();
+    payload.lifecycleVersion = lifecycle.version;
+    logicalKey = tenantWorkLogicalKey(logicalKey, payload);
     const existing = this.jobs.get(logicalKey);
     if (existing) return existing.id;
     const job = { id: createId(), logicalKey, payload };
@@ -1208,6 +1322,7 @@ export class InMemoryM1Store implements M1Store {
   }
   async setCommitReachability(tenantId: string, repositoryId: string, ref: string, sha: string, reachable: boolean): Promise<void> { this.commitReachability.set(`${tenantId}:${repositoryId}:${branchName(ref)}:${sha}`, reachable); }
   async listActivity(tenantId: string, repositoryId?: string, query?: ActivityQuery): Promise<ActivityRecord[]> {
+    if ((await this.getTenantLifecycle(tenantId)).state !== "active") return [];
     return this.events.filter((event) => {
       const repository = [...this.repositories.values()].find((value) => value.tenantId === tenantId && value.id === event.repositoryId);
       if (!repository || (repositoryId && event.repositoryId !== repositoryId)) return false;

@@ -272,7 +272,7 @@ Deletion and restore are destructive/high-trust operations; isolate targets, pre
 - [x] Worker-only bounded hourly `privacy_payload_purge` (`17 * * * *` UTC) is registered on boot and queue rebuild; web/API cannot restore payloads.
 - [x] InMemory and PostgreSQL retention, race, tombstone, privilege, and privacy-canary coverage is in place.
 
-Milestone 6 is not complete. Remaining slices are disconnect/delete, secret/key rotation, and PITR/Gate A evidence.
+Local disconnect/delete/session controls, stale-worker fencing, synthetic key rotation and PostgreSQL 18 logical restore are now implemented and tested. See [M6 lifecycle and recovery](M6_LIFECYCLE_AND_RECOVERY.md). Milestone 6 remains incomplete pending real provider rotation, paid/always-on PITR, deletion-ledger and queue/log-retention evidence.
 
 ## Milestone 7 — Soak, quality, and dashboard
 

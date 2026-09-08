@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { AppConfig } from "@devmemoir/config";
 import { InMemoryM1Store } from "@devmemoir/db";
 import { createId, createOpaqueToken, encryptSecret, hashOpaqueToken } from "@devmemoir/domain";
@@ -66,6 +66,61 @@ describe("M1 webhook receipt", () => {
   });
 
   afterEach(async () => { await app.close(); });
+
+  it.each(["/auth/logout", "/auth/sessions/revoke"])("limits %s before session lookup and ignores spoofed forwarded IPs", async (url) => {
+    const lookup = vi.spyOn(store, "getSession");
+    try {
+      for (let index = 0; index < 120; index++) {
+        expect((await app.inject({ method: "POST", url, headers: { authorization: "Bearer invalid" } })).statusCode).toBe(401);
+      }
+      expect(lookup).toHaveBeenCalledTimes(120);
+      const blocked = await app.inject({ method: "POST", url, headers: { authorization: "Bearer invalid", "x-forwarded-for": "192.0.2.99" } });
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.json()).toEqual({ error: "rate_limit_exceeded" });
+      expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0);
+      expect(lookup).toHaveBeenCalledTimes(120);
+      expect((await app.inject({ method: "POST", url, remoteAddress: "192.0.2.2", headers: { authorization: "Bearer invalid" } })).statusCode).toBe(401);
+      expect(lookup).toHaveBeenCalledTimes(121);
+    } finally { lookup.mockRestore(); }
+  });
+
+  it("shares the request budget across routes and addresses in the same IPv6 subnet", async () => {
+    for (let index = 0; index < 120; index++) {
+      expect((await app.inject({ method: "POST", url: "/auth/logout", remoteAddress: "2001:db8:1:2::1" })).statusCode).toBe(401);
+    }
+    expect((await app.inject({ method: "POST", url: "/auth/sessions/revoke", remoteAddress: "2001:db8:1:2::ffff" })).statusCode).toBe(429);
+    expect((await app.inject({ method: "POST", url: "/auth/logout", remoteAddress: "2001:db8:1:3::1" })).statusCode).toBe(401);
+  });
+
+  it("includes bot activity in overview only when explicitly requested", async () => {
+    await store.createSession({ userId: "user-1", tenantId: "tenant-1", tokenHash: hashOpaqueToken("bots-session", config.SESSION_SECRET), csrfTokenHash: "unused", expiresAt: new Date(Date.now() + 60_000) });
+    const list = vi.spyOn(store, "listActivity").mockResolvedValue([{ id: "bot-event", repositoryId: "repo-1", sourceKind: "issue", sourceExternalId: "1", eventType: "issue", verb: "opened", actorGithubAccountId: 8, actorKind: "bot", contributionRole: "opener", contextKind: "project", occurredAt: new Date(), completenessState: "observed", visibility: "private", attributionConfidence: "exact_github_actor", projectionVersion: 1 }]);
+    try {
+      const headers = { authorization: "Bearer bots-session" };
+      expect((await app.inject({ url: "/api/activity", headers })).json().events).toEqual([]);
+      expect((await app.inject({ url: "/api/activity?includeBots=true", headers })).json().events).toMatchObject([{ id: "bot-event" }]);
+    } finally { list.mockRestore(); }
+  });
+
+  it("requires CSRF and revokes only the current session on logout", async () => {
+    for (const token of ["logout-one", "logout-two"]) await store.createSession({ userId: "user-1", tenantId: "tenant-1", tokenHash: hashOpaqueToken(token, config.SESSION_SECRET), csrfTokenHash: hashOpaqueToken("csrf", config.SESSION_SECRET), expiresAt: new Date(Date.now() + 60_000) });
+    const headers = { authorization: "Bearer logout-one", "x-devmemoir-csrf": "csrf" };
+    expect((await app.inject({ method: "POST", url: "/auth/logout", headers: { authorization: headers.authorization } })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/auth/session", headers })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/auth/logout", headers })).statusCode).toBe(204);
+    expect((await app.inject({ method: "GET", url: "/auth/session", headers })).statusCode).toBe(401);
+    expect((await app.inject({ method: "GET", url: "/auth/session", headers: { authorization: "Bearer logout-two" } })).statusCode).toBe(200);
+  });
+
+  it("revokes every session of the authenticated user without affecting another user", async () => {
+    await store.upsertUser({ userId: "user-2", tenantId: "tenant-1", githubAccountId: 8, login: "other", displayName: "Other" });
+    for (const [token, userId] of [["all-one", "user-1"], ["all-two", "user-1"], ["other-user", "user-2"]]) await store.createSession({ userId: userId!, tenantId: "tenant-1", tokenHash: hashOpaqueToken(token!, config.SESSION_SECRET), csrfTokenHash: hashOpaqueToken("csrf", config.SESSION_SECRET), expiresAt: new Date(Date.now() + 60_000) });
+    expect((await app.inject({ method: "POST", url: "/auth/sessions/revoke" })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/auth/sessions/revoke", headers: { authorization: "Bearer all-one", "x-devmemoir-csrf": "wrong" } })).statusCode).toBe(403);
+    expect((await app.inject({ method: "POST", url: "/auth/sessions/revoke", headers: { authorization: "Bearer all-one", "x-devmemoir-csrf": "csrf" } })).statusCode).toBe(204);
+    for (const token of ["all-one", "all-two"]) expect((await app.inject({ method: "GET", url: "/auth/session", headers: { authorization: `Bearer ${token}` } })).statusCode).toBe(401);
+    expect(await store.getSession(hashOpaqueToken("other-user", config.SESSION_SECRET), new Date())).toBeDefined();
+  });
 
   async function send(guid: string, eventName: string, body: Record<string, unknown>, signingSecret = secret) {
     const raw = Buffer.from(JSON.stringify(body), "utf8");
