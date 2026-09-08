@@ -34,6 +34,8 @@ The only temporary content-sensitive exception is encrypted raw webhook payload 
 
 The design uses GitHub App least privilege, signed webhook verification, separate database runtime roles, row-level security, an owner allowlist, opaque queue payloads, durable rate-limit/reconciliation state, worker-only privacy purge, and secret-manager runtime configuration. These controls reduce exposure and support recovery; they do not eliminate every possible vulnerability or deployment mistake.
 
+The API also limits incoming requests to 120 per minute per peer IP (IPv6 /64), shared across routes in each process, before session lookup or body parsing. Excess requests return `429` with `Retry-After`. Forwarded IP headers are not trusted; clients behind the web server or a proxy share its budget. This in-memory limit resets on restart and is not shared across replicas. Deployment must account for proxy traffic and webhook bursts, and provide shared ingress limits when scaling out. The synthetic browser fixture inherits the limit and skips background queue draining for rejected requests.
+
 ## Local development
 
 The supported local and CI database baseline is **PostgreSQL 18** (`postgres:18-alpine`). Use a local PostgreSQL 18 instance or the included Docker Compose service. Production credentials and GitHub App material must remain outside the repository.

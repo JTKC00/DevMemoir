@@ -5,6 +5,17 @@ import { app, store, runPrivacyWorker } from "./browser-fixture.mjs";
 after(async () => { await app.close(); });
 const localPath = (url) => { const parsed = new URL(url, "http://localhost:4100"); return parsed.pathname + parsed.search; };
 
+test("synthetic authorization routes inherit the API request limit", async () => {
+  const remoteAddress = "192.0.2.40";
+  for (let index = 0; index < 120; index++) {
+    assert.equal((await app.inject({ url: "/__fixture/github-authorize?state=synthetic", remoteAddress })).statusCode, 302);
+  }
+  const blocked = await app.inject({ url: "/__fixture/github-authorize?state=synthetic", remoteAddress });
+  assert.equal(blocked.statusCode, 429);
+  assert.equal(blocked.headers.location, undefined);
+  assert.ok(Number(blocked.headers["retry-after"]) > 0);
+});
+
 test("synthetic owner journey covers login, import, filters, logout, disconnect and account deletion", async () => {
   const start = await app.inject("/auth/github/start?returnPath=/");
   const authorize = await app.inject(localPath(start.headers.location));

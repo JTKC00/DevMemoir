@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import rawBody from "fastify-raw-body";
 import type { AppConfig } from "@devmemoir/config";
 import { createId, createOpaqueToken, defaultTimelineEvents, encryptSecret, hashOpaqueToken, manualDeliveryAuditRunId, manualReconciliationRunId, parseWebhook } from "@devmemoir/domain";
@@ -53,6 +54,7 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
   const now = deps.now ?? (() => new Date());
   const auth = new AuthService(deps.config, deps.store, deps.github, now);
   const app = Fastify({ bodyLimit: webhookBodyLimit(deps.config), logger: false });
+  await app.register(rateLimit, { global: true, hook: "onRequest", max: 120, timeWindow: 60_000 });
   await app.register(cookie);
   await app.register(cors, { origin: deps.config.WEB_ORIGIN, credentials: true });
   await app.register(rawBody, { field: "rawBody", global: false, runFirst: true, encoding: false });
@@ -494,8 +496,9 @@ export async function buildApi(deps: ApiDependencies): Promise<FastifyInstance> 
     if (error instanceof LifecycleRevokedError) return request.url.startsWith("/webhooks/github")
       ? reply.code(202).send({ accepted: true, state: "ignored" })
       : reply.code(409).send({ error: "lifecycle_revoked" });
-    deps.logger.error({ request_id: request.id, result: "error" }, error);
     const statusCode = typeof error === "object" && error !== null && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
+    if (statusCode === 429) return reply.code(429).send({ error: "rate_limit_exceeded" });
+    deps.logger.error({ request_id: request.id, result: "error" }, error);
     return reply.code(statusCode >= 400 && statusCode < 500 ? statusCode : 500).send({ error: statusCode === 413 ? "payload_too_large" : "internal_error" });
   });
   return app;

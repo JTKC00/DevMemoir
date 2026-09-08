@@ -67,6 +67,31 @@ describe("M1 webhook receipt", () => {
 
   afterEach(async () => { await app.close(); });
 
+  it.each(["/auth/logout", "/auth/sessions/revoke"])("limits %s before session lookup and ignores spoofed forwarded IPs", async (url) => {
+    const lookup = vi.spyOn(store, "getSession");
+    try {
+      for (let index = 0; index < 120; index++) {
+        expect((await app.inject({ method: "POST", url, headers: { authorization: "Bearer invalid" } })).statusCode).toBe(401);
+      }
+      expect(lookup).toHaveBeenCalledTimes(120);
+      const blocked = await app.inject({ method: "POST", url, headers: { authorization: "Bearer invalid", "x-forwarded-for": "192.0.2.99" } });
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.json()).toEqual({ error: "rate_limit_exceeded" });
+      expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0);
+      expect(lookup).toHaveBeenCalledTimes(120);
+      expect((await app.inject({ method: "POST", url, remoteAddress: "192.0.2.2", headers: { authorization: "Bearer invalid" } })).statusCode).toBe(401);
+      expect(lookup).toHaveBeenCalledTimes(121);
+    } finally { lookup.mockRestore(); }
+  });
+
+  it("shares the request budget across routes and addresses in the same IPv6 subnet", async () => {
+    for (let index = 0; index < 120; index++) {
+      expect((await app.inject({ method: "POST", url: "/auth/logout", remoteAddress: "2001:db8:1:2::1" })).statusCode).toBe(401);
+    }
+    expect((await app.inject({ method: "POST", url: "/auth/sessions/revoke", remoteAddress: "2001:db8:1:2::ffff" })).statusCode).toBe(429);
+    expect((await app.inject({ method: "POST", url: "/auth/logout", remoteAddress: "2001:db8:1:3::1" })).statusCode).toBe(401);
+  });
+
   it("includes bot activity in overview only when explicitly requested", async () => {
     await store.createSession({ userId: "user-1", tenantId: "tenant-1", tokenHash: hashOpaqueToken("bots-session", config.SESSION_SECRET), csrfTokenHash: "unused", expiresAt: new Date(Date.now() + 60_000) });
     const list = vi.spyOn(store, "listActivity").mockResolvedValue([{ id: "bot-event", repositoryId: "repo-1", sourceKind: "issue", sourceExternalId: "1", eventType: "issue", verb: "opened", actorGithubAccountId: 8, actorKind: "bot", contributionRole: "opener", contextKind: "project", occurredAt: new Date(), completenessState: "observed", visibility: "private", attributionConfidence: "exact_github_actor", projectionVersion: 1 }]);

@@ -77,7 +77,9 @@ app.addHook("onSend", async (request, reply, payload) => {
   }
   return payload;
 });
-app.addHook("onResponse", async () => { await drain(); });
+app.addHook("onResponse", async (_request, reply) => {
+  if (reply.statusCode !== 429) await drain();
+});
 app.get("/__fixture", async (_request, reply) => reply.type("text/html").send(`<!doctype html><html lang="en"><title>DevMemoir synthetic browser controls</title><h1>Synthetic browser controls</h1><p>In-memory data only. GitHub calls are synthetic.</p><p>Import enabled: ${importEnabled}. Activity outage: ${unavailable}. Queued jobs: ${jobs.jobs.size}.</p><a href="${webOrigin}">Open DevMemoir</a><form method="post" action="/__fixture/import"><button>Finish synthetic import</button></form><form method="post" action="/__fixture/expire"><button>Expire synthetic sessions</button></form><form method="post" action="/__fixture/outage"><button>Toggle activity outage</button></form></html>`));
 app.get("/__fixture/github-authorize", async (request, reply) => {
   const query = new URL(request.url, apiOrigin).searchParams;
