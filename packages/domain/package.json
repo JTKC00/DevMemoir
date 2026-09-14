@@ -11,5 +11,5 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": { "uuid": "^11.0.5", "zod": "^3.24.2" },
-  "devDependencies": { "vitest": "^3.0.5" }
+  "devDependencies": { "vitest": "^4.1.11" }
 }
