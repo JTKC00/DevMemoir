@@ -5,4 +5,4 @@ allowBuilds:
   esbuild: true
   sharp: true
 overrides:
-  "next@15.5.25>postcss": 8.5.26
+  "next@15.5.28>postcss": 8.5.26
