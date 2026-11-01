@@ -10,6 +10,6 @@
     "lint": "eslint src",
     "test": "vitest run --passWithNoTests"
   },
-  "dependencies": { "uuid": "^11.0.5", "zod": "^3.24.2" },
+  "dependencies": { "uuid": "^11.0.5", "zod": "^4.6.6" },
   "devDependencies": { "vitest": "^4.1.11" }
 }
