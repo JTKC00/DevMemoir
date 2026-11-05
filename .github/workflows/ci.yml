@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -12,6 +16,7 @@ jobs:
   verify:
     name: DevMemoir CI / verify
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:18-alpine
@@ -35,17 +40,34 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Public repository current-tree check
+        run: node scripts/public-readiness-check.mjs --self-test && node scripts/public-readiness-check.mjs
+      - name: Check for non-documentation changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - 'README.md'
+              - 'SECURITY.md'
+              - 'CONTRIBUTING.md'
+              - '!docs/**'
+              - '!LICENSE'
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: ${{ steps.filter.outputs.code == 'true' }}
         with:
           version: 11.19.0
       - uses: actions/setup-node@v7
+        if: ${{ steps.filter.outputs.code == 'true' }}
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Public repository current-tree check
-        run: pnpm audit:public
+        if: ${{ steps.filter.outputs.code == 'true' }}
       - name: Assert PostgreSQL 18
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: |
           IMAGE="$(docker inspect --format '{{.Config.Image}}' "${{ job.services.postgres.id }}")"
           VERSION="$(docker exec "${{ job.services.postgres.id }}" psql -U devmemoir -d devmemoir -tAc 'SHOW server_version')"
@@ -60,16 +82,23 @@ jobs:
             *) echo "Expected PostgreSQL 18, got ${VERSION}" >&2; exit 1 ;;
           esac
       - name: Assert PostgreSQL integration configuration
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: test -n "$TEST_DATABASE_URL"
       - name: Apply empty/upgrade-safe migrations
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: pnpm db:migrate
       - name: Build
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: pnpm build
       - name: Typecheck
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: pnpm -r --if-present typecheck
       - name: Lint
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: pnpm lint
       - name: Unit, PostgreSQL integration, projection, RLS, and queue recovery tests
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: pnpm -r --if-present test
       - name: Synthetic owner journey through API and worker
+        if: ${{ steps.filter.outputs.code == 'true' }}
         run: pnpm test:journey

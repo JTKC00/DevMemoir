@@ -3,6 +3,11 @@ name: CodeQL
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
     branches: [main]
   schedule:
@@ -13,14 +18,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   analyze:
     name: Analyze JavaScript/TypeScript
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     permissions:
       actions: read
       contents: read
@@ -31,12 +36,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check for non-documentation changes
+        id: filter
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!LICENSE'
+              - '!.gitignore'
+
       - name: Initialize CodeQL
+        if: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code == 'true' }}
         uses: github/codeql-action/init@v4
         with:
           languages: javascript-typescript
 
       - name: Perform CodeQL Analysis
+        if: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code == 'true' }}
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:javascript-typescript"
