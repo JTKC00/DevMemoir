@@ -44,7 +44,7 @@ jobs:
         run: node scripts/public-readiness-check.mjs --self-test && node scripts/public-readiness-check.mjs
       - name: Check for non-documentation changes
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             code:
